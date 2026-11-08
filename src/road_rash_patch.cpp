@@ -106,12 +106,18 @@ static const DWORD kOriginalLogicalWidth = 320;
 static const DWORD kOriginalLogicalHeight = 240;
 static const DWORD kOriginalDisplayWidth = 640;
 static const DWORD kOriginalDisplayHeight = 480;
-// The game renders into a 856x480 virtual buffer that is stretched to the
-// real 1920x1080 display mode when it flips.
+// The game renders into a virtual buffer (480 lines high, width matching the
+// real display's aspect ratio) that is stretched to the real display mode
+// when it flips.
 static DWORD kVirtualLogicalWidth = 428;
 static DWORD kVirtualDisplayWidth = 856;
-static const DWORD kTargetDisplayWidth = 1920;
-static const DWORD kTargetDisplayHeight = 1080;
+static DWORD g_virtualWidthOverride = 0;
+static DWORD kTargetDisplayWidth = 1920;
+static DWORD kTargetDisplayHeight = 1080;
+static const DWORD kSafeDisplayWidth = 1920;
+static const DWORD kSafeDisplayHeight = 1080;
+static const DWORD kMinVirtualWidth = 640;
+static const DWORD kMaxVirtualWidth = 1280;
 static const DWORD kFallbackLogicalWidth = 360;
 static const DWORD kFallbackDisplayWidth = 720;
 
@@ -131,6 +137,8 @@ static DirectDrawHookState g_hookState;
 static DWORD g_gameBase = 0;
 static BOOL g_widescreenActive = FALSE;
 static BOOL g_virtualDisplayActive = FALSE;
+static DWORD g_realDisplayWidth = 0;
+static DWORD g_realDisplayHeight = 0;
 static LPVOID g_virtualPrimary = NULL;
 static LPVOID g_virtualBack = NULL;
 static LPVOID* g_surfaceVtable = NULL;
@@ -513,27 +521,84 @@ static void ReadVirtualWidthSetting()
     CHAR path[MAX_PATH];
     DWORD length = GetModuleFileNameA(NULL, path, MAX_PATH);
     static const CHAR fileName[] = "RoadRashWidescreen.ini";
+    typedef BOOL (WINAPI *SetProcessDPIAwareFn)(void);
+    SetProcessDPIAwareFn setDpiAware;
     DWORD width;
+    DWORD displayWidth;
+    DWORD displayHeight;
+
+    // Without this, the desktop size is reported DPI-virtualized on newer Windows.
+    setDpiAware = reinterpret_cast<SetProcessDPIAwareFn>(GetProcAddress(
+        GetModuleHandleA("user32.dll"), "SetProcessDPIAware"));
+    if (setDpiAware != NULL)
+    {
+        setDpiAware();
+    }
+
+    displayWidth = GetSystemMetrics(SM_CXSCREEN);
+    displayHeight = GetSystemMetrics(SM_CYSCREEN);
 
     while (length > 0 && path[length - 1] != '\\')
     {
         --length;
     }
 
-    if (length == 0 || length + sizeof(fileName) > MAX_PATH)
+    if (length != 0 && length + sizeof(fileName) <= MAX_PATH)
     {
-        return;
+        lstrcpyA(path + length, fileName);
+        g_waitForVerticalBlank = GetPrivateProfileIntA(
+            "Display", "WaitForVBlank", 1, path) != 0;
+        width = GetPrivateProfileIntA("Display", "DisplayWidth", 0, path);
+        if (width != 0)
+        {
+            displayWidth = width;
+        }
+
+        width = GetPrivateProfileIntA("Display", "DisplayHeight", 0, path);
+        if (width != 0)
+        {
+            displayHeight = width;
+        }
+
+        width = GetPrivateProfileIntA("Display", "VirtualWidth", 0, path);
+        width &= ~7UL;
+        if (width >= kMinVirtualWidth && width <= kMaxVirtualWidth)
+        {
+            g_virtualWidthOverride = width;
+        }
     }
 
-    lstrcpyA(path + length, fileName);
-    g_waitForVerticalBlank = GetPrivateProfileIntA(
-        "Display", "WaitForVBlank", 1, path) != 0;
-    width = GetPrivateProfileIntA(
-        "Display", "VirtualWidth", kVirtualDisplayWidth, path);
-    width &= ~7UL;
-    if (width < 640 || width > 856)
+    if (displayWidth < kOriginalDisplayWidth ||
+        displayHeight < kOriginalDisplayHeight ||
+        displayWidth > 16384 ||
+        displayHeight > 16384)
     {
-        return;
+        displayWidth = kSafeDisplayWidth;
+        displayHeight = kSafeDisplayHeight;
+    }
+
+    kTargetDisplayWidth = displayWidth;
+    kTargetDisplayHeight = displayHeight;
+}
+
+// Picks the 480-line virtual width that best fits the display's aspect ratio.
+static void SelectVirtualWidth(DWORD displayWidth, DWORD displayHeight)
+{
+    DWORD width = g_virtualWidthOverride;
+
+    if (width == 0)
+    {
+        width = (kOriginalDisplayHeight * displayWidth +
+            displayHeight / 2) / displayHeight;
+        width = (width + 4) & ~7UL;
+        if (width < kMinVirtualWidth)
+        {
+            width = kMinVirtualWidth;
+        }
+        else if (width > kMaxVirtualWidth)
+        {
+            width = kMaxVirtualWidth;
+        }
     }
 
     kVirtualDisplayWidth = width;
@@ -952,8 +1017,8 @@ static HRESULT CreateVirtualPrimary(
     g_virtualPrimary = *surface;
     g_virtualBack = backBuffer;
     LogMessage(
-        "Created the real 1920x1080 primary surface and a 856x480 virtual back buffer.\r\n",
-        sizeof("Created the real 1920x1080 primary surface and a 856x480 virtual back buffer.\r\n") - 1);
+        "Created the real primary surface and the virtual back buffer.\r\n",
+        sizeof("Created the real primary surface and the virtual back buffer.\r\n") - 1);
     return result;
 }
 
@@ -1443,6 +1508,7 @@ static HRESULT WINAPI HookedSetDisplayMode(
         bitsPerPixel == 8)
     {
         HRESULT result;
+        DWORD attempt;
 
         if (g_widescreenActive)
         {
@@ -1468,31 +1534,60 @@ static HRESULT WINAPI HookedSetDisplayMode(
                 caller);
         }
 
-        result = CallOriginalSetDisplayMode(
-            directDraw,
-            kTargetDisplayWidth,
-            kTargetDisplayHeight,
-            bitsPerPixel,
-            caller);
-        if (SUCCEEDED(result))
+        for (attempt = 0; attempt < 2; ++attempt)
         {
-            SetWidescreenGameState(
-                kVirtualLogicalWidth,
-                kOriginalLogicalHeight,
-                kVirtualDisplayWidth,
-                kOriginalDisplayHeight);
-            g_virtualDisplayActive = TRUE;
-            SetHudCentering(TRUE);
-            g_widescreenActive = TRUE;
+            DWORD targetWidth = attempt == 0 ? kTargetDisplayWidth : kSafeDisplayWidth;
+            DWORD targetHeight = attempt == 0 ? kTargetDisplayHeight : kSafeDisplayHeight;
+
+            if (attempt == 1 &&
+                targetWidth == kTargetDisplayWidth &&
+                targetHeight == kTargetDisplayHeight)
+            {
+                break;
+            }
+
+            SelectVirtualWidth(targetWidth, targetHeight);
+            result = CallOriginalSetDisplayMode(
+                directDraw,
+                targetWidth,
+                targetHeight,
+                bitsPerPixel,
+                caller);
+            if (SUCCEEDED(result))
+            {
+                g_realDisplayWidth = targetWidth;
+                g_realDisplayHeight = targetHeight;
+                SetWidescreenGameState(
+                    kVirtualLogicalWidth,
+                    kOriginalLogicalHeight,
+                    kVirtualDisplayWidth,
+                    kOriginalDisplayHeight);
+                g_virtualDisplayActive = TRUE;
+                SetHudCentering(TRUE);
+                g_widescreenActive = TRUE;
+                LogHRESULTResult(
+                    "Enabled the virtual viewport; real width=0x",
+                    sizeof("Enabled the virtual viewport; real width=0x") - 1,
+                    targetWidth);
+                LogHRESULTResult(
+                    "  real height=0x",
+                    sizeof("  real height=0x") - 1,
+                    targetHeight);
+                LogHRESULTResult(
+                    "  virtual width=0x",
+                    sizeof("  virtual width=0x") - 1,
+                    kVirtualDisplayWidth);
+                return result;
+            }
+
             LogMessage(
-                "Enabled the 856x480 virtual viewport stretched to 1920x1080.\r\n",
-                sizeof("Enabled the 856x480 virtual viewport stretched to 1920x1080.\r\n") - 1);
-            return result;
+                "The requested display mode was unavailable.\r\n",
+                sizeof("The requested display mode was unavailable.\r\n") - 1);
         }
 
         LogMessage(
-            "1920x1080 was unavailable; trying the 720x480 fallback.\r\n",
-            sizeof("1920x1080 was unavailable; trying the 720x480 fallback.\r\n") - 1);
+            "Trying the 720x480 fallback.\r\n",
+            sizeof("Trying the 720x480 fallback.\r\n") - 1);
         result = CallOriginalSetDisplayMode(
             directDraw,
             kFallbackDisplayWidth,

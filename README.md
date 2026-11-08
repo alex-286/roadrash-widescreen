@@ -32,12 +32,14 @@ versions.
 The proxy now has a version-checked runtime patch for the German Road Rash
 Windows 95 executable (1.0A). It hooks the game's `IDirectDraw::SetDisplayMode`
 call used when entering the high-resolution game renderer. On that call only,
-it sets the real display mode to 1920x1080 at 8 bits per pixel, but tells the
-game it is running at 856x480 (logical width 428). The gameplay flip-chain
-primary surface is replaced by a plain 1920x1080 primary plus an 856x480
+it sets the real display mode (the desktop resolution by default, see the ini
+settings) at 8 bits per pixel, but tells the
+game it is running at a 480-line virtual view whose width fits the display's
+aspect ratio (856x480 for 16:9, logical width 428). The gameplay flip-chain
+primary surface is replaced by a plain primary of the real size plus an
 offscreen "virtual" back buffer, and each `Flip` is turned into a stretched
-`Blt` of that buffer onto the screen. The patch does not request modes above
-1920x1080. If 1920x1080 is unavailable, it tries the previously tested 720x480
+`Blt` of that buffer onto the screen. If the chosen mode is unavailable, it
+tries 1920x1080 and then the previously tested 720x480
 (3:2) mode, then retains the original 640x480 mode. It restores the original
 game state when returning to the menu. The executable on disk is not changed.
 
@@ -79,19 +81,25 @@ flip, therefore re-installs the `Flip` hook when needed.
 
   ```ini
   [Display]
-  VirtualWidth=856
+  DisplayWidth=0
+  DisplayHeight=0
+  VirtualWidth=0
   WaitForVBlank=1
   ```
 
-  `VirtualWidth` is the game's render width (rounded down to a multiple of 8,
-  640-856, default 856). It is stretched to 1920x1080, so values other than 856
-  change the aspect ratio. Invalid values are ignored. `WaitForVBlank` (default
+  `DisplayWidth`/`DisplayHeight` select the real 8-bit display mode. 0 (the
+  default) uses the desktop resolution, e.g. 2560x1440. If that mode is
+  rejected, 1920x1080 is tried, then the 720x480 fallback. `VirtualWidth` is
+  the game's render width (multiple of 8, 640-1280); 0 (the default) picks the
+  width that best fits the display's aspect ratio at 480 lines (856 for 16:9,
+  1120 for 21:9). Setting it manually changes the aspect ratio. Invalid values
+  are ignored. `WaitForVBlank` (default
   1) makes each frame wait for the vertical blank before it is presented, which
   prevents tearing but caps the frame rate at the monitor's refresh rate. Set it
   to 0 to disable the wait. An unsupported wait is ignored rather than blocking.
 
-Known limitations: with `WaitForVBlank=0`, tearing is possible, and Windows
-98 behavior (including 1920x1080x8 support) is untested.
+Known limitations: with `WaitForVBlank=0`, tearing is possible. Widths above
+856 and displays above 1920x1080 are untested, and so is Windows 98.
 
 The proxy loads the operating system's DirectDraw DLL and does not currently
 chain through DDrawCompat or dgVoodoo2. Modern-Windows translation-layer
