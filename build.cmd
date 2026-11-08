@@ -51,11 +51,17 @@ set "LIB=%PLATFORM_SDK_ROOT%\Lib;%LIB%"
 
 cl.exe /nologo /Zl /O2 /W3 /DWIN32 /D_WINDOWS /D_USRDLL /D_MBCS /Fo"%BUILD%\ddraw_proxy.obj" /c "%ROOT%\src\ddraw_proxy.cpp"
 if errorlevel 1 (
-    echo C++ compilation failed.
+    echo DirectDraw proxy compilation failed.
     exit /b 1
 )
 
-link.exe /nologo /NODEFAULTLIB /DLL /MACHINE:I386 /SUBSYSTEM:WINDOWS,4.0 /ENTRY:DllMain@12 /DEF:"%ROOT%\src\ddraw.def" /OUT:"%BUILD%\ddraw.dll" "%BUILD%\ddraw_proxy.obj" kernel32.lib
+cl.exe /nologo /Zl /GS- /O2 /W3 /DWIN32 /D_WINDOWS /D_USRDLL /D_MBCS /Fo"%BUILD%\road_rash_patch.obj" /c "%ROOT%\src\road_rash_patch.cpp"
+if errorlevel 1 (
+    echo Road Rash patch compilation failed.
+    exit /b 1
+)
+
+link.exe /nologo /NODEFAULTLIB /DLL /MACHINE:I386 /SUBSYSTEM:WINDOWS,4.0 /ENTRY:DllMain@12 /DEF:"%ROOT%\src\ddraw.def" /OUT:"%BUILD%\ddraw.dll" "%BUILD%\ddraw_proxy.obj" "%BUILD%\road_rash_patch.obj" kernel32.lib
 if errorlevel 1 (
     echo DLL linking failed.
     exit /b 1

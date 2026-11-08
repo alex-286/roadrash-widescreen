@@ -1,8 +1,8 @@
 # Road Rash Widescreen Patch
 
-This repository starts with an x86 `ddraw.dll` proxy built by the Visual C++
-2005 compiler. The first milestone is a DLL that exports common DirectDraw
-entry points and forwards them to the operating system's DirectDraw DLL.
+This repository builds a 32-bit x86 `ddraw.dll` proxy with Visual C++ 2005. It
+forwards common DirectDraw entry points to the operating system's DirectDraw
+DLL and includes an experimental, version-checked Road Rash widescreen hook.
 
 ## Build
 
@@ -27,24 +27,45 @@ subsystem version to 4.0. It uses only legacy Windows APIs so the proxy can be
 tested on Windows 98 as well as in 32-bit game processes on newer Windows
 versions.
 
-## Current scope
+## Experimental widescreen prototype
 
-This is a forwarding proxy, not yet a widescreen patch. It does not change
-display modes, surface sizes, software-renderer pitch, projection, or HUD
-layout. Intercepting `SetDisplayMode` alone cannot make a software renderer
-produce a correct Hor+ image. The earlier example offset `0x000A1234` was only
-a placeholder and must not be used.
+The proxy now has a version-checked runtime patch for the German Road Rash
+Windows 95 executable (1.0A). It hooks the game's `IDirectDraw::SetDisplayMode`
+call used when entering the high-resolution game renderer. On that call only,
+it requests 720x480 at 8 bits per pixel and updates the game's logical
+horizontal render width to 360 and its clip bounds. This is a 3:2 viewport,
+not the original 16:9 target; the native mode probe found 720x480x8 but not
+854x480x8 on the current test system. The patch restores the original 640x480
+state when the game returns to its menu. The executable on disk is not changed.
 
-The proxy also does not currently chain through DDrawCompat or dgVoodoo2.
-Modern-Windows rendering compatibility therefore still needs separate testing.
-The same x86 DLL is intended for the game's 32-bit process; it is not a 64-bit
-DLL.
+The prototype requires the game's **High Resolution** option (640x480). Other
+resolutions, executable builds, and display-mode calls are passed through
+unchanged. If 720x480 is unavailable, the proxy falls back to 640x480. Native
+mode support can vary by system. The supported executable is identified by its
+PE timestamp, image size, and instruction signatures; unknown versions are
+left untouched.
 
-Initial inspection of the German PC release confirmed that `ROADRASH.EXE` is a
-32-bit x86 executable importing `DDRAW.dll!DirectDrawCreate` by name. Its
-initialization requests 640x480 DirectDraw modes at 8 and 16 bits per pixel.
-That confirms the proxy exports the game's entry point, but is not enough to
-implement Hor+: the render-surface allocation, software-renderer pitch,
-projection, and HUD behavior still need to be identified and tested. These
-mode requests are observations, not patch offsets. No game executable is
-included or modified by this starter project.
+This is the first rendering patch, not yet a visually verified release. It
+expands the renderer's logical width and clipping region, but the game still
+needs runtime testing to confirm that every road-projection and HUD path
+responds correctly. The DLL writes diagnostic messages to
+`RoadRashWidescreen.log` beside the game executable. It changes only the
+existing `SetDisplayMode` vtable slot; the first eight calls log the caller
+address, requested mode, and HRESULT. Remove an old log before a diagnostic
+run. After the first successful display-mode change, it also enumerates the
+native DirectDraw modes and logs their dimensions and bit depths, up to 64
+entries. This probe does not change the active display mode.
+
+The proxy loads the operating system's DirectDraw DLL and does not currently
+chain through DDrawCompat or dgVoodoo2. Modern-Windows translation-layer
+compatibility and actual Windows 98 runtime behavior remain to be tested.
+The same x86 DLL is intended for the game's 32-bit process; it is not a
+64-bit DLL.
+
+## Test installation
+
+For a local test, copy `build\ddraw.dll` beside the supported `ROADRASH.EXE`.
+Do not replace the Windows system copy of `ddraw.dll`. Keep the game's
+**High Resolution** option enabled, then check `RoadRashWidescreen.log` beside
+the executable for version-recognition, hook, and display-mode results.
+Removing the local proxy restores the game's normal DirectDraw loading.

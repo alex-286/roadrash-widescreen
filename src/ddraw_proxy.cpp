@@ -1,6 +1,8 @@
 #include <windows.h>
 #include <unknwn.h>
 
+#include "road_rash_patch.h"
+
 typedef HRESULT (WINAPI *DirectDrawCreateFn)(GUID*, LPVOID*, IUnknown*);
 typedef HRESULT (WINAPI *DirectDrawCreateExFn)(GUID*, LPVOID*, REFIID, IUnknown*);
 typedef HRESULT (WINAPI *DirectDrawEnumerateAFn)(LPVOID, LPVOID);
@@ -99,7 +101,12 @@ extern "C" HRESULT WINAPI DirectDrawCreate(
     {
         return ProxyFailure();
     }
-    return procedure(lpGuid, lplpDD, pUnkOuter);
+    HRESULT result = procedure(lpGuid, lplpDD, pUnkOuter);
+    if (SUCCEEDED(result) && lplpDD != NULL && *lplpDD != NULL)
+    {
+        InstallRoadRashWidescreenHook(*lplpDD);
+    }
+    return result;
 }
 
 extern "C" HRESULT WINAPI DirectDrawCreateEx(

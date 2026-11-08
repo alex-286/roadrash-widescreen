@@ -2,9 +2,10 @@
     "version": "2.0.0",
     "tasks": [
         {
-            "label": "Build ddraw.dll (MSVC 2005 x86)",
+            "label": "Build Road Rash widescreen ddraw.dll (MSVC 2005 x86)",
             "type": "shell",
             "command": "${workspaceFolder}\\build.cmd",
+            "detail": "Builds the x86 proxy and experimental widescreen patch to build\\ddraw.dll.",
             "options": {
                 "cwd": "${workspaceFolder}"
             },
