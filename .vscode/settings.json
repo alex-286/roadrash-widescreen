@@ -1,0 +1,9 @@
+{
+    "VsCodeTaskButtons.tasks": [
+        {
+            "label": "$(tools) Build ddraw.dll",
+            "task": "Build ddraw.dll (MSVC 2005 x86)",
+            "tooltip": "Build the x86 DirectDraw proxy with Visual C++ 2005"
+        }
+    ]
+}
