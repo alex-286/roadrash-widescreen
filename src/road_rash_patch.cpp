@@ -9,6 +9,11 @@ typedef HRESULT (WINAPI *DirectDrawSetDisplayModeFn)(
     DWORD,
     DWORD,
     DWORD);
+typedef HRESULT (WINAPI *DirectDrawCreateSurfaceFn)(
+    LPVOID,
+    LPVOID,
+    LPVOID*,
+    LPVOID);
 typedef HRESULT (WINAPI *DirectDrawEnumModesCallback)(LPVOID, LPVOID);
 typedef HRESULT (WINAPI *DirectDrawEnumDisplayModesFn)(
     LPVOID,
@@ -21,6 +26,7 @@ struct DirectDrawHookState
 {
     LPVOID object;
     LPVOID* vtable;
+    DirectDrawCreateSurfaceFn originalCreateSurface;
     DirectDrawSetDisplayModeFn originalSetDisplayMode;
 };
 
@@ -30,8 +36,30 @@ static const DWORD kExpectedImageSize = 0x000D8000;
 static const DWORD kGameModeSetDisplayModeReturnRva = 0x00048903;
 static const DWORD kMenuSetDisplayModeReturnRva = 0x000485F1;
 static const DWORD kMenuSetDisplayMode16ReturnRva = 0x00048609;
+static const DWORD kPrimaryCreateReturnRva = 0x00048A58;
+static const DWORD kCreateSurfaceVtableIndex = 6;
 static const DWORD kEnumDisplayModesVtableIndex = 8;
+static const DWORD kWaitForVerticalBlankVtableIndex = 22;
 static const DWORD kSetDisplayModeVtableIndex = 21;
+static const DWORD kSurfaceReleaseVtableIndex = 2;
+static const DWORD kSurfaceBltVtableIndex = 5;
+static const DWORD kSurfaceFlipVtableIndex = 11;
+static const DWORD kSurfaceGetAttachedVtableIndex = 12;
+static const DWORD kSurfaceVtableRangeCount = 23;
+static const DWORD kSurfaceGetFlipStatusVtableIndex = 18;
+static const DWORD kSurfaceIsLostVtableIndex = 24;
+static const DWORD kDdsdCaps = 0x00000001;
+static const DWORD kDdsCapsBackBuffer = 0x00000004;
+static const DWORD kDdsCapsOffscreenPlain = 0x00000040;
+static const DWORD kDdsCapsPrimarySurface = 0x00000200;
+static const DWORD kDdsCapsPrimaryFlipChain = 0x00000218;
+static const DWORD kDdsdPrimaryChainFlags = 0x00000021;
+static const DWORD kDdsurfaceDescSize = 0x0000006C;
+static const DWORD kDdsurfaceDescFlagsOffset = 0x00000004;
+static const DWORD kDdsurfaceDescBackBufferCountOffset = 0x00000014;
+static const DWORD kDdsurfaceDescCapsOffset = 0x00000068;
+static const DWORD kDdbltWait = 0x01000000;
+static const DWORD kDdWaitVbBlockBegin = 0x00000001;
 static const HRESULT kDdEnumReturnOk = 1;
 // DDSURFACEDESC v1 places dimensions at 0x08/0x0C and RGB bit count at 0x54.
 static const DWORD kDdsdHeight = 0x00000002;
@@ -59,12 +87,45 @@ static const DWORD kOriginalLogicalWidth = 320;
 static const DWORD kOriginalLogicalHeight = 240;
 static const DWORD kOriginalDisplayWidth = 640;
 static const DWORD kOriginalDisplayHeight = 480;
-static const DWORD kWidescreenLogicalWidth = 360;
-static const DWORD kWidescreenDisplayWidth = 720;
+// The game renders into a 856x480 virtual buffer that is stretched to the
+// real 1920x1080 display mode when it flips.
+static const DWORD kVirtualLogicalWidth = 428;
+static const DWORD kVirtualDisplayWidth = 856;
+static const DWORD kTargetDisplayWidth = 1920;
+static const DWORD kTargetDisplayHeight = 1080;
+static const DWORD kFallbackLogicalWidth = 360;
+static const DWORD kFallbackDisplayWidth = 720;
+
+typedef ULONG (WINAPI *SurfaceReleaseFn)(LPVOID);
+typedef HRESULT (WINAPI *SurfaceBltFn)(
+    LPVOID,
+    LPVOID,
+    LPVOID,
+    LPVOID,
+    DWORD,
+    LPVOID);
+typedef HRESULT (WINAPI *SurfaceFlipFn)(LPVOID, LPVOID, DWORD);
+typedef HRESULT (WINAPI *SurfaceGetAttachedFn)(LPVOID, LPVOID, LPVOID*);
+typedef HRESULT (WINAPI *WaitForVerticalBlankFn)(LPVOID, DWORD, HANDLE);
 
 static DirectDrawHookState g_hookState;
 static DWORD g_gameBase = 0;
 static BOOL g_widescreenActive = FALSE;
+static BOOL g_virtualDisplayActive = FALSE;
+static LPVOID g_virtualPrimary = NULL;
+static LPVOID g_virtualBack = NULL;
+static LPVOID* g_surfaceVtable = NULL;
+static SurfaceReleaseFn g_originalSurfaceRelease = NULL;
+static SurfaceBltFn g_originalSurfaceBlt = NULL;
+static SurfaceFlipFn g_originalSurfaceFlip = NULL;
+typedef HRESULT (WINAPI *SurfaceQueryFn)(LPVOID, DWORD);
+typedef HRESULT (WINAPI *SurfaceIsLostFn)(LPVOID);
+static SurfaceQueryFn g_originalSurfaceGetFlipStatus = NULL;
+static SurfaceIsLostFn g_originalSurfaceIsLost = NULL;
+static DWORD g_queryLogCount = 0;
+static DWORD g_backLogCount = 0;
+static SurfaceGetAttachedFn g_originalSurfaceGetAttached = NULL;
+static DWORD g_flipLogCount = 0;
 static DWORD g_displayModeLogCount = 0;
 static BOOL g_nativeDisplayModesLogged = FALSE;
 
@@ -194,7 +255,8 @@ struct NativeDisplayModeLogContext
 
     Mode modes[64];
     DWORD loggedModes;
-    BOOL hasWidescreen8BitMode;
+    BOOL hasTarget8BitMode;
+    BOOL hasFallback8BitMode;
 };
 
 static void LogNativeDisplayMode(
@@ -267,11 +329,18 @@ static HRESULT WINAPI LogNativeDisplayModeCallback(
         return kDdEnumReturnOk;
     }
 
-    if (width == kWidescreenDisplayWidth &&
+    if (width == kTargetDisplayWidth &&
+        height == kTargetDisplayHeight &&
+        bitsPerPixel == 8)
+    {
+        logContext->hasTarget8BitMode = TRUE;
+    }
+
+    if (width == kFallbackDisplayWidth &&
         height == kOriginalDisplayHeight &&
         bitsPerPixel == 8)
     {
-        logContext->hasWidescreen8BitMode = TRUE;
+        logContext->hasFallback8BitMode = TRUE;
     }
 
     if (logContext->loggedModes < sizeof(logContext->modes) / sizeof(logContext->modes[0]))
@@ -312,7 +381,8 @@ static void LogNativeDisplayModes(LPVOID directDraw)
     enumerateModes = reinterpret_cast<DirectDrawEnumDisplayModesFn>(
         g_hookState.vtable[kEnumDisplayModesVtableIndex]);
     logContext.loggedModes = 0;
-    logContext.hasWidescreen8BitMode = FALSE;
+    logContext.hasTarget8BitMode = FALSE;
+    logContext.hasFallback8BitMode = FALSE;
     result = enumerateModes(
         directDraw,
         0,
@@ -334,7 +404,20 @@ static void LogNativeDisplayModes(LPVOID directDraw)
                 logContext.modes[modeIndex].bitsPerPixel);
         }
 
-        if (logContext.hasWidescreen8BitMode)
+        if (logContext.hasTarget8BitMode)
+        {
+            LogMessage(
+                "Native DirectDraw mode list includes 1920x1080x8.\r\n",
+                sizeof("Native DirectDraw mode list includes 1920x1080x8.\r\n") - 1);
+        }
+        else
+        {
+            LogMessage(
+                "Native DirectDraw mode list does not include 1920x1080x8.\r\n",
+                sizeof("Native DirectDraw mode list does not include 1920x1080x8.\r\n") - 1);
+        }
+
+        if (logContext.hasFallback8BitMode)
         {
             LogMessage(
                 "Native DirectDraw mode list includes 720x480x8.\r\n",
@@ -414,6 +497,12 @@ static DWORD FindSupportedGameBase()
     static const BYTE setDisplayModeCall[] = {
         0xFF, 0x55, 0x54
     };
+    static const BYTE primaryCreateCall[] = {
+        0xFF, 0x53, 0x18
+    };
+    static const BYTE getAttachedSurfaceCall[] = {
+        0xFF, 0x53, 0x30
+    };
 
     if (module == NULL)
     {
@@ -448,7 +537,15 @@ static DWORD FindSupportedGameBase()
         !MatchesBytes(
             image + 0x00048900,
             setDisplayModeCall,
-            sizeof(setDisplayModeCall)))
+            sizeof(setDisplayModeCall)) ||
+        !MatchesBytes(
+            image + 0x00048A55,
+            primaryCreateCall,
+            sizeof(primaryCreateCall)) ||
+        !MatchesBytes(
+            image + 0x00048A70,
+            getAttachedSurfaceCall,
+            sizeof(getAttachedSurfaceCall)))
     {
         return 0;
     }
@@ -466,24 +563,30 @@ static void WriteGameDword(DWORD rva, DWORD value)
     *reinterpret_cast<DWORD*>(g_gameBase + rva) = value;
 }
 
-static void SetWidescreenGameState()
+static void SetWidescreenGameState(
+    DWORD logicalWidth,
+    DWORD logicalHeight,
+    DWORD displayWidth,
+    DWORD displayHeight)
 {
-    WriteGameDword(kLogicalWidthARva, kWidescreenLogicalWidth);
-    WriteGameDword(kLogicalWidthBRva, kWidescreenLogicalWidth);
+    WriteGameDword(kLogicalWidthARva, logicalWidth);
+    WriteGameDword(kLogicalWidthBRva, logicalWidth);
+    WriteGameDword(kLogicalHeightRva, logicalHeight);
     WriteGameDword(kDisplayOriginXRva, 0);
     WriteGameDword(kDisplayOriginYRva, 0);
-    WriteGameDword(kDisplayWidthRva, kWidescreenDisplayWidth);
-    WriteGameDword(kDisplayHeightRva, kOriginalDisplayHeight);
+    WriteGameDword(kDisplayWidthRva, displayWidth);
+    WriteGameDword(kDisplayHeightRva, displayHeight);
     WriteGameDword(kClipLeftRva, 0);
     WriteGameDword(kClipTopRva, 0);
-    WriteGameDword(kClipRightRva, kWidescreenDisplayWidth);
-    WriteGameDword(kClipBottomRva, kOriginalDisplayHeight - 1);
+    WriteGameDword(kClipRightRva, displayWidth);
+    WriteGameDword(kClipBottomRva, displayHeight - 1);
 }
 
 static void RestoreOriginalGameState()
 {
     WriteGameDword(kLogicalWidthARva, kOriginalLogicalWidth);
     WriteGameDword(kLogicalWidthBRva, kOriginalLogicalWidth);
+    WriteGameDword(kLogicalHeightRva, kOriginalLogicalHeight);
     WriteGameDword(kDisplayOriginXRva, 0);
     WriteGameDword(kDisplayOriginYRva, 0);
     WriteGameDword(kDisplayWidthRva, kOriginalDisplayWidth);
@@ -492,7 +595,396 @@ static void RestoreOriginalGameState()
     WriteGameDword(kClipTopRva, 0);
     WriteGameDword(kClipRightRva, kOriginalDisplayWidth);
     WriteGameDword(kClipBottomRva, kOriginalDisplayHeight - 1);
+    g_virtualDisplayActive = FALSE;
 }
+
+static void ZeroDescription(BYTE* description)
+{
+    volatile DWORD* words = reinterpret_cast<volatile DWORD*>(description);
+    DWORD index;
+
+    for (index = 0; index < kDdsurfaceDescSize / sizeof(DWORD); ++index)
+    {
+        words[index] = 0;
+    }
+}
+
+static void InstallSurfaceHooks(LPVOID surface);
+
+static HRESULT CreateVirtualPrimary(
+    LPVOID directDraw,
+    LPVOID surfaceDescription,
+    LPVOID* surface,
+    LPVOID outer)
+{
+    BYTE* description = reinterpret_cast<BYTE*>(surfaceDescription);
+    BYTE backDescription[kDdsurfaceDescSize];
+    DWORD* flags;
+    DWORD* backBufferCount;
+    DWORD* caps;
+    DWORD originalFlags;
+    DWORD originalBackBufferCount;
+    DWORD originalCaps;
+    LPVOID backBuffer = NULL;
+    HRESULT result;
+
+    if (description == NULL ||
+        surface == NULL ||
+        *reinterpret_cast<DWORD*>(description) < kDdsurfaceDescSize)
+    {
+        return E_FAIL;
+    }
+
+    flags = reinterpret_cast<DWORD*>(
+        description + kDdsurfaceDescFlagsOffset);
+    backBufferCount = reinterpret_cast<DWORD*>(
+        description + kDdsurfaceDescBackBufferCountOffset);
+    caps = reinterpret_cast<DWORD*>(
+        description + kDdsurfaceDescCapsOffset);
+    if (*flags != kDdsdPrimaryChainFlags || *caps != kDdsCapsPrimaryFlipChain)
+    {
+        LogMessage(
+            "Virtual display skipped; the primary surface descriptor was unexpected.\r\n",
+            sizeof("Virtual display skipped; the primary surface descriptor was unexpected.\r\n") - 1);
+        return g_hookState.originalCreateSurface(
+            directDraw,
+            surfaceDescription,
+            surface,
+            outer);
+    }
+
+    originalFlags = *flags;
+    originalBackBufferCount = *backBufferCount;
+    originalCaps = *caps;
+    *flags = kDdsdCaps;
+    *backBufferCount = 0;
+    *caps = kDdsCapsPrimarySurface;
+    result = g_hookState.originalCreateSurface(
+        directDraw,
+        surfaceDescription,
+        surface,
+        outer);
+    *flags = originalFlags;
+    *backBufferCount = originalBackBufferCount;
+    *caps = originalCaps;
+    if (FAILED(result))
+    {
+        LogHRESULTResult(
+            "Real primary surface creation failed=0x",
+            sizeof("Real primary surface creation failed=0x") - 1,
+            result);
+        return result;
+    }
+
+    InstallSurfaceHooks(*surface);
+    ZeroDescription(backDescription);
+    *reinterpret_cast<DWORD*>(backDescription) = kDdsurfaceDescSize;
+    *reinterpret_cast<DWORD*>(backDescription + kDdsurfaceDescFlagsOffset) =
+        kDdsdCaps | kDdsdHeight | kDdsdWidth;
+    *reinterpret_cast<DWORD*>(backDescription + kDdsurfaceDescHeightOffset) =
+        kOriginalDisplayHeight;
+    *reinterpret_cast<DWORD*>(backDescription + kDdsurfaceDescWidthOffset) =
+        kVirtualDisplayWidth;
+    *reinterpret_cast<DWORD*>(backDescription + kDdsurfaceDescCapsOffset) =
+        kDdsCapsOffscreenPlain;
+    result = g_hookState.originalCreateSurface(
+        directDraw,
+        backDescription,
+        &backBuffer,
+        NULL);
+    if (FAILED(result))
+    {
+        LogHRESULTResult(
+            "Virtual back buffer creation failed=0x",
+            sizeof("Virtual back buffer creation failed=0x") - 1,
+            result);
+        g_originalSurfaceRelease(*surface);
+        *surface = NULL;
+        return result;
+    }
+
+    g_virtualPrimary = *surface;
+    g_virtualBack = backBuffer;
+    LogMessage(
+        "Created the real 1920x1080 primary surface and a 856x480 virtual back buffer.\r\n",
+        sizeof("Created the real 1920x1080 primary surface and a 856x480 virtual back buffer.\r\n") - 1);
+    return result;
+}
+
+static ULONG WINAPI HookedSurfaceRelease(LPVOID surface)
+{
+    ULONG count = g_originalSurfaceRelease(surface);
+
+    if (surface == g_virtualPrimary && count == 0)
+    {
+        LPVOID back = g_virtualBack;
+
+        g_virtualPrimary = NULL;
+        g_virtualBack = NULL;
+        if (back != NULL)
+        {
+            g_originalSurfaceRelease(back);
+        }
+    }
+
+    return count;
+}
+
+static HRESULT WINAPI HookedSurfaceGetAttached(
+    LPVOID surface,
+    LPVOID capabilities,
+    LPVOID* attached)
+{
+    if (surface == g_virtualPrimary &&
+        g_virtualBack != NULL &&
+        capabilities != NULL &&
+        attached != NULL &&
+        (*reinterpret_cast<DWORD*>(capabilities) & kDdsCapsBackBuffer) != 0)
+    {
+        typedef ULONG (WINAPI *AddRefFn)(LPVOID);
+        LPVOID* backVtable = *reinterpret_cast<LPVOID**>(g_virtualBack);
+
+        reinterpret_cast<AddRefFn>(backVtable[1])(g_virtualBack);
+        *attached = g_virtualBack;
+        LogMessage(
+            "Returned the virtual back buffer to GetAttachedSurface.\r\n",
+            sizeof("Returned the virtual back buffer to GetAttachedSurface.\r\n") - 1);
+        return S_OK;
+    }
+
+    return g_originalSurfaceGetAttached(surface, capabilities, attached);
+}
+
+static HRESULT WINAPI HookedSurfaceFlip(
+    LPVOID surface,
+    LPVOID target,
+    DWORD flags)
+{
+    HRESULT result;
+
+    if (surface != g_virtualPrimary || g_virtualBack == NULL)
+    {
+        if (g_virtualDisplayActive && g_flipLogCount < 8)
+        {
+            ++g_flipLogCount;
+            LogMessage(
+                "Flip called on a non-virtual surface.\r\n",
+                sizeof("Flip called on a non-virtual surface.\r\n") - 1);
+        }
+        return g_originalSurfaceFlip(surface, target, flags);
+    }
+
+    if (g_flipLogCount < 4)
+    {
+        LogMessage(
+            "Virtual Flip entered.\r\n",
+            sizeof("Virtual Flip entered.\r\n") - 1);
+    }
+
+    result = g_originalSurfaceBlt(
+        surface,
+        NULL,
+        g_virtualBack,
+        NULL,
+        kDdbltWait,
+        NULL);
+    if (g_flipLogCount < 4 || (FAILED(result) && g_flipLogCount < 8))
+    {
+        ++g_flipLogCount;
+        LogHRESULTResult(
+            "Virtual present result=0x",
+            sizeof("Virtual present result=0x") - 1,
+            result);
+    }
+
+    return result;
+}
+
+static HRESULT WINAPI HookedSurfaceGetFlipStatus(LPVOID surface, DWORD flags)
+{
+    HRESULT result = g_originalSurfaceGetFlipStatus(surface, flags);
+
+    if (surface == g_virtualPrimary && g_queryLogCount < 6)
+    {
+        ++g_queryLogCount;
+        LogHRESULTResult(
+            "GetFlipStatus on virtual primary=0x",
+            sizeof("GetFlipStatus on virtual primary=0x") - 1,
+            result);
+    }
+
+    return result;
+}
+
+static void EnsureFlipHook(LPVOID surface)
+{
+    LPVOID* vtable = *reinterpret_cast<LPVOID**>(surface);
+    LPVOID current = vtable[kSurfaceFlipVtableIndex];
+    DWORD oldProtection;
+    DWORD ignoredProtection;
+
+    if (current == reinterpret_cast<LPVOID>(HookedSurfaceFlip))
+    {
+        return;
+    }
+
+    if (!VirtualProtect(
+            &vtable[kSurfaceFlipVtableIndex],
+            sizeof(LPVOID),
+            PAGE_READWRITE,
+            &oldProtection))
+    {
+        return;
+    }
+
+    g_originalSurfaceFlip = reinterpret_cast<SurfaceFlipFn>(current);
+    vtable[kSurfaceFlipVtableIndex] =
+        reinterpret_cast<LPVOID>(HookedSurfaceFlip);
+    VirtualProtect(
+        &vtable[kSurfaceFlipVtableIndex],
+        sizeof(LPVOID),
+        oldProtection,
+        &ignoredProtection);
+    LogMessage(
+        "The surface Flip slot had been replaced; re-installed the Flip hook.\r\n",
+        sizeof("The surface Flip slot had been replaced; re-installed the Flip hook.\r\n") - 1);
+}
+
+static HRESULT WINAPI HookedSurfaceIsLost(LPVOID surface)
+{
+    HRESULT result = g_originalSurfaceIsLost(surface);
+
+    if (surface == g_virtualPrimary)
+    {
+        EnsureFlipHook(surface);
+    }
+
+    if (surface == g_virtualPrimary && g_queryLogCount < 6)
+    {
+        ++g_queryLogCount;
+        LogHRESULTResult(
+            "IsLost on virtual PRIMARY=0x",
+            sizeof("IsLost on virtual PRIMARY=0x") - 1,
+            result);
+    }
+    else if (surface == g_virtualBack && g_backLogCount < 3)
+    {
+        ++g_backLogCount;
+        LogHRESULTResult(
+            "IsLost on virtual back buffer=0x",
+            sizeof("IsLost on virtual back buffer=0x") - 1,
+            result);
+    }
+
+    return result;
+}
+
+static void InstallSurfaceHooks(LPVOID surface)
+{
+    LPVOID* vtable;
+    DWORD oldProtection;
+    DWORD ignoredProtection;
+
+    if (surface == NULL || g_surfaceVtable != NULL)
+    {
+        return;
+    }
+
+    vtable = *reinterpret_cast<LPVOID**>(surface);
+    if (vtable == NULL ||
+        vtable[kSurfaceReleaseVtableIndex] == NULL ||
+        vtable[kSurfaceBltVtableIndex] == NULL ||
+        vtable[kSurfaceFlipVtableIndex] == NULL ||
+        vtable[kSurfaceGetAttachedVtableIndex] == NULL ||
+        vtable[kSurfaceGetFlipStatusVtableIndex] == NULL ||
+        vtable[kSurfaceIsLostVtableIndex] == NULL)
+    {
+        return;
+    }
+
+    if (!VirtualProtect(
+            &vtable[kSurfaceReleaseVtableIndex],
+            kSurfaceVtableRangeCount * sizeof(LPVOID),
+            PAGE_READWRITE,
+            &oldProtection))
+    {
+        LogMessage(
+            "Could not update the DirectDraw surface vtable.\r\n",
+            sizeof("Could not update the DirectDraw surface vtable.\r\n") - 1);
+        return;
+    }
+
+    g_originalSurfaceRelease = reinterpret_cast<SurfaceReleaseFn>(
+        vtable[kSurfaceReleaseVtableIndex]);
+    g_originalSurfaceBlt = reinterpret_cast<SurfaceBltFn>(
+        vtable[kSurfaceBltVtableIndex]);
+    g_originalSurfaceFlip = reinterpret_cast<SurfaceFlipFn>(
+        vtable[kSurfaceFlipVtableIndex]);
+    g_originalSurfaceGetAttached = reinterpret_cast<SurfaceGetAttachedFn>(
+        vtable[kSurfaceGetAttachedVtableIndex]);
+    vtable[kSurfaceReleaseVtableIndex] =
+        reinterpret_cast<LPVOID>(HookedSurfaceRelease);
+    vtable[kSurfaceFlipVtableIndex] =
+        reinterpret_cast<LPVOID>(HookedSurfaceFlip);
+    vtable[kSurfaceGetAttachedVtableIndex] =
+        reinterpret_cast<LPVOID>(HookedSurfaceGetAttached);
+    g_originalSurfaceGetFlipStatus = reinterpret_cast<SurfaceQueryFn>(
+        vtable[kSurfaceGetFlipStatusVtableIndex]);
+    g_originalSurfaceIsLost = reinterpret_cast<SurfaceIsLostFn>(
+        vtable[kSurfaceIsLostVtableIndex]);
+    vtable[kSurfaceGetFlipStatusVtableIndex] =
+        reinterpret_cast<LPVOID>(HookedSurfaceGetFlipStatus);
+    vtable[kSurfaceIsLostVtableIndex] =
+        reinterpret_cast<LPVOID>(HookedSurfaceIsLost);
+    g_surfaceVtable = vtable;
+    VirtualProtect(
+        &vtable[kSurfaceReleaseVtableIndex],
+        kSurfaceVtableRangeCount * sizeof(LPVOID),
+        oldProtection,
+        &ignoredProtection);
+    LogMessage(
+        "Installed the in-place DirectDraw surface Release/Flip/GetAttachedSurface hooks.\r\n",
+        sizeof("Installed the in-place DirectDraw surface Release/Flip/GetAttachedSurface hooks.\r\n") - 1);
+}
+
+static HRESULT WINAPI HookedCreateSurface(
+    LPVOID directDraw,
+    LPVOID surfaceDescription,
+    LPVOID* surface,
+    LPVOID outer)
+{
+    DWORD caller = reinterpret_cast<DWORD>(_ReturnAddress());
+    HRESULT result;
+
+    if (g_hookState.originalCreateSurface == NULL)
+    {
+        return E_FAIL;
+    }
+
+    if (directDraw == g_hookState.object &&
+        g_virtualDisplayActive &&
+        caller == g_gameBase + kPrimaryCreateReturnRva)
+    {
+        return CreateVirtualPrimary(
+            directDraw,
+            surfaceDescription,
+            surface,
+            outer);
+    }
+
+    result = g_hookState.originalCreateSurface(
+        directDraw,
+        surfaceDescription,
+        surface,
+        outer);
+    if (SUCCEEDED(result) && surface != NULL)
+    {
+        InstallSurfaceHooks(*surface);
+    }
+
+    return result;
+}
+
 
 static HRESULT WINAPI HookedSetDisplayMode(
     LPVOID directDraw,
@@ -570,40 +1062,67 @@ static HRESULT WINAPI HookedSetDisplayMode(
 
         result = CallOriginalSetDisplayMode(
             directDraw,
-            kWidescreenDisplayWidth,
+            kTargetDisplayWidth,
+            kTargetDisplayHeight,
+            bitsPerPixel,
+            caller);
+        if (SUCCEEDED(result))
+        {
+            SetWidescreenGameState(
+                kVirtualLogicalWidth,
+                kOriginalLogicalHeight,
+                kVirtualDisplayWidth,
+                kOriginalDisplayHeight);
+            g_virtualDisplayActive = TRUE;
+            g_widescreenActive = TRUE;
+            LogMessage(
+                "Enabled the 856x480 virtual viewport stretched to 1920x1080.\r\n",
+                sizeof("Enabled the 856x480 virtual viewport stretched to 1920x1080.\r\n") - 1);
+            return result;
+        }
+
+        LogMessage(
+            "1920x1080 was unavailable; trying the 720x480 fallback.\r\n",
+            sizeof("1920x1080 was unavailable; trying the 720x480 fallback.\r\n") - 1);
+        result = CallOriginalSetDisplayMode(
+            directDraw,
+            kFallbackDisplayWidth,
             kOriginalDisplayHeight,
+            bitsPerPixel,
+            caller);
+        if (SUCCEEDED(result))
+        {
+            SetWidescreenGameState(
+                kFallbackLogicalWidth,
+                kOriginalLogicalHeight,
+                kFallbackDisplayWidth,
+                kOriginalDisplayHeight);
+            g_widescreenActive = TRUE;
+            LogMessage(
+                "Enabled the experimental 720x480 (3:2) fallback viewport.\r\n",
+                sizeof("Enabled the experimental 720x480 (3:2) fallback viewport.\r\n") - 1);
+            return result;
+        }
+
+        result = CallOriginalSetDisplayMode(
+            directDraw,
+            width,
+            height,
             bitsPerPixel,
             caller);
         if (FAILED(result))
         {
-            HRESULT fallback = CallOriginalSetDisplayMode(
-                directDraw,
-                width,
-                height,
-                bitsPerPixel,
-                caller);
-
-            if (FAILED(fallback))
-            {
-                LogMessage(
-                    "720x480 and the original 640x480 display modes both failed.\r\n",
-                    sizeof("720x480 and the original 640x480 display modes both failed.\r\n") - 1);
-            }
-            else
-            {
-                LogMessage(
-                    "720x480 was unavailable; retained the original 640x480 display mode.\r\n",
-                    sizeof("720x480 was unavailable; retained the original 640x480 display mode.\r\n") - 1);
-            }
-
-            return fallback;
+            LogMessage(
+                "1920x1080, 720x480, and the original 640x480 display modes all failed.\r\n",
+                sizeof("1920x1080, 720x480, and the original 640x480 display modes all failed.\r\n") - 1);
+        }
+        else
+        {
+            LogMessage(
+                "1920x1080 and 720x480 were unavailable; retained the original 640x480 mode.\r\n",
+                sizeof("1920x1080 and 720x480 were unavailable; retained the original 640x480 mode.\r\n") - 1);
         }
 
-        SetWidescreenGameState();
-        g_widescreenActive = TRUE;
-        LogMessage(
-            "Enabled the experimental 720x480 (3:2) wider render viewport.\r\n",
-            sizeof("Enabled the experimental 720x480 (3:2) wider render viewport.\r\n") - 1);
         return result;
     }
 
@@ -619,7 +1138,9 @@ BOOL InstallRoadRashWidescreenHook(LPVOID directDraw)
 {
     DWORD base;
     LPVOID* originalVtable;
+    LPVOID* firstHookSlot;
     LPVOID* displayModeSlot;
+    DWORD hookRangeSize;
     DWORD oldProtection;
     DWORD ignoredProtection;
 
@@ -649,6 +1170,7 @@ BOOL InstallRoadRashWidescreenHook(LPVOID directDraw)
 
     originalVtable = *reinterpret_cast<LPVOID**>(directDraw);
     if (originalVtable == NULL ||
+        originalVtable[kCreateSurfaceVtableIndex] == NULL ||
         originalVtable[kSetDisplayModeVtableIndex] == NULL)
     {
         LogMessage(
@@ -670,42 +1192,51 @@ BOOL InstallRoadRashWidescreenHook(LPVOID directDraw)
         return FALSE;
     }
 
+    firstHookSlot = &originalVtable[kCreateSurfaceVtableIndex];
     displayModeSlot = &originalVtable[kSetDisplayModeVtableIndex];
+    hookRangeSize =
+        (kSetDisplayModeVtableIndex - kCreateSurfaceVtableIndex + 1) *
+        sizeof(*firstHookSlot);
     g_hookState.object = directDraw;
     g_hookState.vtable = originalVtable;
+    g_hookState.originalCreateSurface =
+        reinterpret_cast<DirectDrawCreateSurfaceFn>(
+            originalVtable[kCreateSurfaceVtableIndex]);
     g_hookState.originalSetDisplayMode =
         reinterpret_cast<DirectDrawSetDisplayModeFn>(
             originalVtable[kSetDisplayModeVtableIndex]);
 
     if (!VirtualProtect(
-            displayModeSlot,
-            sizeof(*displayModeSlot),
+            firstHookSlot,
+            hookRangeSize,
             PAGE_READWRITE,
             &oldProtection))
     {
         g_hookState.object = NULL;
         g_hookState.vtable = NULL;
+        g_hookState.originalCreateSurface = NULL;
         g_hookState.originalSetDisplayMode = NULL;
         LogMessage(
-            "DirectDraw hook installation failed: could not update the SetDisplayMode vtable slot.\r\n",
-            sizeof("DirectDraw hook installation failed: could not update the SetDisplayMode vtable slot.\r\n") - 1);
+            "DirectDraw hook installation failed: could not update the vtable slots.\r\n",
+            sizeof("DirectDraw hook installation failed: could not update the vtable slots.\r\n") - 1);
         return FALSE;
     }
 
+    *firstHookSlot = reinterpret_cast<LPVOID>(HookedCreateSurface);
     *displayModeSlot = reinterpret_cast<LPVOID>(HookedSetDisplayMode);
     if (!VirtualProtect(
-            displayModeSlot,
-            sizeof(*displayModeSlot),
+            firstHookSlot,
+            hookRangeSize,
             oldProtection,
             &ignoredProtection))
     {
         LogMessage(
-            "SetDisplayMode was hooked, but its original memory protection could not be restored.\r\n",
-            sizeof("SetDisplayMode was hooked, but its original memory protection could not be restored.\r\n") - 1);
+            "DirectDraw hooks were installed, but their original memory protection could not be restored.\r\n",
+            sizeof("DirectDraw hooks were installed, but their original memory protection could not be restored.\r\n") - 1);
     }
 
     LogMessage(
-        "Installed the in-place DirectDraw display-mode hook.\r\n",
-        sizeof("Installed the in-place DirectDraw display-mode hook.\r\n") - 1);
+        "Installed the in-place DirectDraw surface and display-mode hooks.\r\n",
+        sizeof("Installed the in-place DirectDraw surface and display-mode hooks.\r\n") - 1);
     return TRUE;
 }
