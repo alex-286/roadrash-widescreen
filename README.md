@@ -48,20 +48,47 @@ enumerated 1920x1080x8, but Windows 98 still needs to be tested. The supported
 executable is identified by its PE timestamp, image size, and instruction
 signatures; unknown versions are left untouched.
 
-This is the first rendering patch, not yet a visually verified release. It
-expands the renderer's logical width and clipping region, but the game still
-needs runtime testing to confirm that every road-projection and HUD path
-responds correctly. The DLL writes diagnostic messages to
-`RoadRashWidescreen.log` beside the game executable. It changes only the
-existing `CreateSurface` and `SetDisplayMode` vtable slots and the surface
-`Release`, `Flip`, and `GetAttachedSurface` slots; the first eight
-`SetDisplayMode` calls log the caller address, requested mode, and HRESULT. The
-surface replacement happens only at the verified gameplay primary-surface
-`CreateSurface` callsite.
-Remove an old log before a diagnostic run. After the first successful
-display-mode change, it enumerates native DirectDraw modes and logs their
-dimensions and bit depths, up to 64 entries. This probe does not change the
-active display mode.
+Gameplay is verified at 1920x1080 on a modern Windows system. Two game routines
+had to be patched for the wider view, both only while the virtual view is
+active and both undone when returning to the menu:
+
+- **HUD centering:** the cockpit, gauges, needles and text are positioned
+  relative to a horizontal origin value. The call to the HUD routine is
+  redirected so the origin is 108 px while it runs, which centers the
+  640-pixel-wide HUD. A conditional jump that narrows the message rectangle to
+  640 px is made unconditional.
+- **Sky panorama:** the game draws the sky from two 360-pixel halves in three
+  pieces, which leaves gaps (stale or black pixels) beyond 720 px. The call is
+  redirected to a routine that tiles the panorama across the whole view.
+
+Both patch sites are byte-checked before the executable is accepted.
+
+On modern Windows something replaces the surface vtable's `Flip` slot after the
+hooks are installed. The `IsLost` hook, which the game calls right before every
+flip, therefore re-installs the `Flip` hook when needed.
+
+### Diagnostics and settings
+
+- `RoadRashWidescreen.log` beside the game executable records hook and
+  display-mode results; remove an old log before a diagnostic run. After the
+  first successful display-mode change it enumerates native DirectDraw modes
+  (up to 64 entries) without changing the active mode.
+- **F12** during gameplay saves the 8-bit virtual frame, before it is stretched,
+  as `RoadRashFrame.bmp` beside the executable. It uses only legacy APIs.
+- `RoadRashWidescreen.ini` beside the executable is optional:
+
+  ```ini
+  [Display]
+  VirtualWidth=856
+  ```
+
+  `VirtualWidth` is the game's render width (rounded down to a multiple of 8,
+  640-856, default 856). It is stretched to 1920x1080, so values other than 856
+  change the aspect ratio. Invalid values are ignored.
+
+Known limitations: tearing is possible because the presentation does not wait
+for the vertical blank, and Windows 98 behavior (including 1920x1080x8 support)
+is untested.
 
 The proxy loads the operating system's DirectDraw DLL and does not currently
 chain through DDrawCompat or dgVoodoo2. Modern-Windows translation-layer
@@ -74,5 +101,6 @@ The same x86 DLL is intended for the game's 32-bit process; it is not a
 For a local test, copy `build\ddraw.dll` beside the supported `ROADRASH.EXE`.
 Do not replace the Windows system copy of `ddraw.dll`. Keep the game's
 **High Resolution** option enabled, then check `RoadRashWidescreen.log` beside
-the executable for version-recognition, hook, and display-mode results.
+the executable for version-recognition, hook, and display-mode results. Press
+F12 during a race to save `RoadRashFrame.bmp`.
 Removing the local proxy restores the game's normal DirectDraw loading.
