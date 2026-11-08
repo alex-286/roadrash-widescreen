@@ -43,6 +43,19 @@ static const DWORD kHudCallRva = 0x0004C7B9;
 static const DWORD kHudFunctionRva = 0x00046C30;
 static const DWORD kHudMessageJumpRva = 0x00047322;
 static const DWORD kHudCockpitWidth = 640;
+// Sky panorama: the draw call, its two half-surfaces, the destination, and
+// the period/half-width/height globals.
+static const DWORD kSkyCallRva = 0x00043AD3;
+static const DWORD kSkyFunctionRva = 0x0004C800;
+static const DWORD kSkyPeriodRva = 0x0009E644;
+static const DWORD kSkyHalfWidthRva = 0x0009E650;
+static const DWORD kSkyHeightRva = 0x000B7EC8;
+static const DWORD kSkySurfaceARva = 0x00075418;
+static const DWORD kSkySurfaceBRva = 0x0007541C;
+static const DWORD kGameBackBufferRva = 0x00075410;
+static const DWORD kLoadingImageFlagRva = 0x00075390;
+static const DWORD kRenderingEnabledRva = 0x00066680;
+static const DWORD kSurfaceRestoreRva = 0x0001DF60;
 static const DWORD kCreateSurfaceVtableIndex = 6;
 static const DWORD kEnumDisplayModesVtableIndex = 8;
 static const DWORD kWaitForVerticalBlankVtableIndex = 22;
@@ -95,8 +108,8 @@ static const DWORD kOriginalDisplayWidth = 640;
 static const DWORD kOriginalDisplayHeight = 480;
 // The game renders into a 856x480 virtual buffer that is stretched to the
 // real 1920x1080 display mode when it flips.
-static const DWORD kVirtualLogicalWidth = 428;
-static const DWORD kVirtualDisplayWidth = 856;
+static DWORD kVirtualLogicalWidth = 428;
+static DWORD kVirtualDisplayWidth = 856;
 static const DWORD kTargetDisplayWidth = 1920;
 static const DWORD kTargetDisplayHeight = 1080;
 static const DWORD kFallbackLogicalWidth = 360;
@@ -491,6 +504,36 @@ static BOOL MatchesBytes(
     return TRUE;
 }
 
+static void ReadVirtualWidthSetting()
+{
+    CHAR path[MAX_PATH];
+    DWORD length = GetModuleFileNameA(NULL, path, MAX_PATH);
+    static const CHAR fileName[] = "RoadRashWidescreen.ini";
+    DWORD width;
+
+    while (length > 0 && path[length - 1] != '\\')
+    {
+        --length;
+    }
+
+    if (length == 0 || length + sizeof(fileName) > MAX_PATH)
+    {
+        return;
+    }
+
+    lstrcpyA(path + length, fileName);
+    width = GetPrivateProfileIntA(
+        "Display", "VirtualWidth", kVirtualDisplayWidth, path);
+    width &= ~7UL;
+    if (width < 640 || width > 856)
+    {
+        return;
+    }
+
+    kVirtualDisplayWidth = width;
+    kVirtualLogicalWidth = width / 2;
+}
+
 static DWORD FindSupportedGameBase()
 {
     HMODULE module = GetModuleHandleA(NULL);
@@ -511,6 +554,9 @@ static DWORD FindSupportedGameBase()
     };
     static const BYTE hudCall[] = {
         0xE8, 0x72, 0xA4, 0xFF, 0xFF
+    };
+    static const BYTE skyCall[] = {
+        0xE8, 0x28, 0x8D, 0x00, 0x00
     };
     static const BYTE hudMessageJump[] = {
         0x74, 0x0B, 0xC7, 0x84, 0x24, 0x80, 0x00, 0x00, 0x00, 0x80, 0x02
@@ -563,6 +609,10 @@ static DWORD FindSupportedGameBase()
             hudCall,
             sizeof(hudCall)) ||
         !MatchesBytes(
+            image + kSkyCallRva,
+            skyCall,
+            sizeof(skyCall)) ||
+        !MatchesBytes(
             image + kHudMessageJumpRva,
             hudMessageJump,
             sizeof(hudMessageJump)))
@@ -581,6 +631,107 @@ static DWORD ReadGameDword(DWORD rva)
 static void WriteGameDword(DWORD rva, DWORD value)
 {
     *reinterpret_cast<DWORD*>(g_gameBase + rva) = value;
+}
+
+typedef void (__fastcall *SkyDrawFn)(int, int);
+typedef void (__fastcall *SurfaceRestoreFn)(LPVOID);
+typedef HRESULT (WINAPI *SurfaceBltFastFn)(
+    LPVOID, DWORD, DWORD, LPVOID, RECT*, DWORD);
+
+// The game draws the sky panorama in three pieces, which leaves a gap on
+// the right when the view is wider than 720 pixels. Draw the remaining
+// pieces after the original routine.
+static void __fastcall HookedSkyDraw(int scroll, int top)
+{
+    DWORD period = ReadGameDword(kSkyPeriodRva);
+    DWORD half = ReadGameDword(kSkyHalfWidthRva);
+    LONG height = static_cast<LONG>(ReadGameDword(kSkyHeightRva));
+    LONG viewWidth = static_cast<LONG>(ReadGameDword(kDisplayWidthRva));
+    LPVOID first = reinterpret_cast<LPVOID>(ReadGameDword(kSkySurfaceARva));
+    LPVOID second = reinterpret_cast<LPVOID>(ReadGameDword(kSkySurfaceBRva));
+    LPVOID back = reinterpret_cast<LPVOID>(ReadGameDword(kGameBackBufferRva));
+    LONG x;
+    LONG phase = scroll;
+    DWORD index = 0;
+
+    if (ReadGameDword(kLoadingImageFlagRva) != 0)
+    {
+        reinterpret_cast<SkyDrawFn>(g_gameBase + kSkyFunctionRva)(scroll, top);
+        return;
+    }
+
+    if (ReadGameDword(kRenderingEnabledRva) == 0 || period == 0 ||
+        half == 0 || back == NULL || first == NULL || second == NULL)
+    {
+        return;
+    }
+
+    reinterpret_cast<SurfaceRestoreFn>(g_gameBase + kSurfaceRestoreRva)(back);
+    reinterpret_cast<SurfaceRestoreFn>(g_gameBase + kSurfaceRestoreRva)(first);
+    reinterpret_cast<SurfaceRestoreFn>(g_gameBase + kSurfaceRestoreRva)(second);
+
+    while (phase >= static_cast<LONG>(period))
+    {
+        phase -= period;
+    }
+
+    while (phase < 0)
+    {
+        phase += period;
+    }
+
+    if (phase >= static_cast<LONG>(half))
+    {
+        LPVOID swap = first;
+
+        first = second;
+        second = swap;
+        phase -= half;
+    }
+
+    // Tile the panorama across the whole view: first the tail of the
+    // previous half, then alternating halves.
+    x = 0;
+    while (x < viewWidth)
+    {
+        LONG width;
+        LONG left = 0;
+        LPVOID surface;
+        RECT source;
+        LPVOID* vtable = *reinterpret_cast<LPVOID**>(back);
+
+        if (index == 0 && phase != 0)
+        {
+            width = phase;
+            left = half - phase;
+            surface = second;
+        }
+        else
+        {
+            width = half;
+            surface = (((phase != 0 ? index : index + 1) & 1) != 0) ?
+                first : second;
+        }
+
+        if (width > viewWidth - x)
+        {
+            width = viewWidth - x;
+        }
+
+        source.left = left;
+        source.top = 0;
+        source.right = left + width;
+        source.bottom = height;
+        reinterpret_cast<SurfaceBltFastFn>(vtable[7])(
+            back,
+            ReadGameDword(kDisplayOriginXRva) + x,
+            ReadGameDword(kDisplayOriginYRva) + top,
+            surface,
+            &source,
+            0x10);
+        x += width;
+        ++index;
+    }
 }
 
 typedef DWORD (__cdecl *HudDrawFn)(void);
@@ -638,6 +789,13 @@ static void SetHudCentering(BOOL enable)
     *reinterpret_cast<DWORD*>(call + 1) = relative;
     WriteGameCode(kHudCallRva, call, sizeof(call));
     WriteGameCode(kHudMessageJumpRva, &jump, 1);
+
+    target = enable ?
+        reinterpret_cast<DWORD>(HookedSkyDraw) :
+        g_gameBase + kSkyFunctionRva;
+    relative = target - (g_gameBase + kSkyCallRva + 5);
+    *reinterpret_cast<DWORD*>(call + 1) = relative;
+    WriteGameCode(kSkyCallRva, call, sizeof(call));
 }
 
 static void SetWidescreenGameState(
@@ -837,6 +995,142 @@ static HRESULT WINAPI HookedSurfaceGetAttached(
     return g_originalSurfaceGetAttached(surface, capabilities, attached);
 }
 
+typedef HRESULT (WINAPI *SurfaceLockFn)(LPVOID, LPVOID, LPVOID, DWORD, HANDLE);
+typedef HRESULT (WINAPI *SurfaceUnlockFn)(LPVOID, LPVOID);
+typedef HRESULT (WINAPI *SurfaceGetPaletteFn)(LPVOID, LPVOID*);
+typedef HRESULT (WINAPI *PaletteGetEntriesFn)(
+    LPVOID, DWORD, DWORD, DWORD, BYTE*);
+
+static BYTE g_dumpHeader[54 + 1024];
+
+static void WriteDumpDword(BYTE* destination, DWORD value)
+{
+    destination[0] = static_cast<BYTE>(value);
+    destination[1] = static_cast<BYTE>(value >> 8);
+    destination[2] = static_cast<BYTE>(value >> 16);
+    destination[3] = static_cast<BYTE>(value >> 24);
+}
+
+// Diagnostic: F12 saves the 856x480 virtual back buffer as RoadRashFrame.bmp.
+static void DumpVirtualBackBuffer()
+{
+    LPVOID* backVtable = *reinterpret_cast<LPVOID**>(g_virtualBack);
+    LPVOID* primaryVtable = *reinterpret_cast<LPVOID**>(g_virtualPrimary);
+    BYTE description[kDdsurfaceDescSize];
+    BYTE palette[1024];
+    LPVOID paletteObject = NULL;
+    HANDLE file;
+    DWORD written;
+    DWORD index;
+    LONG row;
+    BYTE* pixels;
+    DWORD pitch;
+
+    ZeroDescription(description);
+    *reinterpret_cast<DWORD*>(description) = kDdsurfaceDescSize;
+    {
+        HRESULT lockResult = reinterpret_cast<SurfaceLockFn>(backVtable[25])(
+            g_virtualBack, NULL, description, 1, NULL);
+
+        if (FAILED(lockResult))
+        {
+            LogHRESULTResult(
+                "Frame dump: Lock failed=0x",
+                sizeof("Frame dump: Lock failed=0x") - 1,
+                lockResult);
+            return;
+        }
+    }
+
+    pitch = *reinterpret_cast<DWORD*>(description + 16);
+    pixels = *reinterpret_cast<BYTE**>(description + 0x24);
+    for (index = 0; index < sizeof(palette) / sizeof(DWORD); ++index)
+    {
+        reinterpret_cast<volatile DWORD*>(palette)[index] = 0;
+    }
+
+    if (SUCCEEDED(reinterpret_cast<SurfaceGetPaletteFn>(primaryVtable[20])(
+            g_virtualPrimary, &paletteObject)) &&
+        paletteObject != NULL)
+    {
+        LPVOID* paletteVtable = *reinterpret_cast<LPVOID**>(paletteObject);
+
+        reinterpret_cast<PaletteGetEntriesFn>(paletteVtable[4])(
+            paletteObject, 0, 0, 256, palette);
+        reinterpret_cast<ULONG (WINAPI*)(LPVOID)>(paletteVtable[2])(
+            paletteObject);
+    }
+
+    for (index = 0; index < sizeof(g_dumpHeader); ++index)
+    {
+        reinterpret_cast<volatile BYTE*>(g_dumpHeader)[index] = 0;
+    }
+
+    g_dumpHeader[0] = 'B';
+    g_dumpHeader[1] = 'M';
+    WriteDumpDword(g_dumpHeader + 2, sizeof(g_dumpHeader) + kVirtualDisplayWidth * 480);
+    WriteDumpDword(g_dumpHeader + 10, sizeof(g_dumpHeader));
+    WriteDumpDword(g_dumpHeader + 14, 40);
+    WriteDumpDword(g_dumpHeader + 18, kVirtualDisplayWidth);
+    WriteDumpDword(g_dumpHeader + 22, 480);
+    g_dumpHeader[26] = 1;
+    g_dumpHeader[28] = 8;
+    WriteDumpDword(g_dumpHeader + 46, 256);
+    for (index = 0; index < 256; ++index)
+    {
+        g_dumpHeader[54 + index * 4] = palette[index * 4 + 2];
+        g_dumpHeader[54 + index * 4 + 1] = palette[index * 4 + 1];
+        g_dumpHeader[54 + index * 4 + 2] = palette[index * 4];
+    }
+
+    {
+        CHAR dumpPath[MAX_PATH];
+        DWORD pathLength = GetModuleFileNameA(NULL, dumpPath, MAX_PATH);
+        static const CHAR dumpName[] = "RoadRashFrame.bmp";
+
+        while (pathLength > 0 && dumpPath[pathLength - 1] != '\\')
+        {
+            --pathLength;
+        }
+
+        if (pathLength + sizeof(dumpName) > MAX_PATH)
+        {
+            pathLength = 0;
+        }
+
+        lstrcpyA(dumpPath + pathLength, dumpName);
+        file = CreateFileA(
+            dumpPath,
+            GENERIC_WRITE,
+            0,
+            NULL,
+            CREATE_ALWAYS,
+            FILE_ATTRIBUTE_NORMAL,
+            NULL);
+    }
+    if (file == INVALID_HANDLE_VALUE)
+    {
+        LogMessage(
+            "Frame dump: could not create RoadRashFrame.bmp.\r\n",
+            sizeof("Frame dump: could not create RoadRashFrame.bmp.\r\n") - 1);
+    }
+    else
+    {
+        WriteFile(file, g_dumpHeader, sizeof(g_dumpHeader), &written, NULL);
+        for (row = 479; row >= 0; --row)
+        {
+            WriteFile(file, pixels + row * pitch, kVirtualDisplayWidth, &written, NULL);
+        }
+
+        CloseHandle(file);
+        LogMessage(
+            "Saved RoadRashFrame.bmp.\r\n",
+            sizeof("Saved RoadRashFrame.bmp.\r\n") - 1);
+    }
+
+    reinterpret_cast<SurfaceUnlockFn>(backVtable[32])(g_virtualBack, NULL);
+}
+
 static HRESULT WINAPI HookedSurfaceFlip(
     LPVOID surface,
     LPVOID target,
@@ -861,6 +1155,21 @@ static HRESULT WINAPI HookedSurfaceFlip(
         LogMessage(
             "Virtual Flip entered.\r\n",
             sizeof("Virtual Flip entered.\r\n") - 1);
+    }
+
+    {
+        static BOOL keyWasDown = FALSE;
+        BOOL keyDown = (GetAsyncKeyState(VK_F12) & 0x8000) != 0;
+
+        if (keyDown && !keyWasDown)
+        {
+            LogMessage(
+                "F12 pressed; dumping the virtual frame.\r\n",
+                sizeof("F12 pressed; dumping the virtual frame.\r\n") - 1);
+            DumpVirtualBackBuffer();
+        }
+
+        keyWasDown = keyDown;
     }
 
     result = g_originalSurfaceBlt(
@@ -1241,6 +1550,7 @@ BOOL InstallRoadRashWidescreenHook(LPVOID directDraw)
         }
 
         g_gameBase = base;
+        ReadVirtualWidthSetting();
         LogMessage(
             "Recognized the supported Road Rash German 1.0A executable.\r\n",
             sizeof("Recognized the supported Road Rash German 1.0A executable.\r\n") - 1);
