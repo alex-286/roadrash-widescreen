@@ -70,7 +70,7 @@ flip, therefore re-installs the `Flip` hook when needed.
 ### Diagnostics and settings
 
 - `RoadRashWidescreen.log` beside the game executable records hook and
-  display-mode results; remove an old log before a diagnostic run. After the
+  display-mode results. It is replaced each time the game starts. After the
   first successful display-mode change it enumerates native DirectDraw modes
   (up to 64 entries) without changing the active mode.
 - **F12** during gameplay saves the 8-bit virtual frame, before it is stretched,
@@ -80,15 +80,18 @@ flip, therefore re-installs the `Flip` hook when needed.
   ```ini
   [Display]
   VirtualWidth=856
+  WaitForVBlank=1
   ```
 
   `VirtualWidth` is the game's render width (rounded down to a multiple of 8,
   640-856, default 856). It is stretched to 1920x1080, so values other than 856
-  change the aspect ratio. Invalid values are ignored.
+  change the aspect ratio. Invalid values are ignored. `WaitForVBlank` (default
+  1) makes each frame wait for the vertical blank before it is presented, which
+  prevents tearing but caps the frame rate at the monitor's refresh rate. Set it
+  to 0 to disable the wait. An unsupported wait is ignored rather than blocking.
 
-Known limitations: tearing is possible because the presentation does not wait
-for the vertical blank, and Windows 98 behavior (including 1920x1080x8 support)
-is untested.
+Known limitations: with `WaitForVBlank=0`, tearing is possible, and Windows
+98 behavior (including 1920x1080x8 support) is untested.
 
 The proxy loads the operating system's DirectDraw DLL and does not currently
 chain through DDrawCompat or dgVoodoo2. Modern-Windows translation-layer

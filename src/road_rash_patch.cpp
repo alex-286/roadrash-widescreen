@@ -147,6 +147,9 @@ static SurfaceGetAttachedFn g_originalSurfaceGetAttached = NULL;
 static DWORD g_flipLogCount = 0;
 static DWORD g_displayModeLogCount = 0;
 static BOOL g_nativeDisplayModesLogged = FALSE;
+static BOOL g_waitForVerticalBlank = TRUE;
+// The first log message of a run replaces the previous log.
+static BOOL g_truncateLog = FALSE;
 
 static void LogMessage(const char* message, DWORD length)
 {
@@ -185,9 +188,10 @@ static void LogMessage(const char* message, DWORD length)
         FILE_APPEND_DATA,
         FILE_SHARE_READ | FILE_SHARE_WRITE,
         NULL,
-        OPEN_ALWAYS,
+        g_truncateLog ? CREATE_ALWAYS : OPEN_ALWAYS,
         FILE_ATTRIBUTE_NORMAL,
         NULL);
+    g_truncateLog = FALSE;
     if (file == INVALID_HANDLE_VALUE)
     {
         OutputDebugStringA(message);
@@ -522,6 +526,8 @@ static void ReadVirtualWidthSetting()
     }
 
     lstrcpyA(path + length, fileName);
+    g_waitForVerticalBlank = GetPrivateProfileIntA(
+        "Display", "WaitForVBlank", 1, path) != 0;
     width = GetPrivateProfileIntA(
         "Display", "VirtualWidth", kVirtualDisplayWidth, path);
     width &= ~7UL;
@@ -1172,6 +1178,17 @@ static HRESULT WINAPI HookedSurfaceFlip(
         keyWasDown = keyDown;
     }
 
+    if (g_waitForVerticalBlank && g_hookState.object != NULL)
+    {
+        LPVOID* directDrawVtable =
+            *reinterpret_cast<LPVOID**>(g_hookState.object);
+
+        // The result is ignored so an unsupported wait never blocks the present.
+        reinterpret_cast<WaitForVerticalBlankFn>(
+            directDrawVtable[kWaitForVerticalBlankVtableIndex])(
+                g_hookState.object, kDdWaitVbBlockBegin, NULL);
+    }
+
     result = g_originalSurfaceBlt(
         surface,
         NULL,
@@ -1550,6 +1567,7 @@ BOOL InstallRoadRashWidescreenHook(LPVOID directDraw)
         }
 
         g_gameBase = base;
+        g_truncateLog = TRUE;
         ReadVirtualWidthSetting();
         LogMessage(
             "Recognized the supported Road Rash German 1.0A executable.\r\n",
