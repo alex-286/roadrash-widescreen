@@ -37,6 +37,12 @@ static const DWORD kGameModeSetDisplayModeReturnRva = 0x00048903;
 static const DWORD kMenuSetDisplayModeReturnRva = 0x000485F1;
 static const DWORD kMenuSetDisplayMode16ReturnRva = 0x00048609;
 static const DWORD kPrimaryCreateReturnRva = 0x00048A58;
+// The HUD/cockpit draw call (E8 rel32 to the HUD function) and the JZ that
+// shrinks the message rectangle to 640 pixels when the display origin is not 0.
+static const DWORD kHudCallRva = 0x0004C7B9;
+static const DWORD kHudFunctionRva = 0x00046C30;
+static const DWORD kHudMessageJumpRva = 0x00047322;
+static const DWORD kHudCockpitWidth = 640;
 static const DWORD kCreateSurfaceVtableIndex = 6;
 static const DWORD kEnumDisplayModesVtableIndex = 8;
 static const DWORD kWaitForVerticalBlankVtableIndex = 22;
@@ -503,6 +509,12 @@ static DWORD FindSupportedGameBase()
     static const BYTE getAttachedSurfaceCall[] = {
         0xFF, 0x53, 0x30
     };
+    static const BYTE hudCall[] = {
+        0xE8, 0x72, 0xA4, 0xFF, 0xFF
+    };
+    static const BYTE hudMessageJump[] = {
+        0x74, 0x0B, 0xC7, 0x84, 0x24, 0x80, 0x00, 0x00, 0x00, 0x80, 0x02
+    };
 
     if (module == NULL)
     {
@@ -545,7 +557,15 @@ static DWORD FindSupportedGameBase()
         !MatchesBytes(
             image + 0x00048A70,
             getAttachedSurfaceCall,
-            sizeof(getAttachedSurfaceCall)))
+            sizeof(getAttachedSurfaceCall)) ||
+        !MatchesBytes(
+            image + kHudCallRva,
+            hudCall,
+            sizeof(hudCall)) ||
+        !MatchesBytes(
+            image + kHudMessageJumpRva,
+            hudMessageJump,
+            sizeof(hudMessageJump)))
     {
         return 0;
     }
@@ -561,6 +581,63 @@ static DWORD ReadGameDword(DWORD rva)
 static void WriteGameDword(DWORD rva, DWORD value)
 {
     *reinterpret_cast<DWORD*>(g_gameBase + rva) = value;
+}
+
+typedef DWORD (__cdecl *HudDrawFn)(void);
+
+// Draws the cockpit, gauges, and text with the display origin shifted so the
+// 640-pixel-wide HUD is centered in the wider virtual buffer.
+static DWORD __cdecl HookedHudDraw(void)
+{
+    DWORD result;
+
+    WriteGameDword(
+        kDisplayOriginXRva,
+        (kVirtualDisplayWidth - kHudCockpitWidth) / 2);
+    result = reinterpret_cast<HudDrawFn>(g_gameBase + kHudFunctionRva)();
+    WriteGameDword(kDisplayOriginXRva, 0);
+    return result;
+}
+
+static void WriteGameCode(DWORD rva, const void* bytes, DWORD length)
+{
+    BYTE* destination = reinterpret_cast<BYTE*>(g_gameBase + rva);
+    const BYTE* source = reinterpret_cast<const BYTE*>(bytes);
+    DWORD oldProtection;
+    DWORD ignoredProtection;
+    DWORD index;
+
+    if (!VirtualProtect(
+            destination,
+            length,
+            PAGE_EXECUTE_READWRITE,
+            &oldProtection))
+    {
+        return;
+    }
+
+    for (index = 0; index < length; ++index)
+    {
+        destination[index] = source[index];
+    }
+
+    VirtualProtect(destination, length, oldProtection, &ignoredProtection);
+    FlushInstructionCache(GetCurrentProcess(), destination, length);
+}
+
+static void SetHudCentering(BOOL enable)
+{
+    BYTE call[5];
+    BYTE jump = enable ? 0xEB : 0x74;
+    DWORD target = enable ?
+        reinterpret_cast<DWORD>(HookedHudDraw) :
+        g_gameBase + kHudFunctionRva;
+    DWORD relative = target - (g_gameBase + kHudCallRva + 5);
+
+    call[0] = 0xE8;
+    *reinterpret_cast<DWORD*>(call + 1) = relative;
+    WriteGameCode(kHudCallRva, call, sizeof(call));
+    WriteGameCode(kHudMessageJumpRva, &jump, 1);
 }
 
 static void SetWidescreenGameState(
@@ -595,6 +672,11 @@ static void RestoreOriginalGameState()
     WriteGameDword(kClipTopRva, 0);
     WriteGameDword(kClipRightRva, kOriginalDisplayWidth);
     WriteGameDword(kClipBottomRva, kOriginalDisplayHeight - 1);
+    if (g_virtualDisplayActive)
+    {
+        SetHudCentering(FALSE);
+    }
+
     g_virtualDisplayActive = FALSE;
 }
 
@@ -1074,6 +1156,7 @@ static HRESULT WINAPI HookedSetDisplayMode(
                 kVirtualDisplayWidth,
                 kOriginalDisplayHeight);
             g_virtualDisplayActive = TRUE;
+            SetHudCentering(TRUE);
             g_widescreenActive = TRUE;
             LogMessage(
                 "Enabled the 856x480 virtual viewport stretched to 1920x1080.\r\n",
