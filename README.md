@@ -85,7 +85,7 @@ flip, therefore re-installs the `Flip` hook when needed.
   DisplayHeight=0  ; 0 (default) = desktop height, or a height in pixels
   VirtualWidth=0   ; 0 (default) = fit the display's aspect ratio, or 640-1280
   WaitForVBlank=1  ; 1 (default) = wait for vertical blank, 0 = no wait
-  Filter=none      ; none (default) = old 8-bit path, unchanged, or nearest, hqx
+  Filter=none      ; none (default) = old 8-bit path, or nearest, hqx, sharp-bilinear
   HqxScale=0       ; 0 (default) = auto (hq2x below 1440 lines), 2 = hq2x, 3 = hq3x
   ShowFps=0        ; 0 (default) = off, 1 = show the frame rate during races
   ```
@@ -122,16 +122,17 @@ surface, and stretched to the display. Two staging surfaces take turns, so a
 frame is never written into the surface the previous present may still be
 reading.
 
-| Filter    | Result                                                               |
-|-----------|----------------------------------------------------------------------|
-| `none`    | The 8-bit display mode; the presenter below is not used.             |
-| `nearest` | Converted only, then stretched by DirectDraw without smoothing.      |
-| `hqx`     | hq2x or hq3x (856x480 becomes 1712x960 or 2568x1440), then stretched. |
+| Filter           | Result                                                                |
+|------------------|-----------------------------------------------------------------------|
+| `none`           | The 8-bit display mode; the presenter below is not used.              |
+| `nearest`        | Converted only, then stretched by DirectDraw without smoothing.       |
+| `hqx`            | hq2x or hq3x (856x480 becomes 1712x960 or 2568x1440), then stretched. |
+| `sharp-bilinear` | Scaled to the display size with crisp, evenly sized pixels.           |
 
 The older `Hqx=1` setting still selects `hqx` when `Filter` is missing.
 
-**F11** cycles through the 32-bit filters during a race (nearest, hqx, back
-to nearest) and logs the new one. The selection is kept for later races. The
+**F11** cycles through the 32-bit filters during a race (nearest, hqx,
+sharp-bilinear, back to nearest) and logs the new one. The selection is kept for later races. The
 cycle stays within the 32-bit display mode: switching between the 8-bit and
 32-bit modes in the middle of a race would invalidate all of the game's
 surfaces, so with `Filter=none` F11 does nothing. A filter that cannot
@@ -162,6 +163,20 @@ With 8 threads a frame takes about 1.1 ms (hq2x) or 1.5 ms (hq3x).
 empty `<iostream>`, which the hqx sources include without using. On a
 1920x1080 display the hq2x output (1712x960) is stretched by a factor of
 1.125 without smoothing, which duplicates about every eighth row and column.
+
+#### Sharp bilinear
+
+`src/sharp_bilinear.cpp` scales the 856x480 frame straight to the display
+size, so DirectDraw copies it 1:1 instead of stretching it. It behaves like
+a nearest-neighbor enlargement by the whole factor closest to the scale,
+followed by bilinear filtering of the remainder: each output pixel takes the
+color of its source pixel, and only a narrow band at source pixel edges is
+blended with the neighbor. Non-integer scales such as 2.25 (1920x1080) thus
+give evenly sized pixels instead of every eighth row and column doubled. Per
+column and row, lookup tables hold the source pixel and blend weight; rows are
+filtered horizontally once and then blended vertically. It uses integer
+arithmetic only. One thread takes about 2 ms (2560x1440) or 4 ms (1920x1080)
+per frame on a modern CPU, 8 threads well under 1 ms.
 
 #### Diagnostics
 

@@ -2,6 +2,7 @@
 #include "hqx_upscaler.h"
 #include "fps_overlay.h"
 #include "worker_pool.h"
+#include "sharp_bilinear.h"
 
 #include <intrin.h>
 
@@ -191,6 +192,7 @@ enum FrameFilter
     kFilterNone,
     kFilterNearest,
     kFilterHqx,
+    kFilterSharpBilinear,
     kFilterCount
 };
 
@@ -198,7 +200,8 @@ static const CHAR* const kFilterNames[kFilterCount] =
 {
     "none",
     "nearest",
-    "hqx"
+    "hqx",
+    "sharp-bilinear"
 };
 
 // The filter from the ini, the filter in use (kept across races), whether
@@ -1258,15 +1261,29 @@ static void GetFilterOutputSize(DWORD filter, DWORD* width, DWORD* height)
         return;
     }
 
+    // Filters that scale to the display size are presented 1:1.
+    if (filter == kFilterSharpBilinear)
+    {
+        *width = g_realDisplayWidth;
+        *height = g_realDisplayHeight;
+        return;
+    }
+
     *width = kVirtualDisplayWidth;
     *height = kOriginalDisplayHeight;
 }
 
-// The glyph scale of the FPS overlay, so it appears at the same size
+// The glyph scale of the FPS overlay, so it appears at about the same size
 // whatever the filter's output size is.
 static DWORD GetFilterOverlayScale(DWORD filter)
 {
-    return filter == kFilterHqx ? g_hqxScale : 1;
+    DWORD width;
+    DWORD height;
+    DWORD scale;
+
+    GetFilterOutputSize(filter, &width, &height);
+    scale = (height + kOriginalDisplayHeight / 2) / kOriginalDisplayHeight;
+    return scale == 0 ? 1 : scale;
 }
 
 static void LogFilter(const CHAR* prefix)
@@ -1382,6 +1399,7 @@ static HRESULT CreatePresenterResources(LPVOID directDraw)
 static void ReleasePresenterResources()
 {
     HqxUpscalerShutdown();
+    SharpBilinearShutdown();
     WorkerPoolStop();
 }
 
@@ -1400,6 +1418,22 @@ static BOOL PrepareFilter(DWORD filter)
                 "hqx buffer allocation failed; filter disabled.\r\n",
                 sizeof("hqx buffer allocation failed; filter disabled.\r\n") - 1);
             g_filterUnavailable[kFilterHqx] = TRUE;
+            return FALSE;
+        }
+    }
+
+    if (filter == kFilterSharpBilinear && !SharpBilinearIsReady())
+    {
+        if (!SharpBilinearInitialize(
+                kVirtualDisplayWidth,
+                kOriginalDisplayHeight,
+                g_realDisplayWidth,
+                g_realDisplayHeight))
+        {
+            LogMessage(
+                "Sharp bilinear buffer allocation failed; filter disabled.\r\n",
+                sizeof("Sharp bilinear buffer allocation failed; filter disabled.\r\n") - 1);
+            g_filterUnavailable[kFilterSharpBilinear] = TRUE;
             return FALSE;
         }
     }
@@ -1937,6 +1971,14 @@ static HRESULT PresentFilteredFrame(LPVOID primary, FrameTiming* timing)
             case kFilterHqx:
                 HqxUpscalerScale(
                     sourcePixels, sourcePitch, stagingPixels, stagingPitch);
+                break;
+            case kFilterSharpBilinear:
+                SharpBilinearScale(
+                    sourcePixels,
+                    sourcePitch,
+                    g_paletteRgb,
+                    stagingPixels,
+                    stagingPitch);
                 break;
             default:
                 ConvertFrame(
