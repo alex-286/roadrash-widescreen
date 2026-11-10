@@ -85,7 +85,7 @@ flip, therefore re-installs the `Flip` hook when needed.
   DisplayHeight=0  ; 0 (default) = desktop height, or a height in pixels
   VirtualWidth=0   ; 0 (default) = fit the display's aspect ratio, or 640-1280
   WaitForVBlank=1  ; 1 (default) = wait for vertical blank, 0 = no wait
-  Hqx=0            ; 0 (default) = old 8-bit path, unchanged, 1 = hqx upscaling
+  Filter=none      ; none (default) = old 8-bit path, unchanged, or nearest, hqx
   HqxScale=0       ; 0 (default) = auto (hq2x below 1440 lines), 2 = hq2x, 3 = hq3x
   ShowFps=0        ; 0 (default) = off, 1 = show the frame rate during races
   ```
@@ -100,25 +100,51 @@ flip, therefore re-installs the `Flip` hook when needed.
   1) makes each frame wait for the vertical blank before it is presented, which
   prevents tearing but caps the frame rate at the monitor's refresh rate. Set it
   to 0 to disable the wait. An unsupported wait is ignored rather than blocking.
-  `Hqx=1` enables the hqx upscaler (see below). `HqxScale` selects hq2x (2)
+  `Filter` selects a frame filter (see below). `HqxScale` selects hq2x (2)
   or hq3x (3); 0 (the default) picks the largest factor whose height fits the
   display: hq2x below 1440 lines, hq3x from 1440 lines.
   `ShowFps=1` shows the number of presented frames per second, refreshed twice
   a second, as white digits on a black box in the top-left corner. In the
   8-bit path it is drawn into the virtual frame with the palette's brightest
-  and darkest colors; with hqx it is drawn after scaling, so the filter does
-  not blur it. F12 screenshots do not contain it. The 720x480 fallback does
-  not show it.
+  and darkest colors; with a filter it is drawn after filtering, so the filter
+  does not blur it. F12 screenshots do not contain it. The 720x480 fallback
+  does not show it.
 
-### hqx upscaling
+### Frame filters
 
-With `Hqx=1`, the gameplay display mode is set to 32 bits per pixel instead of
-8. The game still renders 8-bit palettized frames: its back buffer and the
-other gameplay surfaces (sky halves, HUD bitmaps) are created as 8-bit
-system-memory surfaces, and the game palette is attached to the back buffer so
-the GDI-drawn HUD text keeps its colors. On every flip the frame is converted
-through the game palette, scaled with hq2x or hq3x (856x480 becomes 1712x960
-or 2568x1440), and stretched to the display. The vendored
+With any `Filter` other than `none`, the gameplay display mode is set to 32
+bits per pixel instead of 8. The game still renders 8-bit palettized frames:
+its back buffer and the other gameplay surfaces (sky halves, HUD bitmaps) are
+created as 8-bit system-memory surfaces, and the game palette is attached to
+the back buffer so the GDI-drawn HUD text keeps its colors. On every flip the
+frame is converted through the game palette, filtered into a 32-bit staging
+surface, and stretched to the display. Two staging surfaces take turns, so a
+frame is never written into the surface the previous present may still be
+reading.
+
+| Filter    | Result                                                               |
+|-----------|----------------------------------------------------------------------|
+| `none`    | The 8-bit display mode; the presenter below is not used.             |
+| `nearest` | Converted only, then stretched by DirectDraw without smoothing.      |
+| `hqx`     | hq2x or hq3x (856x480 becomes 1712x960 or 2568x1440), then stretched. |
+
+The older `Hqx=1` setting still selects `hqx` when `Filter` is missing.
+
+**F11** cycles through the 32-bit filters during a race (nearest, hqx, back
+to nearest) and logs the new one. The selection is kept for later races. The
+cycle stays within the 32-bit display mode: switching between the 8-bit and
+32-bit modes in the middle of a race would invalidate all of the game's
+surfaces, so with `Filter=none` F11 does nothing. A filter that cannot
+allocate its buffers is skipped and the frame falls back to `nearest`.
+
+Filters split their work into horizontal stripes, one per processor (up to 8
+threads, `src/worker_pool.cpp`). On a single processor, which includes every
+Windows 98 system, no thread is started and the frame is filtered on the game
+thread.
+
+#### hqx
+
+The vendored
 [hqx](https://github.com/brunexgeek/hqx) library (Apache License 2.0, git
 submodule in `vendor/hqx`; run `git submodule update --init` after cloning)
 does the scaling.
@@ -129,39 +155,28 @@ point for every neighbor comparison, about 115 ms per 856x480 frame. The
 replacement carries each pixel's palette index in the alpha byte and looks up
 a 256x256 similarity table that is rebuilt only when the palette changes. That
 takes about 6 ms (hq2x) or 7 ms (hq3x) per frame on one core and produces
-output byte-identical to the original library. The frame is also split into
-horizontal stripes, one per processor (up to 8). Each stripe is scaled with
-one extra source row above and below, so the seams match the single-pass
-result. With 8 threads a frame takes about 1.1 ms (hq2x) or 1.5 ms (hq3x).
-On a single processor, which includes every Windows 98 system, no thread is
-started and the frame is scaled on the game thread. The converted frame goes
-into two staging surfaces in turn, so a frame is never written into the
-surface the previous present may still be reading. `src/hqx_compat` supplies the
-`<stdint.h>` that Visual C++ 2005 lacks and an empty `<iostream>`, which the
-hqx sources include without using.
+output byte-identical to the original library. Each stripe is scaled with one
+extra source row above and below, so the seams match the single-pass result.
+With 8 threads a frame takes about 1.1 ms (hq2x) or 1.5 ms (hq3x).
+`src/hqx_compat` supplies the `<stdint.h>` that Visual C++ 2005 lacks and an
+empty `<iostream>`, which the hqx sources include without using. On a
+1920x1080 display the hq2x output (1712x960) is stretched by a factor of
+1.125 without smoothing, which duplicates about every eighth row and column.
 
-**F11** toggles the filter during a race. When it is off, the frame is
-stretched without filtering, which looks like the 8-bit path. The toggle stays
-within the 32-bit display mode: switching between the 8-bit and 32-bit modes
-in the middle of a race would invalidate all of the game's surfaces. With
-`Hqx=0`, F11 does nothing.
+#### Diagnostics
 
-For each presentation path (8-bit, 32-bit without hqx, hqx), the log records
-once where the time of a frame goes, averaged over 300 frames: `game` (the
-game's own work between presents), `convert` (palette conversion, hqx, FPS
-overlay), `vblank-wait`, `present` (the stretch blit) and the resulting frame
-time and rate. Frames after a pause of more than 250 ms, such as loading, are
-left out.
+For each filter (and `none` for the 8-bit path), the log records once where
+the time of a frame goes, averaged over 300 frames: `game` (the game's own
+work between presents), `convert` (palette conversion, filter, FPS overlay),
+`vblank-wait`, `present` (the stretch blit) and the resulting frame time and
+rate. Frames after a pause of more than 250 ms, such as loading, are left out.
 
 If the 32-bit mode is not X8R8G8B8, or 8-bit surfaces cannot be created
 alongside it, the 8-bit display mode is used as before. The 720x480 fallback
-never uses hqx. On a 1920x1080 display the hq2x output (1712x960) is
-stretched by a factor of 1.125 without filtering, which duplicates about every
-eighth row and column.
+never uses a filter.
 
 Known limitations: with `WaitForVBlank=0`, tearing is possible. Widths above
-856 and displays above 1920x1080 are untested, and so is Windows 98. The hqx
-presenter has not yet been tested in the game.
+856 are untested, and so is Windows 98.
 
 The proxy loads the operating system's DirectDraw DLL and does not currently
 chain through DDrawCompat or dgVoodoo2. Modern-Windows translation-layer

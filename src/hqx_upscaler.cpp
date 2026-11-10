@@ -1,4 +1,5 @@
 #include "hqx_upscaler.h"
+#include "worker_pool.h"
 
 #include <intrin.h>
 
@@ -21,13 +22,12 @@ static const uint32_t kThresholdU = 0x07;
 static const uint32_t kThresholdV = 0x06;
 static const uint32_t kThresholdA = 0x50;
 
-// The frame is scaled in horizontal stripes, one per processor (the calling
-// thread takes the first). Each stripe is scaled with one extra source row
-// above and below where it has a neighbor, so its 3x3 windows match those of
-// the whole frame; the output of those halo rows is discarded.
+// The frame is scaled in horizontal stripes, one per worker pool part. Each
+// stripe is scaled with one extra source row above and below where it has a
+// neighbor, so its 3x3 windows match those of the whole frame; the output of
+// those halo rows is discarded.
 static const DWORD kMaxStripes = 8;
 static const DWORD kMinStripeRows = 16;
-static const DWORD kWorkerStackSize = 64 * 1024;
 
 struct Stripe
 {
@@ -37,8 +37,14 @@ struct Stripe
     DWORD inputRows;
     DWORD* input;
     DWORD* output;
-    HANDLE thread;
-    HANDLE start;
+};
+
+struct ScaleJob
+{
+    const BYTE* source;
+    LONG sourcePitch;
+    BYTE* destination;
+    LONG destinationPitch;
 };
 
 static BYTE g_different[256 * 256];
@@ -49,16 +55,7 @@ static DWORD g_width = 0;
 static DWORD g_height = 0;
 static DWORD g_scale = 0;
 static Stripe g_stripes[kMaxStripes];
-static HANDLE g_doneEvents[kMaxStripes];
 static DWORD g_stripeCount = 0;
-static volatile LONG g_quit = 0;
-
-// The current job. It is written before the start events are set, which
-// orders the writes before the workers read them.
-static const BYTE* g_jobSource = NULL;
-static LONG g_jobSourcePitch = 0;
-static BYTE* g_jobDestination = NULL;
-static LONG g_jobDestinationPitch = 0;
 
 HQx::HQx()
 {
@@ -138,11 +135,11 @@ static void FreePixels(DWORD** pixels)
     }
 }
 
-static void ProcessStripe(Stripe* stripe)
+static void ProcessStripe(const ScaleJob* job, Stripe* stripe)
 {
     DWORD outputWidth = g_width * g_scale;
-    const BYTE* source = g_jobSource +
-        static_cast<LONG>(stripe->firstRow - stripe->haloTop) * g_jobSourcePitch;
+    const BYTE* source = job->source +
+        static_cast<LONG>(stripe->firstRow - stripe->haloTop) * job->sourcePitch;
     DWORD* input = stripe->input;
     const DWORD* output;
     BYTE* destination;
@@ -159,7 +156,7 @@ static void ProcessStripe(Stripe* stripe)
         }
 
         input += g_width;
-        source += g_jobSourcePitch;
+        source += job->sourcePitch;
     }
 
     if (g_scale == 3)
@@ -186,8 +183,8 @@ static void ProcessStripe(Stripe* stripe)
     }
 
     output = stripe->output + stripe->haloTop * g_scale * outputWidth;
-    destination = g_jobDestination +
-        static_cast<LONG>(stripe->firstRow * g_scale) * g_jobDestinationPitch;
+    destination = job->destination +
+        static_cast<LONG>(stripe->firstRow * g_scale) * job->destinationPitch;
     for (row = 0; row < stripe->rowCount * g_scale; ++row)
     {
         __movsd(
@@ -195,37 +192,44 @@ static void ProcessStripe(Stripe* stripe)
             reinterpret_cast<const unsigned long*>(output),
             outputWidth);
         output += outputWidth;
-        destination += g_jobDestinationPitch;
+        destination += job->destinationPitch;
     }
 }
 
-static DWORD WINAPI StripeWorker(LPVOID parameter)
+static void ScaleTask(DWORD part, DWORD, void* context)
 {
-    Stripe* stripe = reinterpret_cast<Stripe*>(parameter);
-    DWORD index = static_cast<DWORD>(stripe - g_stripes);
-
-    for (;;)
+    if (part < g_stripeCount)
     {
-        WaitForSingleObject(stripe->start, INFINITE);
-        if (g_quit != 0)
-        {
-            break;
-        }
-
-        ProcessStripe(stripe);
-        SetEvent(g_doneEvents[index]);
+        ProcessStripe(
+            reinterpret_cast<const ScaleJob*>(context),
+            &g_stripes[part]);
     }
-
-    return 0;
 }
 
-static DWORD ChooseStripeCount(DWORD height)
+static void FreeStripes()
 {
-    SYSTEM_INFO system;
-    DWORD count;
+    DWORD index;
 
-    GetSystemInfo(&system);
-    count = system.dwNumberOfProcessors;
+    for (index = 0; index < kMaxStripes; ++index)
+    {
+        FreePixels(&g_stripes[index].input);
+        FreePixels(&g_stripes[index].output);
+    }
+
+    g_stripeCount = 0;
+}
+
+BOOL HqxUpscalerInitialize(DWORD width, DWORD height, DWORD scale)
+{
+    DWORD count = WorkerPoolSize();
+    DWORD index;
+
+    HqxUpscalerShutdown();
+    if (width == 0 || height == 0 || (scale != 2 && scale != 3))
+    {
+        return FALSE;
+    }
+
     if (count > kMaxStripes)
     {
         count = kMaxStripes;
@@ -236,129 +240,26 @@ static DWORD ChooseStripeCount(DWORD height)
         --count;
     }
 
-    return count == 0 ? 1 : count;
-}
-
-static BOOL SetUpStripes(DWORD count)
-{
-    DWORD index;
-
-    g_stripeCount = count;
-    for (index = 0; index < count; ++index)
-    {
-        Stripe* stripe = &g_stripes[index];
-        DWORD haloBottom;
-
-        stripe->firstRow = g_height * index / count;
-        stripe->rowCount = g_height * (index + 1) / count - stripe->firstRow;
-        stripe->haloTop = index > 0 ? 1 : 0;
-        haloBottom = index + 1 < count ? 1 : 0;
-        stripe->inputRows = stripe->haloTop + stripe->rowCount + haloBottom;
-        stripe->input = AllocatePixels(g_width * stripe->inputRows);
-        stripe->output = AllocatePixels(
-            g_width * g_scale * stripe->inputRows * g_scale);
-        if (stripe->input == NULL || stripe->output == NULL)
-        {
-            return FALSE;
-        }
-
-        if (index == 0)
-        {
-            continue;
-        }
-
-        stripe->start = CreateEventA(NULL, FALSE, FALSE, NULL);
-        g_doneEvents[index] = CreateEventA(NULL, FALSE, FALSE, NULL);
-        if (stripe->start == NULL || g_doneEvents[index] == NULL)
-        {
-            return FALSE;
-        }
-
-        stripe->thread = CreateThread(
-            NULL,
-            kWorkerStackSize,
-            StripeWorker,
-            stripe,
-            0,
-            NULL);
-        if (stripe->thread == NULL)
-        {
-            return FALSE;
-        }
-    }
-
-    return TRUE;
-}
-
-static void TearDownStripes()
-{
-    DWORD index;
-
-    g_quit = 1;
-    for (index = 1; index < g_stripeCount; ++index)
-    {
-        Stripe* stripe = &g_stripes[index];
-
-        if (stripe->thread != NULL)
-        {
-            SetEvent(stripe->start);
-            WaitForSingleObject(stripe->thread, INFINITE);
-            CloseHandle(stripe->thread);
-        }
-    }
-
-    for (index = 0; index < kMaxStripes; ++index)
-    {
-        Stripe* stripe = &g_stripes[index];
-
-        if (stripe->start != NULL)
-        {
-            CloseHandle(stripe->start);
-        }
-
-        if (g_doneEvents[index] != NULL)
-        {
-            CloseHandle(g_doneEvents[index]);
-            g_doneEvents[index] = NULL;
-        }
-
-        FreePixels(&stripe->input);
-        FreePixels(&stripe->output);
-        stripe->thread = NULL;
-        stripe->start = NULL;
-    }
-
-    g_stripeCount = 0;
-    g_quit = 0;
-}
-
-BOOL HqxUpscalerInitialize(DWORD width, DWORD height, DWORD scale)
-{
-    DWORD count;
-
-    HqxUpscalerShutdown();
-    if (width == 0 || height == 0 || (scale != 2 && scale != 3))
-    {
-        return FALSE;
-    }
-
     g_width = width;
     g_height = height;
     g_scale = scale;
     g_paletteValid = FALSE;
-
-    // Fall back to a single stripe on the calling thread if workers cannot
-    // be started.
-    count = ChooseStripeCount(height);
-    if (!SetUpStripes(count))
+    g_stripeCount = count;
+    for (index = 0; index < count; ++index)
     {
-        TearDownStripes();
-        if (count == 1 || !SetUpStripes(1))
+        Stripe* stripe = &g_stripes[index];
+        DWORD haloBottom = index + 1 < count ? 1 : 0;
+
+        stripe->firstRow = height * index / count;
+        stripe->rowCount = height * (index + 1) / count - stripe->firstRow;
+        stripe->haloTop = index > 0 ? 1 : 0;
+        stripe->inputRows = stripe->haloTop + stripe->rowCount + haloBottom;
+        stripe->input = AllocatePixels(width * stripe->inputRows);
+        stripe->output = AllocatePixels(
+            width * scale * stripe->inputRows * scale);
+        if (stripe->input == NULL || stripe->output == NULL)
         {
-            TearDownStripes();
-            g_width = 0;
-            g_height = 0;
-            g_scale = 0;
+            HqxUpscalerShutdown();
             return FALSE;
         }
     }
@@ -366,17 +267,17 @@ BOOL HqxUpscalerInitialize(DWORD width, DWORD height, DWORD scale)
     return TRUE;
 }
 
-DWORD HqxUpscalerThreadCount()
-{
-    return g_stripeCount;
-}
-
 void HqxUpscalerShutdown()
 {
-    TearDownStripes();
+    FreeStripes();
     g_width = 0;
     g_height = 0;
     g_scale = 0;
+}
+
+BOOL HqxUpscalerIsReady()
+{
+    return g_stripeCount != 0;
 }
 
 void HqxUpscalerSetPalette(const BYTE* entries)
@@ -449,52 +350,16 @@ void HqxUpscalerScale(
     BYTE* destination,
     LONG destinationPitch)
 {
-    DWORD index;
+    ScaleJob job;
 
     if (g_stripeCount == 0)
     {
         return;
     }
 
-    g_jobSource = source;
-    g_jobSourcePitch = sourcePitch;
-    g_jobDestination = destination;
-    g_jobDestinationPitch = destinationPitch;
-    for (index = 1; index < g_stripeCount; ++index)
-    {
-        SetEvent(g_stripes[index].start);
-    }
-
-    ProcessStripe(&g_stripes[0]);
-    if (g_stripeCount > 1)
-    {
-        WaitForMultipleObjects(
-            g_stripeCount - 1,
-            g_doneEvents + 1,
-            TRUE,
-            INFINITE);
-    }
-}
-
-void HqxUpscalerConvert(
-    const BYTE* source,
-    LONG sourcePitch,
-    BYTE* destination,
-    LONG destinationPitch)
-{
-    DWORD row;
-    DWORD column;
-
-    for (row = 0; row < g_height; ++row)
-    {
-        DWORD* output = reinterpret_cast<DWORD*>(destination);
-
-        for (column = 0; column < g_width; ++column)
-        {
-            output[column] = g_rgb[source[column]];
-        }
-
-        source += sourcePitch;
-        destination += destinationPitch;
-    }
+    job.source = source;
+    job.sourcePitch = sourcePitch;
+    job.destination = destination;
+    job.destinationPitch = destinationPitch;
+    WorkerPoolRun(ScaleTask, &job);
 }

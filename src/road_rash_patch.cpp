@@ -1,6 +1,7 @@
 #include "road_rash_patch.h"
 #include "hqx_upscaler.h"
 #include "fps_overlay.h"
+#include "worker_pool.h"
 
 #include <intrin.h>
 
@@ -90,7 +91,7 @@ static const DWORD kDdsurfaceDescV1MinimumSize = 0x00000058;
 static const DWORD kDdsurfaceDescHeightOffset = 0x00000008;
 static const DWORD kDdsurfaceDescWidthOffset = 0x0000000C;
 static const DWORD kDdPixelFormatRgbBitCountOffset = 0x00000054;
-// The rest of DDSURFACEDESC v1 used for the hqx presenter: the lock pitch and
+// The rest of DDSURFACEDESC v1 used for the 32-bit presenter: the lock pitch and
 // pointer, and the pixel format at 0x48 (size, flags, bit count, RGB masks).
 static const DWORD kDdsurfaceDescPitchOffset = 0x00000010;
 static const DWORD kDdsurfaceDescSurfaceOffset = 0x00000024;
@@ -182,17 +183,38 @@ static DWORD g_flipLogCount = 0;
 static DWORD g_displayModeLogCount = 0;
 static BOOL g_nativeDisplayModesLogged = FALSE;
 static BOOL g_waitForVerticalBlank = TRUE;
-// hqx presenter: requested in the ini, active when the 32-bit display mode it
-// needs was set, and toggled with F11 while a race is running.
-static BOOL g_hqxRequested = FALSE;
+// Frame filters. "none" keeps the game's 8-bit display mode; every other
+// filter uses the 32-bit presenter, which converts the 8-bit frame through
+// the game palette. F11 cycles through the 32-bit filters during a race.
+enum FrameFilter
+{
+    kFilterNone,
+    kFilterNearest,
+    kFilterHqx,
+    kFilterCount
+};
+
+static const CHAR* const kFilterNames[kFilterCount] =
+{
+    "none",
+    "nearest",
+    "hqx"
+};
+
+// The filter from the ini, the filter in use (kept across races), whether
+// the 32-bit display mode is active, and filters that failed to start.
+static DWORD g_filterSetting = kFilterNone;
+static DWORD g_activeFilter = kFilterNone;
+static BOOL g_presenterDisplayActive = FALSE;
+static BOOL g_filterUnavailable[kFilterCount];
 static DWORD g_hqxScaleSetting = 0;
-static BOOL g_hqxDisplayActive = FALSE;
-static BOOL g_hqxFilterEnabled = TRUE;
 static DWORD g_hqxScale = 2;
+// The game palette as X8R8G8B8, refreshed every presented frame.
+static DWORD g_paletteRgb[256];
 // Two staging surfaces take turns, so a frame is never written into the
 // surface the previous present may still be reading.
-static LPVOID g_hqxStaging = NULL;
-static LPVOID g_hqxStagingSpare = NULL;
+static LPVOID g_staging = NULL;
+static LPVOID g_stagingSpare = NULL;
 // Frame timing diagnostics: the end of the previous present.
 static LARGE_INTEGER g_lastPresentEnd;
 static BOOL g_lastPresentValid = FALSE;
@@ -558,6 +580,51 @@ static BOOL MatchesBytes(
     return TRUE;
 }
 
+// Reads Filter= (a filter name; anything after it, such as a ; comment, is
+// ignored). Without it, the older Hqx=1 selects hqx.
+static DWORD ReadFilterSetting(const CHAR* path)
+{
+    CHAR value[64];
+    DWORD length = 0;
+    DWORD start = 0;
+    DWORD filter;
+
+    GetPrivateProfileStringA(
+        "Display", "Filter", "", value, sizeof(value), path);
+    while (value[start] == ' ' || value[start] == '\t')
+    {
+        ++start;
+    }
+
+    while (value[start + length] != '\0' &&
+           value[start + length] != ' ' &&
+           value[start + length] != '\t' &&
+           value[start + length] != ';')
+    {
+        ++length;
+    }
+
+    value[start + length] = '\0';
+    if (length == 0)
+    {
+        return GetPrivateProfileIntA("Display", "Hqx", 0, path) != 0 ?
+            kFilterHqx : kFilterNone;
+    }
+
+    for (filter = 0; filter < kFilterCount; ++filter)
+    {
+        if (lstrcmpiA(value + start, kFilterNames[filter]) == 0)
+        {
+            return filter;
+        }
+    }
+
+    LogMessage(
+        "Unknown Filter value in the ini; using none.\r\n",
+        sizeof("Unknown Filter value in the ini; using none.\r\n") - 1);
+    return kFilterNone;
+}
+
 static void ReadVirtualWidthSetting()
 {
     CHAR path[MAX_PATH];
@@ -590,8 +657,8 @@ static void ReadVirtualWidthSetting()
         lstrcpyA(path + length, fileName);
         g_waitForVerticalBlank = GetPrivateProfileIntA(
             "Display", "WaitForVBlank", 1, path) != 0;
-        g_hqxRequested = GetPrivateProfileIntA(
-            "Display", "Hqx", 0, path) != 0;
+        g_filterSetting = ReadFilterSetting(path);
+        g_activeFilter = g_filterSetting;
         g_showFps = GetPrivateProfileIntA(
             "Display", "ShowFps", 0, path) != 0;
         width = GetPrivateProfileIntA("Display", "HqxScale", 0, path);
@@ -959,7 +1026,7 @@ static void RestoreOriginalGameState()
     }
 
     g_virtualDisplayActive = FALSE;
-    g_hqxDisplayActive = FALSE;
+    g_presenterDisplayActive = FALSE;
 }
 
 static void ZeroDescription(BYTE* description)
@@ -1092,9 +1159,9 @@ static void AttachGamePaletteToBackBuffer()
         result);
 }
 
-// The hqx presenter needs an X8R8G8B8 display and 8-bit system-memory
+// The 32-bit presenter needs an X8R8G8B8 display and 8-bit system-memory
 // surfaces alongside it.
-static BOOL ProbeHqxDisplay(LPVOID directDraw)
+static BOOL ProbePresenterDisplay(LPVOID directDraw)
 {
     BYTE description[kDdsurfaceDescSize];
     LPVOID surface = NULL;
@@ -1112,8 +1179,8 @@ static BOOL ProbeHqxDisplay(LPVOID directDraw)
         *DescriptionDword(description, kDdPixelFormatBlueMaskOffset) != 0x000000FF)
     {
         LogMessage(
-            "hqx: the 32-bit display mode is not X8R8G8B8.\r\n",
-            sizeof("hqx: the 32-bit display mode is not X8R8G8B8.\r\n") - 1);
+            "The 32-bit display mode is not X8R8G8B8.\r\n",
+            sizeof("The 32-bit display mode is not X8R8G8B8.\r\n") - 1);
         return FALSE;
     }
 
@@ -1127,8 +1194,8 @@ static BOOL ProbeHqxDisplay(LPVOID directDraw)
     if (FAILED(result))
     {
         LogHRESULTResult(
-            "hqx: 8-bit surfaces are unavailable in 32-bit mode=0x",
-            sizeof("hqx: 8-bit surfaces are unavailable in 32-bit mode=0x") - 1,
+            "8-bit surfaces are unavailable in 32-bit mode=0x",
+            sizeof("8-bit surfaces are unavailable in 32-bit mode=0x") - 1,
             result);
         return FALSE;
     }
@@ -1137,8 +1204,9 @@ static BOOL ProbeHqxDisplay(LPVOID directDraw)
     return TRUE;
 }
 
-// Sets the real gameplay mode: 32 bits per pixel for the hqx presenter when
-// it is requested and usable, otherwise the game's 8 bits per pixel.
+// Sets the real gameplay mode: 32 bits per pixel for the 32-bit presenter
+// when a filter is requested and the mode is usable, otherwise the game's
+// 8 bits per pixel.
 static HRESULT SetVirtualDisplayMode(
     LPVOID directDraw,
     DWORD width,
@@ -1147,8 +1215,8 @@ static HRESULT SetVirtualDisplayMode(
 {
     HRESULT result;
 
-    g_hqxDisplayActive = FALSE;
-    if (g_hqxRequested)
+    g_presenterDisplayActive = FALSE;
+    if (g_filterSetting != kFilterNone)
     {
         result = CallOriginalSetDisplayMode(
             directDraw,
@@ -1156,7 +1224,7 @@ static HRESULT SetVirtualDisplayMode(
             height,
             32,
             caller);
-        if (SUCCEEDED(result) && ProbeHqxDisplay(directDraw))
+        if (SUCCEEDED(result) && ProbePresenterDisplay(directDraw))
         {
             g_hqxScale = g_hqxScaleSetting;
             if (g_hqxScale == 0)
@@ -1164,35 +1232,107 @@ static HRESULT SetVirtualDisplayMode(
                 g_hqxScale = height >= kOriginalDisplayHeight * 3 ? 3 : 2;
             }
 
-            g_hqxDisplayActive = TRUE;
+            g_presenterDisplayActive = TRUE;
             LogHRESULTResult(
-                "hqx presenter enabled at 32 bpp; scale=0x",
-                sizeof("hqx presenter enabled at 32 bpp; scale=0x") - 1,
+                "32-bit presenter enabled; hqx scale=0x",
+                sizeof("32-bit presenter enabled; hqx scale=0x") - 1,
                 g_hqxScale);
             return result;
         }
 
         LogMessage(
-            "hqx presenter unavailable; using the 8-bit display mode.\r\n",
-            sizeof("hqx presenter unavailable; using the 8-bit display mode.\r\n") - 1);
+            "32-bit presenter unavailable; using the 8-bit display mode.\r\n",
+            sizeof("32-bit presenter unavailable; using the 8-bit display mode.\r\n") - 1);
     }
 
     return CallOriginalSetDisplayMode(directDraw, width, height, 8, caller);
 }
 
-// 32-bit system-memory surfaces that receive the converted frame and are
-// stretched onto the primary. The second one is optional.
-static HRESULT CreateHqxStaging(LPVOID directDraw)
+// The size of a filter's output in the staging surface.
+static void GetFilterOutputSize(DWORD filter, DWORD* width, DWORD* height)
+{
+    if (filter == kFilterHqx)
+    {
+        *width = kVirtualDisplayWidth * g_hqxScale;
+        *height = kOriginalDisplayHeight * g_hqxScale;
+        return;
+    }
+
+    *width = kVirtualDisplayWidth;
+    *height = kOriginalDisplayHeight;
+}
+
+// The glyph scale of the FPS overlay, so it appears at the same size
+// whatever the filter's output size is.
+static DWORD GetFilterOverlayScale(DWORD filter)
+{
+    return filter == kFilterHqx ? g_hqxScale : 1;
+}
+
+static void LogFilter(const CHAR* prefix)
+{
+    CHAR message[96];
+
+    lstrcpyA(message, prefix);
+    lstrcatA(message, kFilterNames[g_activeFilter]);
+    lstrcatA(message, "\r\n");
+    LogMessage(message, lstrlenA(message));
+}
+
+// The next filter for F11: cycles through the 32-bit filters, skipping
+// filters that failed to start.
+static DWORD NextFilter(DWORD filter)
+{
+    DWORD step;
+
+    for (step = 0; step < kFilterCount; ++step)
+    {
+        ++filter;
+        if (filter >= kFilterCount)
+        {
+            filter = kFilterNearest;
+        }
+
+        if (!g_filterUnavailable[filter])
+        {
+            break;
+        }
+    }
+
+    return filter;
+}
+
+// 32-bit system-memory surfaces that receive the filtered frame and are
+// stretched onto the primary. They are large enough for every filter's
+// output. The second one is optional.
+static HRESULT CreatePresenterResources(LPVOID directDraw)
 {
     BYTE description[kDdsurfaceDescSize];
     LPVOID staging = NULL;
     LPVOID spare = NULL;
+    DWORD stagingWidth = 0;
+    DWORD stagingHeight = 0;
+    DWORD filter;
     HRESULT result;
 
-    BuildOffscreenDescription(
-        description,
-        kVirtualDisplayWidth * g_hqxScale,
-        kOriginalDisplayHeight * g_hqxScale);
+    for (filter = kFilterNearest; filter < kFilterCount; ++filter)
+    {
+        DWORD width;
+        DWORD height;
+
+        GetFilterOutputSize(filter, &width, &height);
+        if (width > stagingWidth)
+        {
+            stagingWidth = width;
+        }
+
+        if (height > stagingHeight)
+        {
+            stagingHeight = height;
+        }
+    }
+
+    BuildOffscreenDescription(description, stagingWidth, stagingHeight);
     SetSystemMemoryCaps(description);
     result = g_hookState.originalCreateSurface(
         directDraw,
@@ -1202,8 +1342,8 @@ static HRESULT CreateHqxStaging(LPVOID directDraw)
     if (FAILED(result))
     {
         LogHRESULTResult(
-            "hqx staging surface creation failed=0x",
-            sizeof("hqx staging surface creation failed=0x") - 1,
+            "Staging surface creation failed=0x",
+            sizeof("Staging surface creation failed=0x") - 1,
             result);
         return result;
     }
@@ -1217,35 +1357,78 @@ static HRESULT CreateHqxStaging(LPVOID directDraw)
     {
         spare = NULL;
         LogHRESULTResult(
-            "hqx: second staging surface unavailable; using one=0x",
-            sizeof("hqx: second staging surface unavailable; using one=0x") - 1,
+            "Second staging surface unavailable; using one=0x",
+            sizeof("Second staging surface unavailable; using one=0x") - 1,
             result);
     }
 
-    if (!HqxUpscalerInitialize(
-            kVirtualDisplayWidth,
-            kOriginalDisplayHeight,
-            g_hqxScale))
+    // Filters allocate their own buffers when they are first used.
+    WorkerPoolStart(8);
+    LogHRESULTResult(
+        "Filter threads=0x",
+        sizeof("Filter threads=0x") - 1,
+        WorkerPoolSize());
+    if (g_activeFilter == kFilterNone || g_filterUnavailable[g_activeFilter])
     {
-        LogMessage(
-            "hqx buffer allocation failed.\r\n",
-            sizeof("hqx buffer allocation failed.\r\n") - 1);
-        ReleaseObject(staging);
-        if (spare != NULL)
-        {
-            ReleaseObject(spare);
-        }
-
-        return E_OUTOFMEMORY;
+        g_activeFilter = kFilterNearest;
     }
 
-    LogHRESULTResult(
-        "hqx: scaling threads=0x",
-        sizeof("hqx: scaling threads=0x") - 1,
-        HqxUpscalerThreadCount());
-    g_hqxStaging = staging;
-    g_hqxStagingSpare = spare;
+    LogFilter("Filter: ");
+    g_staging = staging;
+    g_stagingSpare = spare;
     return S_OK;
+}
+
+static void ReleasePresenterResources()
+{
+    HqxUpscalerShutdown();
+    WorkerPoolStop();
+}
+
+// Prepares the filter's buffers on first use. A filter that cannot start is
+// skipped from then on, and the frame falls back to nearest.
+static BOOL PrepareFilter(DWORD filter)
+{
+    if (filter == kFilterHqx && !HqxUpscalerIsReady())
+    {
+        if (!HqxUpscalerInitialize(
+                kVirtualDisplayWidth,
+                kOriginalDisplayHeight,
+                g_hqxScale))
+        {
+            LogMessage(
+                "hqx buffer allocation failed; filter disabled.\r\n",
+                sizeof("hqx buffer allocation failed; filter disabled.\r\n") - 1);
+            g_filterUnavailable[kFilterHqx] = TRUE;
+            return FALSE;
+        }
+    }
+
+    return TRUE;
+}
+
+// The nearest filter only converts the frame; the present stretches it.
+static void ConvertFrame(
+    const BYTE* source,
+    LONG sourcePitch,
+    BYTE* destination,
+    LONG destinationPitch)
+{
+    DWORD row;
+    DWORD column;
+
+    for (row = 0; row < kOriginalDisplayHeight; ++row)
+    {
+        DWORD* output = reinterpret_cast<DWORD*>(destination);
+
+        for (column = 0; column < kVirtualDisplayWidth; ++column)
+        {
+            output[column] = g_paletteRgb[source[column]];
+        }
+
+        source += sourcePitch;
+        destination += destinationPitch;
+    }
 }
 
 static HRESULT CreateVirtualPrimary(
@@ -1318,7 +1501,7 @@ static HRESULT CreateVirtualPrimary(
         backDescription,
         kVirtualDisplayWidth,
         kOriginalDisplayHeight);
-    if (g_hqxDisplayActive)
+    if (g_presenterDisplayActive)
     {
         SetIndexedSystemMemoryFormat(backDescription);
     }
@@ -1339,9 +1522,9 @@ static HRESULT CreateVirtualPrimary(
         return result;
     }
 
-    if (g_hqxDisplayActive)
+    if (g_presenterDisplayActive)
     {
-        result = CreateHqxStaging(directDraw);
+        result = CreatePresenterResources(directDraw);
         if (FAILED(result))
         {
             g_originalSurfaceRelease(backBuffer);
@@ -1368,13 +1551,13 @@ static ULONG WINAPI HookedSurfaceRelease(LPVOID surface)
     if (surface == g_virtualPrimary && count == 0)
     {
         LPVOID back = g_virtualBack;
-        LPVOID staging = g_hqxStaging;
-        LPVOID spare = g_hqxStagingSpare;
+        LPVOID staging = g_staging;
+        LPVOID spare = g_stagingSpare;
 
         g_virtualPrimary = NULL;
         g_virtualBack = NULL;
-        g_hqxStaging = NULL;
-        g_hqxStagingSpare = NULL;
+        g_staging = NULL;
+        g_stagingSpare = NULL;
         g_backPalette = NULL;
         if (back != NULL)
         {
@@ -1389,7 +1572,7 @@ static ULONG WINAPI HookedSurfaceRelease(LPVOID surface)
         if (staging != NULL)
         {
             g_originalSurfaceRelease(staging);
-            HqxUpscalerShutdown();
+            ReleasePresenterResources();
         }
     }
 
@@ -1580,14 +1763,6 @@ struct FrameTiming
     LARGE_INTEGER presented;
 };
 
-enum FrameTimingSlot
-{
-    kTiming8Bit,
-    kTiming32BitPlain,
-    kTimingHqx,
-    kTimingSlotCount
-};
-
 // 32-bit arithmetic only: 64-bit division would need the C runtime.
 static DWORD ElapsedMicroseconds(LARGE_INTEGER from, LARGE_INTEGER to)
 {
@@ -1626,25 +1801,20 @@ static void AppendTimingField(
     AppendDecimal(message, length, value);
 }
 
-// Logs, once per presentation path, where the time of a frame goes, averaged
-// over 300 frames: the game's own work between presents, the conversion
-// (palette, hqx, overlay), the vertical-blank wait, and the present blit.
+// Logs, once per filter (kFilterNone is the 8-bit path), where the time of a
+// frame goes, averaged over 300 frames: the game's own work between
+// presents, the conversion (palette, filter, overlay), the vertical-blank
+// wait, and the present blit.
 static void RecordFrameTiming(DWORD slot, const FrameTiming* timing)
 {
     static const DWORD kFrames = 300;
     static const DWORD kMaxGameMicroseconds = 250000;
-    static const CHAR* const kLabels[kTimingSlotCount] =
-    {
-        "Frame timing, 8-bit (average us):",
-        "Frame timing, 32-bit without hqx (average us):",
-        "Frame timing, hqx (average us):"
-    };
-    static DWORD frames[kTimingSlotCount];
-    static DWORD game[kTimingSlotCount];
-    static DWORD convert[kTimingSlotCount];
-    static DWORD wait[kTimingSlotCount];
-    static DWORD present[kTimingSlotCount];
-    static BOOL logged[kTimingSlotCount];
+    static DWORD frames[kFilterCount];
+    static DWORD game[kFilterCount];
+    static DWORD convert[kFilterCount];
+    static DWORD wait[kFilterCount];
+    static DWORD present[kFilterCount];
+    static BOOL logged[kFilterCount];
     BOOL previousValid = g_lastPresentValid;
     LARGE_INTEGER previousEnd = g_lastPresentEnd;
     DWORD gameMicroseconds;
@@ -1677,7 +1847,9 @@ static void RecordFrameTiming(DWORD slot, const FrameTiming* timing)
 
     logged[slot] = TRUE;
     total = (game[slot] + convert[slot] + wait[slot] + present[slot]) / kFrames;
-    lstrcpyA(message, kLabels[slot]);
+    lstrcpyA(message, "Frame timing, filter=");
+    lstrcatA(message, slot == kFilterNone ? "none (8-bit)" : kFilterNames[slot]);
+    lstrcatA(message, " (average us):");
     length = lstrlenA(message);
     AppendTimingField(message, &length, " game=", game[slot] / kFrames);
     AppendTimingField(message, &length, " convert=", convert[slot] / kFrames);
@@ -1692,22 +1864,45 @@ static void RecordFrameTiming(DWORD slot, const FrameTiming* timing)
 }
 
 // Converts the 8-bit virtual frame to 32 bits through the game palette,
-// optionally scales it with hqx, and stretches it onto the primary.
-static HRESULT PresentHqxFrame(LPVOID primary, FrameTiming* timing)
+// applies the active filter, and stretches the result onto the primary.
+static HRESULT PresentFilteredFrame(LPVOID primary, FrameTiming* timing)
 {
     BYTE palette[1024];
     BYTE backDescription[kDdsurfaceDescSize];
     BYTE stagingDescription[kDdsurfaceDescSize];
     LPVOID* backVtable = GetVtable(g_virtualBack);
-    LPVOID* stagingVtable = GetVtable(g_hqxStaging);
-    BOOL filtered = g_hqxFilterEnabled;
+    LPVOID* stagingVtable = GetVtable(g_staging);
+    DWORD filter = g_activeFilter;
+    DWORD outputWidth;
+    DWORD outputHeight;
     RECT source;
     HRESULT result;
 
+    if (!PrepareFilter(filter))
+    {
+        filter = kFilterNearest;
+        g_activeFilter = kFilterNearest;
+    }
+
     if (ReadGamePalette(palette))
     {
-        HqxUpscalerSetPalette(palette);
+        DWORD index;
+
+        for (index = 0; index < 256; ++index)
+        {
+            g_paletteRgb[index] =
+                (static_cast<DWORD>(palette[index * 4]) << 16) |
+                (static_cast<DWORD>(palette[index * 4 + 1]) << 8) |
+                static_cast<DWORD>(palette[index * 4 + 2]);
+        }
+
+        if (filter == kFilterHqx)
+        {
+            HqxUpscalerSetPalette(palette);
+        }
     }
+
+    GetFilterOutputSize(filter, &outputWidth, &outputHeight);
 
     AttachGamePaletteToBackBuffer();
     ZeroDescription(backDescription);
@@ -1721,7 +1916,7 @@ static HRESULT PresentHqxFrame(LPVOID primary, FrameTiming* timing)
         *DescriptionDword(stagingDescription, 0) = kDdsurfaceDescSize;
         result = reinterpret_cast<SurfaceLockFn>(
             stagingVtable[kSurfaceLockVtableIndex])(
-                g_hqxStaging,
+                g_staging,
                 NULL,
                 stagingDescription,
                 kDdlockWait | kDdlockWriteOnly,
@@ -1737,34 +1932,33 @@ static HRESULT PresentHqxFrame(LPVOID primary, FrameTiming* timing)
             LONG stagingPitch = *reinterpret_cast<LONG*>(
                 stagingDescription + kDdsurfaceDescPitchOffset);
 
-            if (filtered)
+            switch (filter)
             {
+            case kFilterHqx:
                 HqxUpscalerScale(
                     sourcePixels, sourcePitch, stagingPixels, stagingPitch);
-            }
-            else
-            {
-                HqxUpscalerConvert(
+                break;
+            default:
+                ConvertFrame(
                     sourcePixels, sourcePitch, stagingPixels, stagingPitch);
+                break;
             }
 
             if (g_showFps)
             {
-                DWORD scale = filtered ? g_hqxScale : 1;
-
                 FpsOverlayDraw(
                     stagingPixels,
                     stagingPitch,
-                    kVirtualDisplayWidth * scale,
-                    kOriginalDisplayHeight * scale,
+                    outputWidth,
+                    outputHeight,
                     4,
-                    scale,
+                    GetFilterOverlayScale(filter),
                     0x00FFFFFF,
                     0x00000000);
             }
 
             reinterpret_cast<SurfaceUnlockFn>(
-                stagingVtable[kSurfaceUnlockVtableIndex])(g_hqxStaging, NULL);
+                stagingVtable[kSurfaceUnlockVtableIndex])(g_staging, NULL);
         }
 
         reinterpret_cast<SurfaceUnlockFn>(
@@ -1775,34 +1969,32 @@ static HRESULT PresentHqxFrame(LPVOID primary, FrameTiming* timing)
     {
         ++g_flipLogCount;
         LogHRESULTResult(
-            "hqx: frame conversion skipped; Lock failed=0x",
-            sizeof("hqx: frame conversion skipped; Lock failed=0x") - 1,
+            "Frame conversion skipped; Lock failed=0x",
+            sizeof("Frame conversion skipped; Lock failed=0x") - 1,
             result);
     }
 
     source.left = 0;
     source.top = 0;
-    source.right = static_cast<LONG>(
-        filtered ? kVirtualDisplayWidth * g_hqxScale : kVirtualDisplayWidth);
-    source.bottom = static_cast<LONG>(
-        filtered ? kOriginalDisplayHeight * g_hqxScale : kOriginalDisplayHeight);
+    source.right = static_cast<LONG>(outputWidth);
+    source.bottom = static_cast<LONG>(outputHeight);
     QueryPerformanceCounter(&timing->converted);
     WaitBeforePresent();
     QueryPerformanceCounter(&timing->waited);
     result = g_originalSurfaceBlt(
         primary,
         NULL,
-        g_hqxStaging,
+        g_staging,
         &source,
         kDdbltWait,
         NULL);
     QueryPerformanceCounter(&timing->presented);
-    if (g_hqxStagingSpare != NULL)
+    if (g_stagingSpare != NULL)
     {
-        LPVOID presented = g_hqxStaging;
+        LPVOID presented = g_staging;
 
-        g_hqxStaging = g_hqxStagingSpare;
-        g_hqxStagingSpare = presented;
+        g_staging = g_stagingSpare;
+        g_stagingSpare = presented;
     }
 
     return result;
@@ -1895,28 +2087,17 @@ static HRESULT WINAPI HookedSurfaceFlip(
 
         if (toggleDown && !toggleWasDown)
         {
-            if (g_hqxStaging != NULL)
+            if (g_staging != NULL)
             {
-                g_hqxFilterEnabled = !g_hqxFilterEnabled;
-                if (g_hqxFilterEnabled)
-                {
-                    LogMessage(
-                        "F11 pressed; hqx filter on.\r\n",
-                        sizeof("F11 pressed; hqx filter on.\r\n") - 1);
-                }
-                else
-                {
-                    LogMessage(
-                        "F11 pressed; hqx filter off.\r\n",
-                        sizeof("F11 pressed; hqx filter off.\r\n") - 1);
-                }
+                g_activeFilter = NextFilter(g_activeFilter);
+                LogFilter("F11 pressed; filter: ");
             }
             else if (!toggleIgnoredLogged)
             {
                 toggleIgnoredLogged = TRUE;
                 LogMessage(
-                    "F11 ignored; the hqx presenter is not active (Hqx=0 or 32-bit mode unavailable).\r\n",
-                    sizeof("F11 ignored; the hqx presenter is not active (Hqx=0 or 32-bit mode unavailable).\r\n") - 1);
+                    "F11 ignored; the 32-bit presenter is not active (Filter=none or 32-bit mode unavailable).\r\n",
+                    sizeof("F11 ignored; the 32-bit presenter is not active (Filter=none or 32-bit mode unavailable).\r\n") - 1);
             }
         }
 
@@ -1928,18 +2109,17 @@ static HRESULT WINAPI HookedSurfaceFlip(
         FpsOverlayCountFrame();
     }
 
-    if (g_hqxStaging != NULL)
+    if (g_staging != NULL)
     {
-        DWORD slot = g_hqxFilterEnabled ? kTimingHqx : kTiming32BitPlain;
-
-        result = PresentHqxFrame(surface, &timing);
-        RecordFrameTiming(slot, &timing);
+        // The present may fall back to nearest, so read the filter after it.
+        result = PresentFilteredFrame(surface, &timing);
+        RecordFrameTiming(g_activeFilter, &timing);
         if (g_flipLogCount < 4 || (FAILED(result) && g_flipLogCount < 8))
         {
             ++g_flipLogCount;
             LogHRESULTResult(
-                "hqx present result=0x",
-                sizeof("hqx present result=0x") - 1,
+                "32-bit present result=0x",
+                sizeof("32-bit present result=0x") - 1,
                 result);
         }
 
@@ -1962,7 +2142,7 @@ static HRESULT WINAPI HookedSurfaceFlip(
         kDdbltWait,
         NULL);
     QueryPerformanceCounter(&timing.presented);
-    RecordFrameTiming(kTiming8Bit, &timing);
+    RecordFrameTiming(kFilterNone, &timing);
     if (g_flipLogCount < 4 || (FAILED(result) && g_flipLogCount < 8))
     {
         ++g_flipLogCount;
@@ -2148,7 +2328,7 @@ static HRESULT WINAPI HookedCreateSurface(
     }
 
     if (directDraw == g_hookState.object &&
-        g_hqxDisplayActive &&
+        g_presenterDisplayActive &&
         caller - g_gameBase < kExpectedImageSize &&
         surfaceDescription != NULL)
     {
@@ -2181,8 +2361,8 @@ static HRESULT WINAPI HookedCreateSurface(
             {
                 ++indexedLogCount;
                 LogHRESULTResult(
-                    "hqx: created a game surface as 8-bit system memory=0x",
-                    sizeof("hqx: created a game surface as 8-bit system memory=0x") - 1,
+                    "Created a game surface as 8-bit system memory=0x",
+                    sizeof("Created a game surface as 8-bit system memory=0x") - 1,
                     result);
             }
 
