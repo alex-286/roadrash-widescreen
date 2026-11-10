@@ -1,4 +1,5 @@
 #include "road_rash_patch.h"
+#include "hqx_upscaler.h"
 
 #include <intrin.h>
 
@@ -88,6 +89,30 @@ static const DWORD kDdsurfaceDescV1MinimumSize = 0x00000058;
 static const DWORD kDdsurfaceDescHeightOffset = 0x00000008;
 static const DWORD kDdsurfaceDescWidthOffset = 0x0000000C;
 static const DWORD kDdPixelFormatRgbBitCountOffset = 0x00000054;
+// The rest of DDSURFACEDESC v1 used for the hqx presenter: the lock pitch and
+// pointer, and the pixel format at 0x48 (size, flags, bit count, RGB masks).
+static const DWORD kDdsurfaceDescPitchOffset = 0x00000010;
+static const DWORD kDdsurfaceDescSurfaceOffset = 0x00000024;
+static const DWORD kDdsurfaceDescPixelFormatOffset = 0x00000048;
+static const DWORD kDdPixelFormatSize = 0x00000020;
+static const DWORD kDdPixelFormatFlagsOffset = 0x0000004C;
+static const DWORD kDdPixelFormatRedMaskOffset = 0x00000058;
+static const DWORD kDdPixelFormatGreenMaskOffset = 0x0000005C;
+static const DWORD kDdPixelFormatBlueMaskOffset = 0x00000060;
+static const DWORD kDdpfPaletteIndexed8 = 0x00000020;
+static const DWORD kDdpfRgb = 0x00000040;
+static const DWORD kDdsCapsSystemMemory = 0x00000800;
+static const DWORD kDdsCapsVideoMemory = 0x00004000;
+static const DWORD kDdlockWait = 0x00000001;
+static const DWORD kDdlockWriteOnly = 0x00000020;
+static const DWORD kGetDisplayModeVtableIndex = 12;
+static const DWORD kSurfaceGetPaletteVtableIndex = 20;
+static const DWORD kSurfaceLockVtableIndex = 25;
+static const DWORD kSurfaceSetPaletteVtableIndex = 31;
+static const DWORD kSurfaceUnlockVtableIndex = 32;
+static const DWORD kPaletteGetEntriesVtableIndex = 4;
+// The game's IDirectDrawPalette, created right after the gameplay surfaces.
+static const DWORD kGamePaletteRva = 0x00075424;
 
 static const DWORD kHighResolutionFlagRva = 0x00075380;
 static const DWORD kLogicalWidthARva = 0x00066674;
@@ -156,6 +181,15 @@ static DWORD g_flipLogCount = 0;
 static DWORD g_displayModeLogCount = 0;
 static BOOL g_nativeDisplayModesLogged = FALSE;
 static BOOL g_waitForVerticalBlank = TRUE;
+// hqx presenter: requested in the ini, active when the 32-bit display mode it
+// needs was set, and toggled with F11 while a race is running.
+static BOOL g_hqxRequested = FALSE;
+static DWORD g_hqxScaleSetting = 0;
+static BOOL g_hqxDisplayActive = FALSE;
+static BOOL g_hqxFilterEnabled = TRUE;
+static DWORD g_hqxScale = 2;
+static LPVOID g_hqxStaging = NULL;
+static LPVOID g_backPalette = NULL;
 // The first log message of a run replaces the previous log.
 static BOOL g_truncateLog = FALSE;
 
@@ -548,6 +582,14 @@ static void ReadVirtualWidthSetting()
         lstrcpyA(path + length, fileName);
         g_waitForVerticalBlank = GetPrivateProfileIntA(
             "Display", "WaitForVBlank", 1, path) != 0;
+        g_hqxRequested = GetPrivateProfileIntA(
+            "Display", "Hqx", 0, path) != 0;
+        width = GetPrivateProfileIntA("Display", "HqxScale", 0, path);
+        if (width == 2 || width == 3)
+        {
+            g_hqxScaleSetting = width;
+        }
+
         width = GetPrivateProfileIntA("Display", "DisplayWidth", 0, path);
         if (width != 0)
         {
@@ -907,6 +949,7 @@ static void RestoreOriginalGameState()
     }
 
     g_virtualDisplayActive = FALSE;
+    g_hqxDisplayActive = FALSE;
 }
 
 static void ZeroDescription(BYTE* description)
@@ -921,6 +964,254 @@ static void ZeroDescription(BYTE* description)
 }
 
 static void InstallSurfaceHooks(LPVOID surface);
+
+typedef HRESULT (WINAPI *SurfaceLockFn)(LPVOID, LPVOID, LPVOID, DWORD, HANDLE);
+typedef HRESULT (WINAPI *SurfaceUnlockFn)(LPVOID, LPVOID);
+typedef HRESULT (WINAPI *SurfaceGetPaletteFn)(LPVOID, LPVOID*);
+typedef HRESULT (WINAPI *SurfaceSetPaletteFn)(LPVOID, LPVOID);
+typedef HRESULT (WINAPI *PaletteGetEntriesFn)(
+    LPVOID, DWORD, DWORD, DWORD, BYTE*);
+typedef HRESULT (WINAPI *DirectDrawGetDisplayModeFn)(LPVOID, LPVOID);
+typedef ULONG (WINAPI *ComReleaseFn)(LPVOID);
+
+static LPVOID* GetVtable(LPVOID object)
+{
+    return *reinterpret_cast<LPVOID**>(object);
+}
+
+static void ReleaseObject(LPVOID object)
+{
+    reinterpret_cast<ComReleaseFn>(GetVtable(object)[2])(object);
+}
+
+static DWORD* DescriptionDword(BYTE* description, DWORD offset)
+{
+    return reinterpret_cast<DWORD*>(description + offset);
+}
+
+static void BuildOffscreenDescription(
+    BYTE* description,
+    DWORD width,
+    DWORD height)
+{
+    ZeroDescription(description);
+    *DescriptionDword(description, 0) = kDdsurfaceDescSize;
+    *DescriptionDword(description, kDdsurfaceDescFlagsOffset) =
+        kDdsdCaps | kDdsdHeight | kDdsdWidth;
+    *DescriptionDword(description, kDdsurfaceDescHeightOffset) = height;
+    *DescriptionDword(description, kDdsurfaceDescWidthOffset) = width;
+    *DescriptionDword(description, kDdsurfaceDescCapsOffset) =
+        kDdsCapsOffscreenPlain;
+}
+
+static void SetSystemMemoryCaps(BYTE* description)
+{
+    DWORD* caps = DescriptionDword(description, kDdsurfaceDescCapsOffset);
+
+    *caps = (*caps | kDdsCapsSystemMemory) & ~kDdsCapsVideoMemory;
+}
+
+// While the display runs at 32 bits per pixel, every surface the game
+// renders into must stay 8-bit palettized: it writes palette indices into
+// them through Lock. System memory keeps them independent of the display.
+static void SetIndexedSystemMemoryFormat(BYTE* description)
+{
+    *DescriptionDword(description, kDdsurfaceDescFlagsOffset) |=
+        kDdsdPixelFormat;
+    SetSystemMemoryCaps(description);
+    *DescriptionDword(description, kDdsurfaceDescPixelFormatOffset) =
+        kDdPixelFormatSize;
+    *DescriptionDword(description, kDdPixelFormatFlagsOffset) =
+        kDdpfRgb | kDdpfPaletteIndexed8;
+    *DescriptionDword(description, kDdPixelFormatRgbBitCountOffset) = 8;
+}
+
+// Fills 256 PALETTEENTRY values from the game's palette object, or from the
+// palette attached to the primary surface when the game has none yet.
+static BOOL ReadGamePalette(BYTE* entries)
+{
+    LPVOID palette = reinterpret_cast<LPVOID>(ReadGameDword(kGamePaletteRva));
+    LPVOID attached = NULL;
+    HRESULT result;
+
+    if (palette == NULL &&
+        g_virtualPrimary != NULL &&
+        SUCCEEDED(reinterpret_cast<SurfaceGetPaletteFn>(
+            GetVtable(g_virtualPrimary)[kSurfaceGetPaletteVtableIndex])(
+                g_virtualPrimary, &attached)))
+    {
+        palette = attached;
+    }
+
+    if (palette == NULL)
+    {
+        return FALSE;
+    }
+
+    result = reinterpret_cast<PaletteGetEntriesFn>(
+        GetVtable(palette)[kPaletteGetEntriesVtableIndex])(
+            palette, 0, 0, 256, entries);
+    if (attached != NULL)
+    {
+        ReleaseObject(attached);
+    }
+
+    return SUCCEEDED(result);
+}
+
+// GDI draws the HUD text into the back buffer; on an 8-bit surface it maps
+// colors through the attached palette. The game attaches its palette to the
+// primary, which in 32-bit mode cannot take one, so attach it here instead.
+static void AttachGamePaletteToBackBuffer()
+{
+    LPVOID palette = reinterpret_cast<LPVOID>(ReadGameDword(kGamePaletteRva));
+    HRESULT result;
+
+    if (palette == NULL || palette == g_backPalette || g_virtualBack == NULL)
+    {
+        return;
+    }
+
+    result = reinterpret_cast<SurfaceSetPaletteFn>(
+        GetVtable(g_virtualBack)[kSurfaceSetPaletteVtableIndex])(
+            g_virtualBack, palette);
+    g_backPalette = palette;
+    LogHRESULTResult(
+        "Attached the game palette to the 8-bit back buffer=0x",
+        sizeof("Attached the game palette to the 8-bit back buffer=0x") - 1,
+        result);
+}
+
+// The hqx presenter needs an X8R8G8B8 display and 8-bit system-memory
+// surfaces alongside it.
+static BOOL ProbeHqxDisplay(LPVOID directDraw)
+{
+    BYTE description[kDdsurfaceDescSize];
+    LPVOID surface = NULL;
+    HRESULT result;
+
+    ZeroDescription(description);
+    *DescriptionDword(description, 0) = kDdsurfaceDescSize;
+    result = reinterpret_cast<DirectDrawGetDisplayModeFn>(
+        GetVtable(directDraw)[kGetDisplayModeVtableIndex])(
+            directDraw, description);
+    if (FAILED(result) ||
+        *DescriptionDword(description, kDdPixelFormatRgbBitCountOffset) != 32 ||
+        *DescriptionDword(description, kDdPixelFormatRedMaskOffset) != 0x00FF0000 ||
+        *DescriptionDword(description, kDdPixelFormatGreenMaskOffset) != 0x0000FF00 ||
+        *DescriptionDword(description, kDdPixelFormatBlueMaskOffset) != 0x000000FF)
+    {
+        LogMessage(
+            "hqx: the 32-bit display mode is not X8R8G8B8.\r\n",
+            sizeof("hqx: the 32-bit display mode is not X8R8G8B8.\r\n") - 1);
+        return FALSE;
+    }
+
+    BuildOffscreenDescription(description, 8, 8);
+    SetIndexedSystemMemoryFormat(description);
+    result = g_hookState.originalCreateSurface(
+        directDraw,
+        description,
+        &surface,
+        NULL);
+    if (FAILED(result))
+    {
+        LogHRESULTResult(
+            "hqx: 8-bit surfaces are unavailable in 32-bit mode=0x",
+            sizeof("hqx: 8-bit surfaces are unavailable in 32-bit mode=0x") - 1,
+            result);
+        return FALSE;
+    }
+
+    ReleaseObject(surface);
+    return TRUE;
+}
+
+// Sets the real gameplay mode: 32 bits per pixel for the hqx presenter when
+// it is requested and usable, otherwise the game's 8 bits per pixel.
+static HRESULT SetVirtualDisplayMode(
+    LPVOID directDraw,
+    DWORD width,
+    DWORD height,
+    DWORD caller)
+{
+    HRESULT result;
+
+    g_hqxDisplayActive = FALSE;
+    if (g_hqxRequested)
+    {
+        result = CallOriginalSetDisplayMode(
+            directDraw,
+            width,
+            height,
+            32,
+            caller);
+        if (SUCCEEDED(result) && ProbeHqxDisplay(directDraw))
+        {
+            g_hqxScale = g_hqxScaleSetting;
+            if (g_hqxScale == 0)
+            {
+                g_hqxScale = height >= kOriginalDisplayHeight * 3 ? 3 : 2;
+            }
+
+            g_hqxDisplayActive = TRUE;
+            LogHRESULTResult(
+                "hqx presenter enabled at 32 bpp; scale=0x",
+                sizeof("hqx presenter enabled at 32 bpp; scale=0x") - 1,
+                g_hqxScale);
+            return result;
+        }
+
+        LogMessage(
+            "hqx presenter unavailable; using the 8-bit display mode.\r\n",
+            sizeof("hqx presenter unavailable; using the 8-bit display mode.\r\n") - 1);
+    }
+
+    return CallOriginalSetDisplayMode(directDraw, width, height, 8, caller);
+}
+
+// A 32-bit system-memory surface that receives the converted frame and is
+// stretched onto the primary.
+static HRESULT CreateHqxStaging(LPVOID directDraw)
+{
+    BYTE description[kDdsurfaceDescSize];
+    LPVOID staging = NULL;
+    HRESULT result;
+
+    BuildOffscreenDescription(
+        description,
+        kVirtualDisplayWidth * g_hqxScale,
+        kOriginalDisplayHeight * g_hqxScale);
+    SetSystemMemoryCaps(description);
+    result = g_hookState.originalCreateSurface(
+        directDraw,
+        description,
+        &staging,
+        NULL);
+    if (FAILED(result))
+    {
+        LogHRESULTResult(
+            "hqx staging surface creation failed=0x",
+            sizeof("hqx staging surface creation failed=0x") - 1,
+            result);
+        return result;
+    }
+
+    if (!HqxUpscalerInitialize(
+            kVirtualDisplayWidth,
+            kOriginalDisplayHeight,
+            g_hqxScale))
+    {
+        LogMessage(
+            "hqx buffer allocation failed.\r\n",
+            sizeof("hqx buffer allocation failed.\r\n") - 1);
+        ReleaseObject(staging);
+        return E_OUTOFMEMORY;
+    }
+
+    g_hqxStaging = staging;
+    return S_OK;
+}
 
 static HRESULT CreateVirtualPrimary(
     LPVOID directDraw,
@@ -988,16 +1279,15 @@ static HRESULT CreateVirtualPrimary(
     }
 
     InstallSurfaceHooks(*surface);
-    ZeroDescription(backDescription);
-    *reinterpret_cast<DWORD*>(backDescription) = kDdsurfaceDescSize;
-    *reinterpret_cast<DWORD*>(backDescription + kDdsurfaceDescFlagsOffset) =
-        kDdsdCaps | kDdsdHeight | kDdsdWidth;
-    *reinterpret_cast<DWORD*>(backDescription + kDdsurfaceDescHeightOffset) =
-        kOriginalDisplayHeight;
-    *reinterpret_cast<DWORD*>(backDescription + kDdsurfaceDescWidthOffset) =
-        kVirtualDisplayWidth;
-    *reinterpret_cast<DWORD*>(backDescription + kDdsurfaceDescCapsOffset) =
-        kDdsCapsOffscreenPlain;
+    BuildOffscreenDescription(
+        backDescription,
+        kVirtualDisplayWidth,
+        kOriginalDisplayHeight);
+    if (g_hqxDisplayActive)
+    {
+        SetIndexedSystemMemoryFormat(backDescription);
+    }
+
     result = g_hookState.originalCreateSurface(
         directDraw,
         backDescription,
@@ -1014,6 +1304,19 @@ static HRESULT CreateVirtualPrimary(
         return result;
     }
 
+    if (g_hqxDisplayActive)
+    {
+        result = CreateHqxStaging(directDraw);
+        if (FAILED(result))
+        {
+            g_originalSurfaceRelease(backBuffer);
+            g_originalSurfaceRelease(*surface);
+            *surface = NULL;
+            return result;
+        }
+    }
+
+    g_backPalette = NULL;
     g_virtualPrimary = *surface;
     g_virtualBack = backBuffer;
     LogMessage(
@@ -1029,12 +1332,21 @@ static ULONG WINAPI HookedSurfaceRelease(LPVOID surface)
     if (surface == g_virtualPrimary && count == 0)
     {
         LPVOID back = g_virtualBack;
+        LPVOID staging = g_hqxStaging;
 
         g_virtualPrimary = NULL;
         g_virtualBack = NULL;
+        g_hqxStaging = NULL;
+        g_backPalette = NULL;
         if (back != NULL)
         {
             g_originalSurfaceRelease(back);
+        }
+
+        if (staging != NULL)
+        {
+            g_originalSurfaceRelease(staging);
+            HqxUpscalerShutdown();
         }
     }
 
@@ -1066,12 +1378,6 @@ static HRESULT WINAPI HookedSurfaceGetAttached(
     return g_originalSurfaceGetAttached(surface, capabilities, attached);
 }
 
-typedef HRESULT (WINAPI *SurfaceLockFn)(LPVOID, LPVOID, LPVOID, DWORD, HANDLE);
-typedef HRESULT (WINAPI *SurfaceUnlockFn)(LPVOID, LPVOID);
-typedef HRESULT (WINAPI *SurfaceGetPaletteFn)(LPVOID, LPVOID*);
-typedef HRESULT (WINAPI *PaletteGetEntriesFn)(
-    LPVOID, DWORD, DWORD, DWORD, BYTE*);
-
 static BYTE g_dumpHeader[54 + 1024];
 
 static void WriteDumpDword(BYTE* destination, DWORD value)
@@ -1086,10 +1392,8 @@ static void WriteDumpDword(BYTE* destination, DWORD value)
 static void DumpVirtualBackBuffer()
 {
     LPVOID* backVtable = *reinterpret_cast<LPVOID**>(g_virtualBack);
-    LPVOID* primaryVtable = *reinterpret_cast<LPVOID**>(g_virtualPrimary);
     BYTE description[kDdsurfaceDescSize];
     BYTE palette[1024];
-    LPVOID paletteObject = NULL;
     HANDLE file;
     DWORD written;
     DWORD index;
@@ -1120,17 +1424,7 @@ static void DumpVirtualBackBuffer()
         reinterpret_cast<volatile DWORD*>(palette)[index] = 0;
     }
 
-    if (SUCCEEDED(reinterpret_cast<SurfaceGetPaletteFn>(primaryVtable[20])(
-            g_virtualPrimary, &paletteObject)) &&
-        paletteObject != NULL)
-    {
-        LPVOID* paletteVtable = *reinterpret_cast<LPVOID**>(paletteObject);
-
-        reinterpret_cast<PaletteGetEntriesFn>(paletteVtable[4])(
-            paletteObject, 0, 0, 256, palette);
-        reinterpret_cast<ULONG (WINAPI*)(LPVOID)>(paletteVtable[2])(
-            paletteObject);
-    }
+    ReadGamePalette(palette);
 
     for (index = 0; index < sizeof(g_dumpHeader); ++index)
     {
@@ -1202,6 +1496,188 @@ static void DumpVirtualBackBuffer()
     reinterpret_cast<SurfaceUnlockFn>(backVtable[32])(g_virtualBack, NULL);
 }
 
+static void WaitBeforePresent()
+{
+    if (g_waitForVerticalBlank && g_hookState.object != NULL)
+    {
+        LPVOID* directDrawVtable =
+            *reinterpret_cast<LPVOID**>(g_hookState.object);
+
+        // The result is ignored so an unsupported wait never blocks the present.
+        reinterpret_cast<WaitForVerticalBlankFn>(
+            directDrawVtable[kWaitForVerticalBlankVtableIndex])(
+                g_hookState.object, kDdWaitVbBlockBegin, NULL);
+    }
+}
+
+static void AppendDecimal(CHAR* message, DWORD* length, DWORD value)
+{
+    CHAR digits[10];
+    DWORD count = 0;
+
+    do
+    {
+        digits[count++] = static_cast<CHAR>('0' + value % 10);
+        value /= 10;
+    }
+    while (value != 0);
+
+    while (count > 0)
+    {
+        message[(*length)++] = digits[--count];
+    }
+}
+
+// Logs the average conversion time once per filter state so the cost of
+// hqx can be compared with the plain conversion.
+static void RecordHqxTiming(BOOL filtered, LARGE_INTEGER start)
+{
+    static const DWORD kFrames = 300;
+    static DWORD frameCount[2];
+    static DWORD totalMicroseconds[2];
+    static BOOL logged[2];
+    LARGE_INTEGER end;
+    LARGE_INTEGER frequency;
+    DWORD slot = filtered ? 1 : 0;
+    CHAR message[96];
+    DWORD length;
+    DWORD ticks;
+    int microseconds;
+
+    // 32-bit arithmetic only: 64-bit division would need the C runtime.
+    if (logged[slot] ||
+        !QueryPerformanceCounter(&end) ||
+        !QueryPerformanceFrequency(&frequency) ||
+        frequency.HighPart != 0 ||
+        frequency.LowPart == 0 ||
+        frequency.LowPart > 0x7FFFFFFF)
+    {
+        return;
+    }
+
+    ticks = end.LowPart - start.LowPart;
+    microseconds = MulDiv(
+        static_cast<int>(ticks & 0x7FFFFFFF),
+        1000000,
+        static_cast<int>(frequency.LowPart));
+    if (microseconds > 0)
+    {
+        totalMicroseconds[slot] += static_cast<DWORD>(microseconds);
+    }
+
+    if (++frameCount[slot] < kFrames)
+    {
+        return;
+    }
+
+    logged[slot] = TRUE;
+    microseconds = static_cast<int>(totalMicroseconds[slot] / kFrames);
+    lstrcpyA(message, filtered ?
+        "hqx: average frame conversion with hqx (us)=" :
+        "hqx: average frame conversion without hqx (us)=");
+    length = lstrlenA(message);
+    AppendDecimal(message, &length, static_cast<DWORD>(microseconds));
+    message[length++] = '\r';
+    message[length++] = '\n';
+    LogMessage(message, length);
+}
+
+// Converts the 8-bit virtual frame to 32 bits through the game palette,
+// optionally scales it with hqx, and stretches it onto the primary.
+static HRESULT PresentHqxFrame(LPVOID primary)
+{
+    BYTE palette[1024];
+    BYTE backDescription[kDdsurfaceDescSize];
+    BYTE stagingDescription[kDdsurfaceDescSize];
+    LPVOID* backVtable = GetVtable(g_virtualBack);
+    LPVOID* stagingVtable = GetVtable(g_hqxStaging);
+    BOOL filtered = g_hqxFilterEnabled;
+    LARGE_INTEGER start;
+    RECT source;
+    HRESULT result;
+
+    QueryPerformanceCounter(&start);
+    if (ReadGamePalette(palette))
+    {
+        HqxUpscalerSetPalette(palette);
+    }
+
+    AttachGamePaletteToBackBuffer();
+    ZeroDescription(backDescription);
+    *DescriptionDword(backDescription, 0) = kDdsurfaceDescSize;
+    result = reinterpret_cast<SurfaceLockFn>(
+        backVtable[kSurfaceLockVtableIndex])(
+            g_virtualBack, NULL, backDescription, kDdlockWait, NULL);
+    if (SUCCEEDED(result))
+    {
+        ZeroDescription(stagingDescription);
+        *DescriptionDword(stagingDescription, 0) = kDdsurfaceDescSize;
+        result = reinterpret_cast<SurfaceLockFn>(
+            stagingVtable[kSurfaceLockVtableIndex])(
+                g_hqxStaging,
+                NULL,
+                stagingDescription,
+                kDdlockWait | kDdlockWriteOnly,
+                NULL);
+        if (SUCCEEDED(result))
+        {
+            const BYTE* sourcePixels = *reinterpret_cast<BYTE**>(
+                backDescription + kDdsurfaceDescSurfaceOffset);
+            LONG sourcePitch = *reinterpret_cast<LONG*>(
+                backDescription + kDdsurfaceDescPitchOffset);
+            BYTE* stagingPixels = *reinterpret_cast<BYTE**>(
+                stagingDescription + kDdsurfaceDescSurfaceOffset);
+            LONG stagingPitch = *reinterpret_cast<LONG*>(
+                stagingDescription + kDdsurfaceDescPitchOffset);
+
+            if (filtered)
+            {
+                HqxUpscalerScale(
+                    sourcePixels, sourcePitch, stagingPixels, stagingPitch);
+            }
+            else
+            {
+                HqxUpscalerConvert(
+                    sourcePixels, sourcePitch, stagingPixels, stagingPitch);
+            }
+
+            reinterpret_cast<SurfaceUnlockFn>(
+                stagingVtable[kSurfaceUnlockVtableIndex])(g_hqxStaging, NULL);
+        }
+
+        reinterpret_cast<SurfaceUnlockFn>(
+            backVtable[kSurfaceUnlockVtableIndex])(g_virtualBack, NULL);
+    }
+
+    if (FAILED(result) && g_flipLogCount < 8)
+    {
+        ++g_flipLogCount;
+        LogHRESULTResult(
+            "hqx: frame conversion skipped; Lock failed=0x",
+            sizeof("hqx: frame conversion skipped; Lock failed=0x") - 1,
+            result);
+    }
+    else
+    {
+        RecordHqxTiming(filtered, start);
+    }
+
+    source.left = 0;
+    source.top = 0;
+    source.right = static_cast<LONG>(
+        filtered ? kVirtualDisplayWidth * g_hqxScale : kVirtualDisplayWidth);
+    source.bottom = static_cast<LONG>(
+        filtered ? kOriginalDisplayHeight * g_hqxScale : kOriginalDisplayHeight);
+    WaitBeforePresent();
+    return g_originalSurfaceBlt(
+        primary,
+        NULL,
+        g_hqxStaging,
+        &source,
+        kDdbltWait,
+        NULL);
+}
+
 static HRESULT WINAPI HookedSurfaceFlip(
     LPVOID surface,
     LPVOID target,
@@ -1243,17 +1719,57 @@ static HRESULT WINAPI HookedSurfaceFlip(
         keyWasDown = keyDown;
     }
 
-    if (g_waitForVerticalBlank && g_hookState.object != NULL)
     {
-        LPVOID* directDrawVtable =
-            *reinterpret_cast<LPVOID**>(g_hookState.object);
+        static BOOL toggleWasDown = FALSE;
+        static BOOL toggleIgnoredLogged = FALSE;
+        BOOL toggleDown = (GetAsyncKeyState(VK_F11) & 0x8000) != 0;
 
-        // The result is ignored so an unsupported wait never blocks the present.
-        reinterpret_cast<WaitForVerticalBlankFn>(
-            directDrawVtable[kWaitForVerticalBlankVtableIndex])(
-                g_hookState.object, kDdWaitVbBlockBegin, NULL);
+        if (toggleDown && !toggleWasDown)
+        {
+            if (g_hqxStaging != NULL)
+            {
+                g_hqxFilterEnabled = !g_hqxFilterEnabled;
+                if (g_hqxFilterEnabled)
+                {
+                    LogMessage(
+                        "F11 pressed; hqx filter on.\r\n",
+                        sizeof("F11 pressed; hqx filter on.\r\n") - 1);
+                }
+                else
+                {
+                    LogMessage(
+                        "F11 pressed; hqx filter off.\r\n",
+                        sizeof("F11 pressed; hqx filter off.\r\n") - 1);
+                }
+            }
+            else if (!toggleIgnoredLogged)
+            {
+                toggleIgnoredLogged = TRUE;
+                LogMessage(
+                    "F11 ignored; the hqx presenter is not active (Hqx=0 or 32-bit mode unavailable).\r\n",
+                    sizeof("F11 ignored; the hqx presenter is not active (Hqx=0 or 32-bit mode unavailable).\r\n") - 1);
+            }
+        }
+
+        toggleWasDown = toggleDown;
     }
 
+    if (g_hqxStaging != NULL)
+    {
+        result = PresentHqxFrame(surface);
+        if (g_flipLogCount < 4 || (FAILED(result) && g_flipLogCount < 8))
+        {
+            ++g_flipLogCount;
+            LogHRESULTResult(
+                "hqx present result=0x",
+                sizeof("hqx present result=0x") - 1,
+                result);
+        }
+
+        return result;
+    }
+
+    WaitBeforePresent();
     result = g_originalSurfaceBlt(
         surface,
         NULL,
@@ -1445,6 +1961,54 @@ static HRESULT WINAPI HookedCreateSurface(
             outer);
     }
 
+    if (directDraw == g_hookState.object &&
+        g_hqxDisplayActive &&
+        caller - g_gameBase < kExpectedImageSize &&
+        surfaceDescription != NULL)
+    {
+        BYTE* description = reinterpret_cast<BYTE*>(surfaceDescription);
+
+        if (*DescriptionDword(description, 0) == kDdsurfaceDescSize &&
+            (*DescriptionDword(description, kDdsurfaceDescFlagsOffset) &
+                (kDdsdCaps | kDdsdPixelFormat)) == kDdsdCaps &&
+            (*DescriptionDword(description, kDdsurfaceDescCapsOffset) &
+                (kDdsCapsOffscreenPlain | kDdsCapsPrimarySurface)) ==
+                kDdsCapsOffscreenPlain)
+        {
+            static DWORD indexedLogCount = 0;
+            BYTE indexedDescription[kDdsurfaceDescSize];
+            DWORD index;
+
+            for (index = 0; index < kDdsurfaceDescSize; index += sizeof(DWORD))
+            {
+                *reinterpret_cast<volatile DWORD*>(indexedDescription + index) =
+                    *DescriptionDword(description, index);
+            }
+
+            SetIndexedSystemMemoryFormat(indexedDescription);
+            result = g_hookState.originalCreateSurface(
+                directDraw,
+                indexedDescription,
+                surface,
+                outer);
+            if (indexedLogCount < 8)
+            {
+                ++indexedLogCount;
+                LogHRESULTResult(
+                    "hqx: created a game surface as 8-bit system memory=0x",
+                    sizeof("hqx: created a game surface as 8-bit system memory=0x") - 1,
+                    result);
+            }
+
+            if (SUCCEEDED(result) && surface != NULL)
+            {
+                InstallSurfaceHooks(*surface);
+            }
+
+            return result;
+        }
+    }
+
     result = g_hookState.originalCreateSurface(
         directDraw,
         surfaceDescription,
@@ -1547,11 +2111,10 @@ static HRESULT WINAPI HookedSetDisplayMode(
             }
 
             SelectVirtualWidth(targetWidth, targetHeight);
-            result = CallOriginalSetDisplayMode(
+            result = SetVirtualDisplayMode(
                 directDraw,
                 targetWidth,
                 targetHeight,
-                bitsPerPixel,
                 caller);
             if (SUCCEEDED(result))
             {

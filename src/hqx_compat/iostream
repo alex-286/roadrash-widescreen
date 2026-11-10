@@ -1,0 +1,2 @@
+// Empty stand-in for <iostream>. The vendored hqx sources include it but never
+// use it; the real header would pull the C++ runtime into this CRT-free DLL.

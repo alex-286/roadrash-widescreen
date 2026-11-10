@@ -81,10 +81,12 @@ flip, therefore re-installs the `Flip` hook when needed.
 
   ```ini
   [Display]
-  DisplayWidth=0
-  DisplayHeight=0
-  VirtualWidth=0
-  WaitForVBlank=1
+  DisplayWidth=0   ; 0 (default) = desktop width, or a width in pixels
+  DisplayHeight=0  ; 0 (default) = desktop height, or a height in pixels
+  VirtualWidth=0   ; 0 (default) = fit the display's aspect ratio, or 640-1280
+  WaitForVBlank=1  ; 1 (default) = wait for vertical blank, 0 = no wait
+  Hqx=0            ; 0 (default) = old 8-bit path, unchanged, 1 = hqx upscaling
+  HqxScale=0       ; 0 (default) = auto (hq2x below 1440 lines), 2 = hq2x, 3 = hq3x
   ```
 
   `DisplayWidth`/`DisplayHeight` select the real 8-bit display mode. 0 (the
@@ -97,9 +99,49 @@ flip, therefore re-installs the `Flip` hook when needed.
   1) makes each frame wait for the vertical blank before it is presented, which
   prevents tearing but caps the frame rate at the monitor's refresh rate. Set it
   to 0 to disable the wait. An unsupported wait is ignored rather than blocking.
+  `Hqx=1` enables the hqx upscaler (see below). `HqxScale` selects hq2x (2)
+  or hq3x (3); 0 (the default) picks the largest factor whose height fits the
+  display: hq2x below 1440 lines, hq3x from 1440 lines.
+
+### hqx upscaling
+
+With `Hqx=1`, the gameplay display mode is set to 32 bits per pixel instead of
+8. The game still renders 8-bit palettized frames: its back buffer and the
+other gameplay surfaces (sky halves, HUD bitmaps) are created as 8-bit
+system-memory surfaces, and the game palette is attached to the back buffer so
+the GDI-drawn HUD text keeps its colors. On every flip the frame is converted
+through the game palette, scaled with hq2x or hq3x (856x480 becomes 1712x960
+or 2568x1440), and stretched to the display. The vendored
+[hqx](https://github.com/brunexgeek/hqx) library (Apache License 2.0, git
+submodule in `vendor/hqx`; run `git submodule update --init` after cloning)
+does the scaling.
+
+Its `HQ2x.cc` and `HQ3x.cc` are compiled unchanged, but `HQx.cc` is replaced by
+`src/hqx_upscaler.cpp`. The library converts both colors to YUV in floating
+point for every neighbor comparison, about 115 ms per 856x480 frame. The
+replacement carries each pixel's palette index in the alpha byte and looks up
+a 256x256 similarity table that is rebuilt only when the palette changes. That
+takes about 6 ms (hq2x) or 7 ms (hq3x) per frame and produces output
+byte-identical to the original library. `src/hqx_compat` supplies the
+`<stdint.h>` that Visual C++ 2005 lacks and an empty `<iostream>`, which the
+hqx sources include without using.
+
+**F11** toggles the filter during a race. When it is off, the frame is
+stretched without filtering, which looks like the 8-bit path. The toggle stays
+within the 32-bit display mode: switching between the 8-bit and 32-bit modes
+in the middle of a race would invalidate all of the game's surfaces. With
+`Hqx=0`, F11 does nothing. The log records the average conversion time with
+and without the filter after 300 frames each.
+
+If the 32-bit mode is not X8R8G8B8, or 8-bit surfaces cannot be created
+alongside it, the 8-bit display mode is used as before. The 720x480 fallback
+never uses hqx. On a 1920x1080 display the hq2x output (1712x960) is
+stretched by a factor of 1.125 without filtering, which duplicates about every
+eighth row and column.
 
 Known limitations: with `WaitForVBlank=0`, tearing is possible. Widths above
-856 and displays above 1920x1080 are untested, and so is Windows 98.
+856 and displays above 1920x1080 are untested, and so is Windows 98. The hqx
+presenter has not yet been tested in the game.
 
 The proxy loads the operating system's DirectDraw DLL and does not currently
 chain through DDrawCompat or dgVoodoo2. Modern-Windows translation-layer
