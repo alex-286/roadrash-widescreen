@@ -232,6 +232,7 @@ static LARGE_INTEGER g_lastPresentEnd;
 static BOOL g_lastPresentValid = FALSE;
 static LPVOID g_backPalette = NULL;
 static BOOL g_showFps = FALSE;
+static BOOL g_showFilter = FALSE;
 // The first log message of a run replaces the previous log.
 static BOOL g_truncateLog = FALSE;
 
@@ -673,6 +674,8 @@ static void ReadVirtualWidthSetting()
         g_activeFilter = g_filterSetting;
         g_showFps = GetPrivateProfileIntA(
             "Display", "ShowFps", 0, path) != 0;
+        g_showFilter = GetPrivateProfileIntA(
+            "Display", "ShowFilter", 0, path) != 0;
         g_scanlineStrength = GetPrivateProfileIntA(
             "Display", "Scanlines", 0, path);
         if (g_scanlineStrength > 100)
@@ -2058,7 +2061,7 @@ static HRESULT PresentFilteredFrame(LPVOID primary, FrameTiming* timing)
                 outputHeight,
                 kOriginalDisplayHeight,
                 g_scanlineStrength);
-            if (g_showFps)
+            if (g_showFps || g_showFilter)
             {
                 FpsOverlayDraw(
                     stagingPixels,
@@ -2068,7 +2071,9 @@ static HRESULT PresentFilteredFrame(LPVOID primary, FrameTiming* timing)
                     4,
                     GetFilterOverlayScale(filter),
                     0x00FFFFFF,
-                    0x00000000);
+                    0x00000000,
+                    g_showFps,
+                    g_showFilter ? kFilterNames[filter] : NULL);
             }
 
             reinterpret_cast<SurfaceUnlockFn>(
@@ -2114,9 +2119,10 @@ static HRESULT PresentFilteredFrame(LPVOID primary, FrameTiming* timing)
     return result;
 }
 
-// 8-bit path: draws the frame rate into the virtual back buffer, which the
-// game redraws completely every frame, right before it is presented.
-static void DrawFpsOnBackBuffer()
+// 8-bit path: draws the overlay (frame rate and/or filter name) into the
+// virtual back buffer, which the game redraws completely every frame, right
+// before it is presented.
+static void DrawOverlayOnBackBuffer()
 {
     BYTE palette[1024];
     BYTE description[kDdsurfaceDescSize];
@@ -2146,7 +2152,9 @@ static void DrawFpsOnBackBuffer()
         1,
         1,
         white,
-        black);
+        black,
+        g_showFps,
+        g_showFilter ? kFilterNames[kFilterNone] : NULL);
     reinterpret_cast<SurfaceUnlockFn>(
         backVtable[kSurfaceUnlockVtableIndex])(g_virtualBack, NULL);
 }
@@ -2240,9 +2248,9 @@ static HRESULT WINAPI HookedSurfaceFlip(
         return result;
     }
 
-    if (g_showFps)
+    if (g_showFps || g_showFilter)
     {
-        DrawFpsOnBackBuffer();
+        DrawOverlayOnBackBuffer();
     }
 
     QueryPerformanceCounter(&timing.converted);

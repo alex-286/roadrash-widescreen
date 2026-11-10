@@ -11,6 +11,7 @@ static const DWORD kBoxPadding = 2;
 static const DWORD kMargin = 4;
 static const DWORD kUpdateIntervalMs = 500;
 static const DWORD kMaxTextLength = 8;
+static const DWORD kMaxLineLength = 40;
 
 struct Glyph
 {
@@ -18,9 +19,24 @@ struct Glyph
     BYTE rows[7];
 };
 
-// 5x7 glyphs; bit 4 is the leftmost column.
+// 5x7 glyphs; bit 4 is the leftmost column. Digits and the letters of "FPS"
+// and of the filter names.
 static const Glyph kGlyphs[] =
 {
+    { 'A', { 0x0E, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11 } },
+    { 'B', { 0x1E, 0x11, 0x11, 0x1E, 0x11, 0x11, 0x1E } },
+    { 'C', { 0x0E, 0x11, 0x10, 0x10, 0x10, 0x11, 0x0E } },
+    { 'E', { 0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x1F } },
+    { 'H', { 0x11, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11 } },
+    { 'I', { 0x0E, 0x04, 0x04, 0x04, 0x04, 0x04, 0x0E } },
+    { 'L', { 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x1F } },
+    { 'N', { 0x11, 0x11, 0x19, 0x15, 0x13, 0x11, 0x11 } },
+    { 'O', { 0x0E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E } },
+    { 'Q', { 0x0E, 0x11, 0x11, 0x11, 0x15, 0x12, 0x0D } },
+    { 'R', { 0x1E, 0x11, 0x11, 0x1E, 0x14, 0x12, 0x11 } },
+    { 'T', { 0x1F, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04 } },
+    { 'U', { 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E } },
+    { 'X', { 0x11, 0x11, 0x0A, 0x04, 0x0A, 0x11, 0x11 } },
     { '0', { 0x0E, 0x11, 0x13, 0x15, 0x19, 0x11, 0x0E } },
     { '1', { 0x04, 0x0C, 0x04, 0x04, 0x04, 0x04, 0x0E } },
     { '2', { 0x0E, 0x11, 0x01, 0x02, 0x04, 0x08, 0x1F } },
@@ -97,6 +113,11 @@ static const BYTE* FindGlyph(CHAR character)
 {
     DWORD index;
 
+    if (character >= 'a' && character <= 'z')
+    {
+        character = static_cast<CHAR>(character - 'a' + 'A');
+    }
+
     for (index = 0; index < sizeof(kGlyphs) / sizeof(kGlyphs[0]); ++index)
     {
         if (kGlyphs[index].character == character)
@@ -148,15 +169,42 @@ void FpsOverlayDraw(
     DWORD bytesPerPixel,
     DWORD scale,
     DWORD foreground,
-    DWORD background)
+    DWORD background,
+    BOOL showRate,
+    const CHAR* label)
 {
-    DWORD length = lstrlenA(g_text);
+    CHAR text[kMaxLineLength + 1];
+    DWORD length = 0;
     DWORD boxLeft = kMargin * scale;
     DWORD boxTop = kMargin * scale;
     DWORD boxRight;
     DWORD boxBottom;
     DWORD index;
 
+    // "60 FPS", the label, or both separated by two spaces.
+    if (showRate)
+    {
+        for (index = 0; g_text[index] != '\0'; ++index)
+        {
+            text[length++] = g_text[index];
+        }
+    }
+
+    if (label != NULL && label[0] != '\0')
+    {
+        if (length != 0)
+        {
+            text[length++] = ' ';
+            text[length++] = ' ';
+        }
+
+        for (index = 0; label[index] != '\0' && length < kMaxLineLength; ++index)
+        {
+            text[length++] = label[index];
+        }
+    }
+
+    text[length] = '\0';
     if (pixels == NULL || length == 0 || scale == 0 ||
         (bytesPerPixel != 1 && bytesPerPixel != 4))
     {
@@ -177,7 +225,7 @@ void FpsOverlayDraw(
 
     for (index = 0; index < length; ++index)
     {
-        const BYTE* rows = FindGlyph(g_text[index]);
+        const BYTE* rows = FindGlyph(text[index]);
         DWORD glyphLeft = boxLeft + (kBoxPadding + index * kGlyphAdvance) * scale;
         DWORD glyphTop = boxTop + kBoxPadding * scale;
         DWORD row;

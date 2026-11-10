@@ -89,6 +89,7 @@ flip, therefore re-installs the `Flip` hook when needed.
   HqxScale=0       ; hqx/xbr factor: 0 (default) = auto (2 below 1440 lines), 2, or 3
   Scanlines=0      ; 0 (default) = off, or 1-100 = scanline darkening in percent
   ShowFps=0        ; 0 (default) = off, 1 = show the frame rate during races
+  ShowFilter=0     ; 0 (default) = off, 1 = show the active filter's name
   ```
 
   `DisplayWidth`/`DisplayHeight` select the real 8-bit display mode. 0 (the
@@ -110,7 +111,9 @@ flip, therefore re-installs the `Flip` hook when needed.
   8-bit path it is drawn into the virtual frame with the palette's brightest
   and darkest colors; with a filter it is drawn after filtering, so the filter
   does not blur it. F12 screenshots do not contain it. The 720x480 fallback
-  does not show it.
+  does not show it. `ShowFilter=1` adds the name of the active filter in the
+  same box (`60 FPS  BICUBIC`, or `NONE` in the 8-bit path), which helps when
+  cycling with F11; it also works without `ShowFps`.
 
 ### Frame filters
 
