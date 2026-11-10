@@ -87,6 +87,7 @@ flip, therefore re-installs the `Flip` hook when needed.
   WaitForVBlank=1  ; 1 (default) = wait for vertical blank, 0 = no wait
   Hqx=0            ; 0 (default) = old 8-bit path, unchanged, 1 = hqx upscaling
   HqxScale=0       ; 0 (default) = auto (hq2x below 1440 lines), 2 = hq2x, 3 = hq3x
+  ShowFps=0        ; 0 (default) = off, 1 = show the frame rate during races
   ```
 
   `DisplayWidth`/`DisplayHeight` select the real 8-bit display mode. 0 (the
@@ -102,6 +103,12 @@ flip, therefore re-installs the `Flip` hook when needed.
   `Hqx=1` enables the hqx upscaler (see below). `HqxScale` selects hq2x (2)
   or hq3x (3); 0 (the default) picks the largest factor whose height fits the
   display: hq2x below 1440 lines, hq3x from 1440 lines.
+  `ShowFps=1` shows the number of presented frames per second, refreshed twice
+  a second, as white digits on a black box in the top-left corner. In the
+  8-bit path it is drawn into the virtual frame with the palette's brightest
+  and darkest colors; with hqx it is drawn after scaling, so the filter does
+  not blur it. F12 screenshots do not contain it. The 720x480 fallback does
+  not show it.
 
 ### hqx upscaling
 

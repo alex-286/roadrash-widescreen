@@ -68,6 +68,12 @@ if errorlevel 1 (
     exit /b 1
 )
 
+cl.exe /nologo /Zl /GS- /O2 /W3 /DWIN32 /D_WINDOWS /D_USRDLL /D_MBCS /Fo"%BUILD%\fps_overlay.obj" /c "%ROOT%\src\fps_overlay.cpp"
+if errorlevel 1 (
+    echo FPS overlay compilation failed.
+    exit /b 1
+)
+
 rem The hqx sources are compiled unchanged. src\hqx_compat supplies the
 rem <stdint.h> that Visual C++ 2005 lacks and an empty <iostream>, and
 rem src\hqx_upscaler.cpp replaces vendor\hqx\source\HQx.cc.
@@ -91,7 +97,7 @@ if errorlevel 1 (
     exit /b 1
 )
 
-link.exe /nologo /NODEFAULTLIB /DLL /MACHINE:I386 /SUBSYSTEM:WINDOWS,4.0 /ENTRY:DllMain@12 /DEF:"%ROOT%\src\ddraw.def" /OUT:"%BUILD%\ddraw.dll" "%BUILD%\ddraw_proxy.obj" "%BUILD%\road_rash_patch.obj" "%BUILD%\hqx_upscaler.obj" "%BUILD%\HQ2x.obj" "%BUILD%\HQ3x.obj" kernel32.lib user32.lib
+link.exe /nologo /NODEFAULTLIB /DLL /MACHINE:I386 /SUBSYSTEM:WINDOWS,4.0 /ENTRY:DllMain@12 /DEF:"%ROOT%\src\ddraw.def" /OUT:"%BUILD%\ddraw.dll" "%BUILD%\ddraw_proxy.obj" "%BUILD%\road_rash_patch.obj" "%BUILD%\fps_overlay.obj" "%BUILD%\hqx_upscaler.obj" "%BUILD%\HQ2x.obj" "%BUILD%\HQ3x.obj" kernel32.lib user32.lib
 if errorlevel 1 (
     echo DLL linking failed.
     exit /b 1

@@ -1,5 +1,6 @@
 #include "road_rash_patch.h"
 #include "hqx_upscaler.h"
+#include "fps_overlay.h"
 
 #include <intrin.h>
 
@@ -190,6 +191,7 @@ static BOOL g_hqxFilterEnabled = TRUE;
 static DWORD g_hqxScale = 2;
 static LPVOID g_hqxStaging = NULL;
 static LPVOID g_backPalette = NULL;
+static BOOL g_showFps = FALSE;
 // The first log message of a run replaces the previous log.
 static BOOL g_truncateLog = FALSE;
 
@@ -584,6 +586,8 @@ static void ReadVirtualWidthSetting()
             "Display", "WaitForVBlank", 1, path) != 0;
         g_hqxRequested = GetPrivateProfileIntA(
             "Display", "Hqx", 0, path) != 0;
+        g_showFps = GetPrivateProfileIntA(
+            "Display", "ShowFps", 0, path) != 0;
         width = GetPrivateProfileIntA("Display", "HqxScale", 0, path);
         if (width == 2 || width == 3)
         {
@@ -1641,6 +1645,21 @@ static HRESULT PresentHqxFrame(LPVOID primary)
                     sourcePixels, sourcePitch, stagingPixels, stagingPitch);
             }
 
+            if (g_showFps)
+            {
+                DWORD scale = filtered ? g_hqxScale : 1;
+
+                FpsOverlayDraw(
+                    stagingPixels,
+                    stagingPitch,
+                    kVirtualDisplayWidth * scale,
+                    kOriginalDisplayHeight * scale,
+                    4,
+                    scale,
+                    0x00FFFFFF,
+                    0x00000000);
+            }
+
             reinterpret_cast<SurfaceUnlockFn>(
                 stagingVtable[kSurfaceUnlockVtableIndex])(g_hqxStaging, NULL);
         }
@@ -1676,6 +1695,43 @@ static HRESULT PresentHqxFrame(LPVOID primary)
         &source,
         kDdbltWait,
         NULL);
+}
+
+// 8-bit path: draws the frame rate into the virtual back buffer, which the
+// game redraws completely every frame, right before it is presented.
+static void DrawFpsOnBackBuffer()
+{
+    BYTE palette[1024];
+    BYTE description[kDdsurfaceDescSize];
+    LPVOID* backVtable = GetVtable(g_virtualBack);
+    DWORD white = 255;
+    DWORD black = 0;
+
+    if (ReadGamePalette(palette))
+    {
+        FpsOverlayPickColors(palette, &white, &black);
+    }
+
+    ZeroDescription(description);
+    *DescriptionDword(description, 0) = kDdsurfaceDescSize;
+    if (FAILED(reinterpret_cast<SurfaceLockFn>(
+            backVtable[kSurfaceLockVtableIndex])(
+                g_virtualBack, NULL, description, kDdlockWait, NULL)))
+    {
+        return;
+    }
+
+    FpsOverlayDraw(
+        *reinterpret_cast<BYTE**>(description + kDdsurfaceDescSurfaceOffset),
+        *reinterpret_cast<LONG*>(description + kDdsurfaceDescPitchOffset),
+        kVirtualDisplayWidth,
+        kOriginalDisplayHeight,
+        1,
+        1,
+        white,
+        black);
+    reinterpret_cast<SurfaceUnlockFn>(
+        backVtable[kSurfaceUnlockVtableIndex])(g_virtualBack, NULL);
 }
 
 static HRESULT WINAPI HookedSurfaceFlip(
@@ -1754,6 +1810,11 @@ static HRESULT WINAPI HookedSurfaceFlip(
         toggleWasDown = toggleDown;
     }
 
+    if (g_showFps)
+    {
+        FpsOverlayCountFrame();
+    }
+
     if (g_hqxStaging != NULL)
     {
         result = PresentHqxFrame(surface);
@@ -1767,6 +1828,11 @@ static HRESULT WINAPI HookedSurfaceFlip(
         }
 
         return result;
+    }
+
+    if (g_showFps)
+    {
+        DrawFpsOnBackBuffer();
     }
 
     WaitBeforePresent();
