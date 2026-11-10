@@ -189,7 +189,13 @@ static DWORD g_hqxScaleSetting = 0;
 static BOOL g_hqxDisplayActive = FALSE;
 static BOOL g_hqxFilterEnabled = TRUE;
 static DWORD g_hqxScale = 2;
+// Two staging surfaces take turns, so a frame is never written into the
+// surface the previous present may still be reading.
 static LPVOID g_hqxStaging = NULL;
+static LPVOID g_hqxStagingSpare = NULL;
+// Frame timing diagnostics: the end of the previous present.
+static LARGE_INTEGER g_lastPresentEnd;
+static BOOL g_lastPresentValid = FALSE;
 static LPVOID g_backPalette = NULL;
 static BOOL g_showFps = FALSE;
 // The first log message of a run replaces the previous log.
@@ -1174,12 +1180,13 @@ static HRESULT SetVirtualDisplayMode(
     return CallOriginalSetDisplayMode(directDraw, width, height, 8, caller);
 }
 
-// A 32-bit system-memory surface that receives the converted frame and is
-// stretched onto the primary.
+// 32-bit system-memory surfaces that receive the converted frame and are
+// stretched onto the primary. The second one is optional.
 static HRESULT CreateHqxStaging(LPVOID directDraw)
 {
     BYTE description[kDdsurfaceDescSize];
     LPVOID staging = NULL;
+    LPVOID spare = NULL;
     HRESULT result;
 
     BuildOffscreenDescription(
@@ -1201,6 +1208,20 @@ static HRESULT CreateHqxStaging(LPVOID directDraw)
         return result;
     }
 
+    result = g_hookState.originalCreateSurface(
+        directDraw,
+        description,
+        &spare,
+        NULL);
+    if (FAILED(result))
+    {
+        spare = NULL;
+        LogHRESULTResult(
+            "hqx: second staging surface unavailable; using one=0x",
+            sizeof("hqx: second staging surface unavailable; using one=0x") - 1,
+            result);
+    }
+
     if (!HqxUpscalerInitialize(
             kVirtualDisplayWidth,
             kOriginalDisplayHeight,
@@ -1210,10 +1231,20 @@ static HRESULT CreateHqxStaging(LPVOID directDraw)
             "hqx buffer allocation failed.\r\n",
             sizeof("hqx buffer allocation failed.\r\n") - 1);
         ReleaseObject(staging);
+        if (spare != NULL)
+        {
+            ReleaseObject(spare);
+        }
+
         return E_OUTOFMEMORY;
     }
 
+    LogHRESULTResult(
+        "hqx: scaling threads=0x",
+        sizeof("hqx: scaling threads=0x") - 1,
+        HqxUpscalerThreadCount());
     g_hqxStaging = staging;
+    g_hqxStagingSpare = spare;
     return S_OK;
 }
 
@@ -1321,6 +1352,7 @@ static HRESULT CreateVirtualPrimary(
     }
 
     g_backPalette = NULL;
+    g_lastPresentValid = FALSE;
     g_virtualPrimary = *surface;
     g_virtualBack = backBuffer;
     LogMessage(
@@ -1337,14 +1369,21 @@ static ULONG WINAPI HookedSurfaceRelease(LPVOID surface)
     {
         LPVOID back = g_virtualBack;
         LPVOID staging = g_hqxStaging;
+        LPVOID spare = g_hqxStagingSpare;
 
         g_virtualPrimary = NULL;
         g_virtualBack = NULL;
         g_hqxStaging = NULL;
+        g_hqxStagingSpare = NULL;
         g_backPalette = NULL;
         if (back != NULL)
         {
             g_originalSurfaceRelease(back);
+        }
+
+        if (spare != NULL)
+        {
+            g_originalSurfaceRelease(spare);
         }
 
         if (staging != NULL)
@@ -1532,55 +1571,121 @@ static void AppendDecimal(CHAR* message, DWORD* length, DWORD value)
     }
 }
 
-// Logs the average conversion time once per filter state so the cost of
-// hqx can be compared with the plain conversion.
-static void RecordHqxTiming(BOOL filtered, LARGE_INTEGER start)
+// Points in time of one virtual present.
+struct FrameTiming
 {
-    static const DWORD kFrames = 300;
-    static DWORD frameCount[2];
-    static DWORD totalMicroseconds[2];
-    static BOOL logged[2];
-    LARGE_INTEGER end;
-    LARGE_INTEGER frequency;
-    DWORD slot = filtered ? 1 : 0;
-    CHAR message[96];
-    DWORD length;
+    LARGE_INTEGER start;
+    LARGE_INTEGER converted;
+    LARGE_INTEGER waited;
+    LARGE_INTEGER presented;
+};
+
+enum FrameTimingSlot
+{
+    kTiming8Bit,
+    kTiming32BitPlain,
+    kTimingHqx,
+    kTimingSlotCount
+};
+
+// 32-bit arithmetic only: 64-bit division would need the C runtime.
+static DWORD ElapsedMicroseconds(LARGE_INTEGER from, LARGE_INTEGER to)
+{
+    static LARGE_INTEGER frequency;
     DWORD ticks;
     int microseconds;
 
-    // 32-bit arithmetic only: 64-bit division would need the C runtime.
-    if (logged[slot] ||
-        !QueryPerformanceCounter(&end) ||
-        !QueryPerformanceFrequency(&frequency) ||
-        frequency.HighPart != 0 ||
+    if (frequency.LowPart == 0 && !QueryPerformanceFrequency(&frequency))
+    {
+        return 0;
+    }
+
+    if (frequency.HighPart != 0 ||
         frequency.LowPart == 0 ||
         frequency.LowPart > 0x7FFFFFFF)
     {
-        return;
+        return 0;
     }
 
-    ticks = end.LowPart - start.LowPart;
+    ticks = to.LowPart - from.LowPart;
     microseconds = MulDiv(
         static_cast<int>(ticks & 0x7FFFFFFF),
         1000000,
         static_cast<int>(frequency.LowPart));
-    if (microseconds > 0)
+    return microseconds > 0 ? static_cast<DWORD>(microseconds) : 0;
+}
+
+static void AppendTimingField(
+    CHAR* message,
+    DWORD* length,
+    const CHAR* name,
+    DWORD value)
+{
+    lstrcpyA(message + *length, name);
+    *length += lstrlenA(name);
+    AppendDecimal(message, length, value);
+}
+
+// Logs, once per presentation path, where the time of a frame goes, averaged
+// over 300 frames: the game's own work between presents, the conversion
+// (palette, hqx, overlay), the vertical-blank wait, and the present blit.
+static void RecordFrameTiming(DWORD slot, const FrameTiming* timing)
+{
+    static const DWORD kFrames = 300;
+    static const DWORD kMaxGameMicroseconds = 250000;
+    static const CHAR* const kLabels[kTimingSlotCount] =
     {
-        totalMicroseconds[slot] += static_cast<DWORD>(microseconds);
+        "Frame timing, 8-bit (average us):",
+        "Frame timing, 32-bit without hqx (average us):",
+        "Frame timing, hqx (average us):"
+    };
+    static DWORD frames[kTimingSlotCount];
+    static DWORD game[kTimingSlotCount];
+    static DWORD convert[kTimingSlotCount];
+    static DWORD wait[kTimingSlotCount];
+    static DWORD present[kTimingSlotCount];
+    static BOOL logged[kTimingSlotCount];
+    BOOL previousValid = g_lastPresentValid;
+    LARGE_INTEGER previousEnd = g_lastPresentEnd;
+    DWORD gameMicroseconds;
+    CHAR message[192];
+    DWORD length;
+    DWORD total;
+
+    g_lastPresentEnd = timing->presented;
+    g_lastPresentValid = TRUE;
+    if (!previousValid || logged[slot])
+    {
+        return;
     }
 
-    if (++frameCount[slot] < kFrames)
+    // Loading screens and pauses would distort the average.
+    gameMicroseconds = ElapsedMicroseconds(previousEnd, timing->start);
+    if (gameMicroseconds > kMaxGameMicroseconds)
+    {
+        return;
+    }
+
+    game[slot] += gameMicroseconds;
+    convert[slot] += ElapsedMicroseconds(timing->start, timing->converted);
+    wait[slot] += ElapsedMicroseconds(timing->converted, timing->waited);
+    present[slot] += ElapsedMicroseconds(timing->waited, timing->presented);
+    if (++frames[slot] < kFrames)
     {
         return;
     }
 
     logged[slot] = TRUE;
-    microseconds = static_cast<int>(totalMicroseconds[slot] / kFrames);
-    lstrcpyA(message, filtered ?
-        "hqx: average frame conversion with hqx (us)=" :
-        "hqx: average frame conversion without hqx (us)=");
+    total = (game[slot] + convert[slot] + wait[slot] + present[slot]) / kFrames;
+    lstrcpyA(message, kLabels[slot]);
     length = lstrlenA(message);
-    AppendDecimal(message, &length, static_cast<DWORD>(microseconds));
+    AppendTimingField(message, &length, " game=", game[slot] / kFrames);
+    AppendTimingField(message, &length, " convert=", convert[slot] / kFrames);
+    AppendTimingField(message, &length, " vblank-wait=", wait[slot] / kFrames);
+    AppendTimingField(message, &length, " present=", present[slot] / kFrames);
+    AppendTimingField(message, &length, " frame=", total);
+    AppendTimingField(
+        message, &length, " fps=", total != 0 ? 1000000 / total : 0);
     message[length++] = '\r';
     message[length++] = '\n';
     LogMessage(message, length);
@@ -1588,7 +1693,7 @@ static void RecordHqxTiming(BOOL filtered, LARGE_INTEGER start)
 
 // Converts the 8-bit virtual frame to 32 bits through the game palette,
 // optionally scales it with hqx, and stretches it onto the primary.
-static HRESULT PresentHqxFrame(LPVOID primary)
+static HRESULT PresentHqxFrame(LPVOID primary, FrameTiming* timing)
 {
     BYTE palette[1024];
     BYTE backDescription[kDdsurfaceDescSize];
@@ -1596,11 +1701,9 @@ static HRESULT PresentHqxFrame(LPVOID primary)
     LPVOID* backVtable = GetVtable(g_virtualBack);
     LPVOID* stagingVtable = GetVtable(g_hqxStaging);
     BOOL filtered = g_hqxFilterEnabled;
-    LARGE_INTEGER start;
     RECT source;
     HRESULT result;
 
-    QueryPerformanceCounter(&start);
     if (ReadGamePalette(palette))
     {
         HqxUpscalerSetPalette(palette);
@@ -1676,10 +1779,6 @@ static HRESULT PresentHqxFrame(LPVOID primary)
             sizeof("hqx: frame conversion skipped; Lock failed=0x") - 1,
             result);
     }
-    else
-    {
-        RecordHqxTiming(filtered, start);
-    }
 
     source.left = 0;
     source.top = 0;
@@ -1687,14 +1786,26 @@ static HRESULT PresentHqxFrame(LPVOID primary)
         filtered ? kVirtualDisplayWidth * g_hqxScale : kVirtualDisplayWidth);
     source.bottom = static_cast<LONG>(
         filtered ? kOriginalDisplayHeight * g_hqxScale : kOriginalDisplayHeight);
+    QueryPerformanceCounter(&timing->converted);
     WaitBeforePresent();
-    return g_originalSurfaceBlt(
+    QueryPerformanceCounter(&timing->waited);
+    result = g_originalSurfaceBlt(
         primary,
         NULL,
         g_hqxStaging,
         &source,
         kDdbltWait,
         NULL);
+    QueryPerformanceCounter(&timing->presented);
+    if (g_hqxStagingSpare != NULL)
+    {
+        LPVOID presented = g_hqxStaging;
+
+        g_hqxStaging = g_hqxStagingSpare;
+        g_hqxStagingSpare = presented;
+    }
+
+    return result;
 }
 
 // 8-bit path: draws the frame rate into the virtual back buffer, which the
@@ -1740,7 +1851,9 @@ static HRESULT WINAPI HookedSurfaceFlip(
     DWORD flags)
 {
     HRESULT result;
+    FrameTiming timing;
 
+    QueryPerformanceCounter(&timing.start);
     if (surface != g_virtualPrimary || g_virtualBack == NULL)
     {
         if (g_virtualDisplayActive && g_flipLogCount < 8)
@@ -1817,7 +1930,10 @@ static HRESULT WINAPI HookedSurfaceFlip(
 
     if (g_hqxStaging != NULL)
     {
-        result = PresentHqxFrame(surface);
+        DWORD slot = g_hqxFilterEnabled ? kTimingHqx : kTiming32BitPlain;
+
+        result = PresentHqxFrame(surface, &timing);
+        RecordFrameTiming(slot, &timing);
         if (g_flipLogCount < 4 || (FAILED(result) && g_flipLogCount < 8))
         {
             ++g_flipLogCount;
@@ -1835,7 +1951,9 @@ static HRESULT WINAPI HookedSurfaceFlip(
         DrawFpsOnBackBuffer();
     }
 
+    QueryPerformanceCounter(&timing.converted);
     WaitBeforePresent();
+    QueryPerformanceCounter(&timing.waited);
     result = g_originalSurfaceBlt(
         surface,
         NULL,
@@ -1843,6 +1961,8 @@ static HRESULT WINAPI HookedSurfaceFlip(
         NULL,
         kDdbltWait,
         NULL);
+    QueryPerformanceCounter(&timing.presented);
+    RecordFrameTiming(kTiming8Bit, &timing);
     if (g_flipLogCount < 4 || (FAILED(result) && g_flipLogCount < 8))
     {
         ++g_flipLogCount;

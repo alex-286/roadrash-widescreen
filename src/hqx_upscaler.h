@@ -8,6 +8,9 @@
 BOOL HqxUpscalerInitialize(DWORD width, DWORD height, DWORD scale);
 void HqxUpscalerShutdown();
 
+// The number of threads that scale a frame, including the calling one.
+DWORD HqxUpscalerThreadCount();
+
 // Takes 256 PALETTEENTRY values (red, green, blue, flags). The similarity
 // table is only rebuilt when the colors changed.
 void HqxUpscalerSetPalette(const BYTE* entries);

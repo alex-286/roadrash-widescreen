@@ -128,8 +128,15 @@ Its `HQ2x.cc` and `HQ3x.cc` are compiled unchanged, but `HQx.cc` is replaced by
 point for every neighbor comparison, about 115 ms per 856x480 frame. The
 replacement carries each pixel's palette index in the alpha byte and looks up
 a 256x256 similarity table that is rebuilt only when the palette changes. That
-takes about 6 ms (hq2x) or 7 ms (hq3x) per frame and produces output
-byte-identical to the original library. `src/hqx_compat` supplies the
+takes about 6 ms (hq2x) or 7 ms (hq3x) per frame on one core and produces
+output byte-identical to the original library. The frame is also split into
+horizontal stripes, one per processor (up to 8). Each stripe is scaled with
+one extra source row above and below, so the seams match the single-pass
+result. With 8 threads a frame takes about 1.1 ms (hq2x) or 1.5 ms (hq3x).
+On a single processor, which includes every Windows 98 system, no thread is
+started and the frame is scaled on the game thread. The converted frame goes
+into two staging surfaces in turn, so a frame is never written into the
+surface the previous present may still be reading. `src/hqx_compat` supplies the
 `<stdint.h>` that Visual C++ 2005 lacks and an empty `<iostream>`, which the
 hqx sources include without using.
 
@@ -137,8 +144,14 @@ hqx sources include without using.
 stretched without filtering, which looks like the 8-bit path. The toggle stays
 within the 32-bit display mode: switching between the 8-bit and 32-bit modes
 in the middle of a race would invalidate all of the game's surfaces. With
-`Hqx=0`, F11 does nothing. The log records the average conversion time with
-and without the filter after 300 frames each.
+`Hqx=0`, F11 does nothing.
+
+For each presentation path (8-bit, 32-bit without hqx, hqx), the log records
+once where the time of a frame goes, averaged over 300 frames: `game` (the
+game's own work between presents), `convert` (palette conversion, hqx, FPS
+overlay), `vblank-wait`, `present` (the stretch blit) and the resulting frame
+time and rate. Frames after a pause of more than 250 ms, such as loading, are
+left out.
 
 If the 32-bit mode is not X8R8G8B8, or 8-bit surfaces cannot be created
 alongside it, the 8-bit display mode is used as before. The 720x480 fallback
