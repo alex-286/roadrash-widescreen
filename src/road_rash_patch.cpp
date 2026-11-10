@@ -3,6 +3,7 @@
 #include "fps_overlay.h"
 #include "worker_pool.h"
 #include "sharp_bilinear.h"
+#include "bicubic.h"
 
 #include <intrin.h>
 
@@ -193,6 +194,7 @@ enum FrameFilter
     kFilterNearest,
     kFilterHqx,
     kFilterSharpBilinear,
+    kFilterBicubic,
     kFilterCount
 };
 
@@ -201,7 +203,8 @@ static const CHAR* const kFilterNames[kFilterCount] =
     "none",
     "nearest",
     "hqx",
-    "sharp-bilinear"
+    "sharp-bilinear",
+    "bicubic"
 };
 
 // The filter from the ini, the filter in use (kept across races), whether
@@ -1262,7 +1265,7 @@ static void GetFilterOutputSize(DWORD filter, DWORD* width, DWORD* height)
     }
 
     // Filters that scale to the display size are presented 1:1.
-    if (filter == kFilterSharpBilinear)
+    if (filter == kFilterSharpBilinear || filter == kFilterBicubic)
     {
         *width = g_realDisplayWidth;
         *height = g_realDisplayHeight;
@@ -1400,6 +1403,7 @@ static void ReleasePresenterResources()
 {
     HqxUpscalerShutdown();
     SharpBilinearShutdown();
+    BicubicShutdown();
     WorkerPoolStop();
 }
 
@@ -1434,6 +1438,22 @@ static BOOL PrepareFilter(DWORD filter)
                 "Sharp bilinear buffer allocation failed; filter disabled.\r\n",
                 sizeof("Sharp bilinear buffer allocation failed; filter disabled.\r\n") - 1);
             g_filterUnavailable[kFilterSharpBilinear] = TRUE;
+            return FALSE;
+        }
+    }
+
+    if (filter == kFilterBicubic && !BicubicIsReady())
+    {
+        if (!BicubicInitialize(
+                kVirtualDisplayWidth,
+                kOriginalDisplayHeight,
+                g_realDisplayWidth,
+                g_realDisplayHeight))
+        {
+            LogMessage(
+                "Bicubic buffer allocation failed; filter disabled.\r\n",
+                sizeof("Bicubic buffer allocation failed; filter disabled.\r\n") - 1);
+            g_filterUnavailable[kFilterBicubic] = TRUE;
             return FALSE;
         }
     }
@@ -1974,6 +1994,14 @@ static HRESULT PresentFilteredFrame(LPVOID primary, FrameTiming* timing)
                 break;
             case kFilterSharpBilinear:
                 SharpBilinearScale(
+                    sourcePixels,
+                    sourcePitch,
+                    g_paletteRgb,
+                    stagingPixels,
+                    stagingPitch);
+                break;
+            case kFilterBicubic:
+                BicubicScale(
                     sourcePixels,
                     sourcePitch,
                     g_paletteRgb,

@@ -85,7 +85,7 @@ flip, therefore re-installs the `Flip` hook when needed.
   DisplayHeight=0  ; 0 (default) = desktop height, or a height in pixels
   VirtualWidth=0   ; 0 (default) = fit the display's aspect ratio, or 640-1280
   WaitForVBlank=1  ; 1 (default) = wait for vertical blank, 0 = no wait
-  Filter=none      ; none (default) = old 8-bit path, or nearest, hqx, sharp-bilinear
+  Filter=none      ; none (default) = old 8-bit path, or nearest, hqx, sharp-bilinear, bicubic
   HqxScale=0       ; 0 (default) = auto (hq2x below 1440 lines), 2 = hq2x, 3 = hq3x
   ShowFps=0        ; 0 (default) = off, 1 = show the frame rate during races
   ```
@@ -128,11 +128,12 @@ reading.
 | `nearest`        | Converted only, then stretched by DirectDraw without smoothing.       |
 | `hqx`            | hq2x or hq3x (856x480 becomes 1712x960 or 2568x1440), then stretched. |
 | `sharp-bilinear` | Scaled to the display size with crisp, evenly sized pixels.           |
+| `bicubic`        | Scaled to the display size smoothly (Catmull-Rom), like a photo.      |
 
 The older `Hqx=1` setting still selects `hqx` when `Filter` is missing.
 
 **F11** cycles through the 32-bit filters during a race (nearest, hqx,
-sharp-bilinear, back to nearest) and logs the new one. The selection is kept for later races. The
+sharp-bilinear, bicubic, back to nearest) and logs the new one. The selection is kept for later races. The
 cycle stays within the 32-bit display mode: switching between the 8-bit and
 32-bit modes in the middle of a race would invalidate all of the game's
 surfaces, so with `Filter=none` F11 does nothing. A filter that cannot
@@ -177,6 +178,20 @@ column and row, lookup tables hold the source pixel and blend weight; rows are
 filtered horizontally once and then blended vertically. It uses integer
 arithmetic only. One thread takes about 2 ms (2560x1440) or 4 ms (1920x1080)
 per frame on a modern CPU, 8 threads well under 1 ms.
+
+#### Bicubic
+
+`src/bicubic.cpp` scales the frame straight to the display size with the
+Catmull-Rom cubic, the sharpest bicubic that adds no blur of its own. Unlike
+the pixel-art filters it also softens the blocks the game itself creates when
+it enlarges near sprites, and the noise of the digitized textures; hard edges
+may show a faint overshoot. Each output pixel combines a 4x4 neighborhood with
+10-bit integer weights from per-column and per-row tables; each source row is
+filtered horizontally once, then rows are combined vertically. Samples that
+fall exactly on a source pixel are copied. One thread takes about 19 ms
+(2560x1440) or 15 ms (1920x1080) per frame on a modern CPU, 8 threads about
+2.5 ms. On a single-core Pentium 4 it is only practical at low display
+resolutions.
 
 #### Diagnostics
 
