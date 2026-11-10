@@ -74,6 +74,12 @@ if errorlevel 1 (
     exit /b 1
 )
 
+cl.exe /nologo /Zl /GS- /O2 /W3 /DWIN32 /D_WINDOWS /D_USRDLL /D_MBCS /Fo"%BUILD%\scanlines.obj" /c "%ROOT%\src\scanlines.cpp"
+if errorlevel 1 (
+    echo Scanlines compilation failed.
+    exit /b 1
+)
+
 cl.exe /nologo /Zl /GS- /O2 /W3 /DWIN32 /D_WINDOWS /D_USRDLL /D_MBCS /Fo"%BUILD%\xbr.obj" /c "%ROOT%\src\xbr.cpp"
 if errorlevel 1 (
     echo xBR compilation failed.
@@ -121,7 +127,7 @@ if errorlevel 1 (
     exit /b 1
 )
 
-link.exe /nologo /NODEFAULTLIB /DLL /MACHINE:I386 /SUBSYSTEM:WINDOWS,4.0 /ENTRY:DllMain@12 /DEF:"%ROOT%\src\ddraw.def" /OUT:"%BUILD%\ddraw.dll" "%BUILD%\ddraw_proxy.obj" "%BUILD%\road_rash_patch.obj" "%BUILD%\fps_overlay.obj" "%BUILD%\worker_pool.obj" "%BUILD%\sharp_bilinear.obj" "%BUILD%\bicubic.obj" "%BUILD%\xbr.obj" "%BUILD%\hqx_upscaler.obj" "%BUILD%\HQ2x.obj" "%BUILD%\HQ3x.obj" kernel32.lib user32.lib
+link.exe /nologo /NODEFAULTLIB /DLL /MACHINE:I386 /SUBSYSTEM:WINDOWS,4.0 /ENTRY:DllMain@12 /DEF:"%ROOT%\src\ddraw.def" /OUT:"%BUILD%\ddraw.dll" "%BUILD%\ddraw_proxy.obj" "%BUILD%\road_rash_patch.obj" "%BUILD%\fps_overlay.obj" "%BUILD%\worker_pool.obj" "%BUILD%\sharp_bilinear.obj" "%BUILD%\bicubic.obj" "%BUILD%\xbr.obj" "%BUILD%\scanlines.obj" "%BUILD%\hqx_upscaler.obj" "%BUILD%\HQ2x.obj" "%BUILD%\HQ3x.obj" kernel32.lib user32.lib
 if errorlevel 1 (
     echo DLL linking failed.
     exit /b 1

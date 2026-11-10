@@ -87,6 +87,7 @@ flip, therefore re-installs the `Flip` hook when needed.
   WaitForVBlank=1  ; 1 (default) = wait for vertical blank, 0 = no wait
   Filter=none      ; none (default) = old 8-bit path, or nearest, hqx, xbr, sharp-bilinear, bicubic
   HqxScale=0       ; hqx/xbr factor: 0 (default) = auto (2 below 1440 lines), 2, or 3
+  Scanlines=0      ; 0 (default) = off, or 1-100 = scanline darkening in percent
   ShowFps=0        ; 0 (default) = off, 1 = show the frame rate during races
   ```
 
@@ -209,6 +210,20 @@ fall exactly on a source pixel are copied. One thread takes about 19 ms
 (2560x1440) or 15 ms (1920x1080) per frame on a modern CPU, 8 threads about
 2.5 ms. On a single-core Pentium 4 it is only practical at low display
 resolutions.
+
+#### Scanlines
+
+`Scanlines=1` to `100` darkens the rows between the game's 480 source lines
+by that percentage after any filter, like the gaps between the lines of a CRT
+(`src/scanlines.cpp`); 30 to 50 is a good start. With a whole number of rows
+per source line (hq2x, hq3x, xBR, and the display-size filters at 960 or 1440
+lines), the rows in the last third of each line are darkened: one row in two
+or one in three. Otherwise, such as with 2.25 rows per line at 1080 lines,
+rows are darkened in proportion to their closeness to a line boundary, which
+spreads the darkening evenly instead of skipping some lines. Scanlines need
+at least two rows per source line, so the `nearest` filter (which leaves the
+stretch to DirectDraw) and the 8-bit path show none. They are drawn before
+the FPS overlay.
 
 #### Diagnostics
 

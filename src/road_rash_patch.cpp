@@ -5,6 +5,7 @@
 #include "sharp_bilinear.h"
 #include "bicubic.h"
 #include "xbr.h"
+#include "scanlines.h"
 
 #include <intrin.h>
 
@@ -217,6 +218,8 @@ static DWORD g_activeFilter = kFilterNone;
 static BOOL g_presenterDisplayActive = FALSE;
 static BOOL g_filterUnavailable[kFilterCount];
 static DWORD g_hqxScaleSetting = 0;
+// Scanline darkening in percent; 0 is off.
+static DWORD g_scanlineStrength = 0;
 static DWORD g_hqxScale = 2;
 // The game palette as X8R8G8B8, refreshed every presented frame.
 static DWORD g_paletteRgb[256];
@@ -670,6 +673,12 @@ static void ReadVirtualWidthSetting()
         g_activeFilter = g_filterSetting;
         g_showFps = GetPrivateProfileIntA(
             "Display", "ShowFps", 0, path) != 0;
+        g_scanlineStrength = GetPrivateProfileIntA(
+            "Display", "Scanlines", 0, path);
+        if (g_scanlineStrength > 100)
+        {
+            g_scanlineStrength = 100;
+        }
         width = GetPrivateProfileIntA("Display", "HqxScale", 0, path);
         if (width == 2 || width == 3)
         {
@@ -2042,6 +2051,13 @@ static HRESULT PresentFilteredFrame(LPVOID primary, FrameTiming* timing)
                 break;
             }
 
+            ScanlinesApply(
+                stagingPixels,
+                stagingPitch,
+                outputWidth,
+                outputHeight,
+                kOriginalDisplayHeight,
+                g_scanlineStrength);
             if (g_showFps)
             {
                 FpsOverlayDraw(
