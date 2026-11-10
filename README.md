@@ -85,8 +85,8 @@ flip, therefore re-installs the `Flip` hook when needed.
   DisplayHeight=0  ; 0 (default) = desktop height, or a height in pixels
   VirtualWidth=0   ; 0 (default) = fit the display's aspect ratio, or 640-1280
   WaitForVBlank=1  ; 1 (default) = wait for vertical blank, 0 = no wait
-  Filter=none      ; none (default) = old 8-bit path, or nearest, hqx, sharp-bilinear, bicubic
-  HqxScale=0       ; 0 (default) = auto (hq2x below 1440 lines), 2 = hq2x, 3 = hq3x
+  Filter=none      ; none (default) = old 8-bit path, or nearest, hqx, xbr, sharp-bilinear, bicubic
+  HqxScale=0       ; hqx/xbr factor: 0 (default) = auto (2 below 1440 lines), 2, or 3
   ShowFps=0        ; 0 (default) = off, 1 = show the frame rate during races
   ```
 
@@ -100,9 +100,10 @@ flip, therefore re-installs the `Flip` hook when needed.
   1) makes each frame wait for the vertical blank before it is presented, which
   prevents tearing but caps the frame rate at the monitor's refresh rate. Set it
   to 0 to disable the wait. An unsupported wait is ignored rather than blocking.
-  `Filter` selects a frame filter (see below). `HqxScale` selects hq2x (2)
-  or hq3x (3); 0 (the default) picks the largest factor whose height fits the
-  display: hq2x below 1440 lines, hq3x from 1440 lines.
+  `Filter` selects a frame filter (see below). `HqxScale` selects the factor
+  of the pixel-art filters hqx and xbr, 2 or 3; 0 (the default) picks the
+  largest factor whose height fits the display: 2 below 1440 lines, 3 from
+  1440 lines.
   `ShowFps=1` shows the number of presented frames per second, refreshed twice
   a second, as white digits on a black box in the top-left corner. In the
   8-bit path it is drawn into the virtual frame with the palette's brightest
@@ -127,14 +128,15 @@ reading.
 | `none`           | The 8-bit display mode; the presenter below is not used.              |
 | `nearest`        | Converted only, then stretched by DirectDraw without smoothing.       |
 | `hqx`            | hq2x or hq3x (856x480 becomes 1712x960 or 2568x1440), then stretched. |
+| `xbr`            | xBR 2x or 3x pixel-art scaling with cleaner diagonals, then stretched. |
 | `sharp-bilinear` | Scaled to the display size with crisp, evenly sized pixels.           |
 | `bicubic`        | Scaled to the display size smoothly (Catmull-Rom), like a photo.      |
 
 The older `Hqx=1` setting still selects `hqx` when `Filter` is missing.
 
-**F11** cycles through the 32-bit filters during a race (nearest, hqx,
-sharp-bilinear, bicubic, back to nearest) and logs the new one. The selection is kept for later races. The
-cycle stays within the 32-bit display mode: switching between the 8-bit and
+**F11** cycles through the 32-bit filters during a race (nearest, hqx, xbr,
+sharp-bilinear, bicubic, back to nearest) and logs the new one. The selection
+is kept for later races. The cycle stays within the 32-bit display mode: switching between the 8-bit and
 32-bit modes in the middle of a race would invalidate all of the game's
 surfaces, so with `Filter=none` F11 does nothing. A filter that cannot
 allocate its buffers is skipped and the frame falls back to `nearest`.
@@ -164,6 +166,21 @@ With 8 threads a frame takes about 1.1 ms (hq2x) or 1.5 ms (hq3x).
 empty `<iostream>`, which the hqx sources include without using. On a
 1920x1080 display the hq2x output (1712x960) is stretched by a factor of
 1.125 without smoothing, which duplicates about every eighth row and column.
+
+#### xBR
+
+`src/xbr.cpp` implements Hyllian's xBR "level 2" rules for 2x and 3x. For
+each corner of a source pixel, two weighted color-distance sums over a 4x4
+neighborhood decide whether an edge runs diagonally through that corner; if
+so, the output subpixels at the corner are blended toward the closer
+neighbor. A further test detects shallow slopes, which cover more subpixels.
+The rule is written once and applied to all four corners by rotating the
+neighborhood. Distances (YUV weighted 48:7:6) and similarity (the hqx
+thresholds) come from 256x256 palette tables that are rebuilt only when the
+palette changes. Pixels equal to their four direct neighbors are copied.
+Compared with hqx, outlines are rounder and diagonals cleaner. One thread
+takes about 10 ms (2x) or 13 ms (3x) per frame on a modern CPU, 8 threads
+under 2 ms.
 
 #### Sharp bilinear
 

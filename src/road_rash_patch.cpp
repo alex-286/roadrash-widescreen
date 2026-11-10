@@ -4,6 +4,7 @@
 #include "worker_pool.h"
 #include "sharp_bilinear.h"
 #include "bicubic.h"
+#include "xbr.h"
 
 #include <intrin.h>
 
@@ -193,6 +194,7 @@ enum FrameFilter
     kFilterNone,
     kFilterNearest,
     kFilterHqx,
+    kFilterXbr,
     kFilterSharpBilinear,
     kFilterBicubic,
     kFilterCount
@@ -203,6 +205,7 @@ static const CHAR* const kFilterNames[kFilterCount] =
     "none",
     "nearest",
     "hqx",
+    "xbr",
     "sharp-bilinear",
     "bicubic"
 };
@@ -1257,7 +1260,8 @@ static HRESULT SetVirtualDisplayMode(
 // The size of a filter's output in the staging surface.
 static void GetFilterOutputSize(DWORD filter, DWORD* width, DWORD* height)
 {
-    if (filter == kFilterHqx)
+    // The pixel-art filters scale by a whole factor; the present stretches.
+    if (filter == kFilterHqx || filter == kFilterXbr)
     {
         *width = kVirtualDisplayWidth * g_hqxScale;
         *height = kOriginalDisplayHeight * g_hqxScale;
@@ -1402,6 +1406,7 @@ static HRESULT CreatePresenterResources(LPVOID directDraw)
 static void ReleasePresenterResources()
 {
     HqxUpscalerShutdown();
+    XbrShutdown();
     SharpBilinearShutdown();
     BicubicShutdown();
     WorkerPoolStop();
@@ -1422,6 +1427,21 @@ static BOOL PrepareFilter(DWORD filter)
                 "hqx buffer allocation failed; filter disabled.\r\n",
                 sizeof("hqx buffer allocation failed; filter disabled.\r\n") - 1);
             g_filterUnavailable[kFilterHqx] = TRUE;
+            return FALSE;
+        }
+    }
+
+    if (filter == kFilterXbr && !XbrIsReady())
+    {
+        if (!XbrInitialize(
+                kVirtualDisplayWidth,
+                kOriginalDisplayHeight,
+                g_hqxScale))
+        {
+            LogMessage(
+                "xBR initialization failed; filter disabled.\r\n",
+                sizeof("xBR initialization failed; filter disabled.\r\n") - 1);
+            g_filterUnavailable[kFilterXbr] = TRUE;
             return FALSE;
         }
     }
@@ -1991,6 +2011,14 @@ static HRESULT PresentFilteredFrame(LPVOID primary, FrameTiming* timing)
             case kFilterHqx:
                 HqxUpscalerScale(
                     sourcePixels, sourcePitch, stagingPixels, stagingPitch);
+                break;
+            case kFilterXbr:
+                XbrScale(
+                    sourcePixels,
+                    sourcePitch,
+                    g_paletteRgb,
+                    stagingPixels,
+                    stagingPitch);
                 break;
             case kFilterSharpBilinear:
                 SharpBilinearScale(
