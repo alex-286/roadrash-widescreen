@@ -23,7 +23,8 @@ on disk: delete the file and the game is back to normal.
 - **No tearing:** waits for the vertical blank before each frame (can be
   turned off).
 - **FPS and filter display:** optional on-screen frame rate and filter name.
-- **Screenshots:** **F12** saves the current frame as a bitmap.
+- **Screenshots:** **F12** saves exactly what is on screen, at full
+  resolution with the filter applied.
 - **Multi-core:** filters spread their work across up to 8 CPU cores.
 - **Safe:** only the supported game version is patched; anything else is left
   untouched. Menus run exactly as before.
@@ -114,7 +115,7 @@ single-core CPU such as a Pentium 4, `sharp-bilinear` is the fastest choice;
 | Key | Action |
 |---|---|
 | **F11** | Cycle through the display filters (during a race, with a filter enabled). |
-| **F12** | Save the current frame as `RoadRashFrame.bmp` in the game folder. |
+| **F12** | Save a screenshot of the screen as `RoadRashScreen001.bmp`, `002`, ... in the game folder. It shows exactly what is displayed, including filter, scanlines and on-screen display. The game's unscaled 856x480 frame is also saved as `RoadRashFrame.bmp` (replaced each time). |
 
 ## Troubleshooting
 

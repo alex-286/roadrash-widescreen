@@ -47,7 +47,7 @@ Uninstallation
 
 Delete these files from the game folder:
 ddraw.dll, RoadRashWidescreen.ini, RoadRashWidescreen.log and, if present,
-RoadRashFrame.bmp.
+the screenshots RoadRashScreen001.bmp, ... and RoadRashFrame.bmp.
 
 
 Hotkeys during a race
@@ -55,7 +55,9 @@ Hotkeys during a race
 
 F11   Cycle through the display filters (only if a filter other than
       "none" is set in RoadRashWidescreen.ini).
-F12   Save the current frame as RoadRashFrame.bmp in the game folder.
+F12   Save a screenshot as RoadRashScreen001.bmp, RoadRashScreen002.bmp,
+      ... in the game folder. It shows exactly what is on screen. The
+      game's unscaled frame is also saved as RoadRashFrame.bmp.
 
 
 Troubleshooting

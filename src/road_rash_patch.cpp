@@ -9,6 +9,7 @@
 #include "bicubic.h"
 #include "xbr.h"
 #include "scanlines.h"
+#include "screenshot.h"
 
 #include <intrin.h>
 
@@ -113,6 +114,7 @@ static const DWORD kDdpfRgb = 0x00000040;
 static const DWORD kDdsCapsSystemMemory = 0x00000800;
 static const DWORD kDdsCapsVideoMemory = 0x00004000;
 static const DWORD kDdlockWait = 0x00000001;
+static const DWORD kDdlockReadOnly = 0x00000010;
 static const DWORD kDdlockWriteOnly = 0x00000020;
 static const DWORD kGetDisplayModeVtableIndex = 12;
 static const DWORD kSurfaceGetPaletteVtableIndex = 20;
@@ -1693,122 +1695,155 @@ static HRESULT WINAPI HookedSurfaceGetAttached(
     return g_originalSurfaceGetAttached(surface, capabilities, attached);
 }
 
-static BYTE g_dumpHeader[54 + 1024];
+static void AppendDecimal(CHAR* message, DWORD* length, DWORD value);
 
-static void WriteDumpDword(BYTE* destination, DWORD value)
+static void LogSavedImage(const CHAR* fileName, DWORD width, DWORD height)
 {
-    destination[0] = static_cast<BYTE>(value);
-    destination[1] = static_cast<BYTE>(value >> 8);
-    destination[2] = static_cast<BYTE>(value >> 16);
-    destination[3] = static_cast<BYTE>(value >> 24);
+    CHAR message[MAX_PATH + 64];
+    DWORD length;
+
+    lstrcpyA(message, "Saved ");
+    lstrcatA(message, fileName);
+    lstrcatA(message, " (");
+    length = lstrlenA(message);
+    AppendDecimal(message, &length, width);
+    message[length++] = 'x';
+    AppendDecimal(message, &length, height);
+    message[length++] = ')';
+    message[length++] = '.';
+    message[length++] = '\r';
+    message[length++] = '\n';
+    LogMessage(message, length);
 }
 
-// Diagnostic: F12 saves the 856x480 virtual back buffer as RoadRashFrame.bmp.
+// Diagnostic: F12 saves the game's own frame, the 8-bit virtual back buffer
+// before any filter or scaling, as RoadRashFrame.bmp.
 static void DumpVirtualBackBuffer()
 {
-    LPVOID* backVtable = *reinterpret_cast<LPVOID**>(g_virtualBack);
+    LPVOID* backVtable = GetVtable(g_virtualBack);
     BYTE description[kDdsurfaceDescSize];
     BYTE palette[1024];
-    HANDLE file;
-    DWORD written;
+    CHAR savedName[MAX_PATH];
     DWORD index;
-    LONG row;
-    BYTE* pixels;
-    DWORD pitch;
+    HRESULT result;
 
-    ZeroDescription(description);
-    *reinterpret_cast<DWORD*>(description) = kDdsurfaceDescSize;
-    {
-        HRESULT lockResult = reinterpret_cast<SurfaceLockFn>(backVtable[25])(
-            g_virtualBack, NULL, description, 1, NULL);
-
-        if (FAILED(lockResult))
-        {
-            LogHRESULTResult(
-                "Frame dump: Lock failed=0x",
-                sizeof("Frame dump: Lock failed=0x") - 1,
-                lockResult);
-            return;
-        }
-    }
-
-    pitch = *reinterpret_cast<DWORD*>(description + 16);
-    pixels = *reinterpret_cast<BYTE**>(description + 0x24);
     for (index = 0; index < sizeof(palette) / sizeof(DWORD); ++index)
     {
         reinterpret_cast<volatile DWORD*>(palette)[index] = 0;
     }
 
     ReadGamePalette(palette);
-
-    for (index = 0; index < sizeof(g_dumpHeader); ++index)
+    ZeroDescription(description);
+    *DescriptionDword(description, 0) = kDdsurfaceDescSize;
+    result = reinterpret_cast<SurfaceLockFn>(
+        backVtable[kSurfaceLockVtableIndex])(
+            g_virtualBack, NULL, description, kDdlockWait, NULL);
+    if (FAILED(result))
     {
-        reinterpret_cast<volatile BYTE*>(g_dumpHeader)[index] = 0;
+        LogHRESULTResult(
+            "Frame dump: Lock failed=0x",
+            sizeof("Frame dump: Lock failed=0x") - 1,
+            result);
+        return;
     }
 
-    g_dumpHeader[0] = 'B';
-    g_dumpHeader[1] = 'M';
-    WriteDumpDword(g_dumpHeader + 2, sizeof(g_dumpHeader) + kVirtualDisplayWidth * 480);
-    WriteDumpDword(g_dumpHeader + 10, sizeof(g_dumpHeader));
-    WriteDumpDword(g_dumpHeader + 14, 40);
-    WriteDumpDword(g_dumpHeader + 18, kVirtualDisplayWidth);
-    WriteDumpDword(g_dumpHeader + 22, 480);
-    g_dumpHeader[26] = 1;
-    g_dumpHeader[28] = 8;
-    WriteDumpDword(g_dumpHeader + 46, 256);
-    for (index = 0; index < 256; ++index)
+    if (ScreenshotWriteBmp(
+            "RoadRashFrame.bmp",
+            FALSE,
+            *reinterpret_cast<BYTE**>(description + kDdsurfaceDescSurfaceOffset),
+            *reinterpret_cast<LONG*>(description + kDdsurfaceDescPitchOffset),
+            kVirtualDisplayWidth,
+            kOriginalDisplayHeight,
+            8,
+            palette,
+            savedName))
     {
-        g_dumpHeader[54 + index * 4] = palette[index * 4 + 2];
-        g_dumpHeader[54 + index * 4 + 1] = palette[index * 4 + 1];
-        g_dumpHeader[54 + index * 4 + 2] = palette[index * 4];
-    }
-
-    {
-        CHAR dumpPath[MAX_PATH];
-        DWORD pathLength = GetModuleFileNameA(NULL, dumpPath, MAX_PATH);
-        static const CHAR dumpName[] = "RoadRashFrame.bmp";
-
-        while (pathLength > 0 && dumpPath[pathLength - 1] != '\\')
-        {
-            --pathLength;
-        }
-
-        if (pathLength + sizeof(dumpName) > MAX_PATH)
-        {
-            pathLength = 0;
-        }
-
-        lstrcpyA(dumpPath + pathLength, dumpName);
-        file = CreateFileA(
-            dumpPath,
-            GENERIC_WRITE,
-            0,
-            NULL,
-            CREATE_ALWAYS,
-            FILE_ATTRIBUTE_NORMAL,
-            NULL);
-    }
-    if (file == INVALID_HANDLE_VALUE)
-    {
-        LogMessage(
-            "Frame dump: could not create RoadRashFrame.bmp.\r\n",
-            sizeof("Frame dump: could not create RoadRashFrame.bmp.\r\n") - 1);
+        LogSavedImage(savedName, kVirtualDisplayWidth, kOriginalDisplayHeight);
     }
     else
     {
-        WriteFile(file, g_dumpHeader, sizeof(g_dumpHeader), &written, NULL);
-        for (row = 479; row >= 0; --row)
-        {
-            WriteFile(file, pixels + row * pitch, kVirtualDisplayWidth, &written, NULL);
-        }
-
-        CloseHandle(file);
         LogMessage(
-            "Saved RoadRashFrame.bmp.\r\n",
-            sizeof("Saved RoadRashFrame.bmp.\r\n") - 1);
+            "Frame dump: could not write RoadRashFrame.bmp.\r\n",
+            sizeof("Frame dump: could not write RoadRashFrame.bmp.\r\n") - 1);
     }
 
-    reinterpret_cast<SurfaceUnlockFn>(backVtable[32])(g_virtualBack, NULL);
+    reinterpret_cast<SurfaceUnlockFn>(
+        backVtable[kSurfaceUnlockVtableIndex])(g_virtualBack, NULL);
+}
+
+// F12 also saves exactly what is on screen: the primary surface after the
+// present, at the display resolution with filter, scanlines and overlay, as
+// the next free RoadRashScreen###.bmp.
+static void CaptureScreen(LPVOID primary)
+{
+    LPVOID* vtable = GetVtable(primary);
+    BYTE description[kDdsurfaceDescSize];
+    BYTE palette[1024];
+    CHAR savedName[MAX_PATH];
+    DWORD bitsPerPixel;
+    DWORD width;
+    DWORD height;
+    DWORD index;
+    HRESULT result;
+
+    for (index = 0; index < sizeof(palette) / sizeof(DWORD); ++index)
+    {
+        reinterpret_cast<volatile DWORD*>(palette)[index] = 0;
+    }
+
+    ReadGamePalette(palette);
+    ZeroDescription(description);
+    *DescriptionDword(description, 0) = kDdsurfaceDescSize;
+    result = reinterpret_cast<SurfaceLockFn>(
+        vtable[kSurfaceLockVtableIndex])(
+            primary, NULL, description, kDdlockWait | kDdlockReadOnly, NULL);
+    if (FAILED(result))
+    {
+        LogHRESULTResult(
+            "Screen capture: Lock failed=0x",
+            sizeof("Screen capture: Lock failed=0x") - 1,
+            result);
+        return;
+    }
+
+    bitsPerPixel = *DescriptionDword(description, kDdPixelFormatRgbBitCountOffset);
+    width = *DescriptionDword(description, kDdsurfaceDescWidthOffset);
+    height = *DescriptionDword(description, kDdsurfaceDescHeightOffset);
+    if (width == 0 || height == 0)
+    {
+        width = g_realDisplayWidth;
+        height = g_realDisplayHeight;
+    }
+
+    if (bitsPerPixel != 8 && bitsPerPixel != 32)
+    {
+        LogHRESULTResult(
+            "Screen capture: unsupported bits per pixel=0x",
+            sizeof("Screen capture: unsupported bits per pixel=0x") - 1,
+            bitsPerPixel);
+    }
+    else if (ScreenshotWriteBmp(
+            "RoadRashScreen",
+            TRUE,
+            *reinterpret_cast<BYTE**>(description + kDdsurfaceDescSurfaceOffset),
+            *reinterpret_cast<LONG*>(description + kDdsurfaceDescPitchOffset),
+            width,
+            height,
+            bitsPerPixel,
+            palette,
+            savedName))
+    {
+        LogSavedImage(savedName, width, height);
+    }
+    else
+    {
+        LogMessage(
+            "Screen capture: could not write the file.\r\n",
+            sizeof("Screen capture: could not write the file.\r\n") - 1);
+    }
+
+    reinterpret_cast<SurfaceUnlockFn>(
+        vtable[kSurfaceUnlockVtableIndex])(primary, NULL);
 }
 
 static void WaitBeforePresent()
@@ -2169,6 +2204,7 @@ static HRESULT WINAPI HookedSurfaceFlip(
 {
     HRESULT result;
     FrameTiming timing;
+    BOOL captureScreen;
 
     QueryPerformanceCounter(&timing.start);
     if (surface != g_virtualPrimary || g_virtualBack == NULL)
@@ -2190,15 +2226,17 @@ static HRESULT WINAPI HookedSurfaceFlip(
             sizeof("Virtual Flip entered.\r\n") - 1);
     }
 
+    // F12: the game's own frame now, the screen after the present below.
     {
         static BOOL keyWasDown = FALSE;
         BOOL keyDown = (GetAsyncKeyState(VK_F12) & 0x8000) != 0;
 
-        if (keyDown && !keyWasDown)
+        captureScreen = keyDown && !keyWasDown;
+        if (captureScreen)
         {
             LogMessage(
-                "F12 pressed; dumping the virtual frame.\r\n",
-                sizeof("F12 pressed; dumping the virtual frame.\r\n") - 1);
+                "F12 pressed; saving the game frame and the screen.\r\n",
+                sizeof("F12 pressed; saving the game frame and the screen.\r\n") - 1);
             DumpVirtualBackBuffer();
         }
 
@@ -2239,6 +2277,11 @@ static HRESULT WINAPI HookedSurfaceFlip(
         // The present may fall back to nearest, so read the filter after it.
         result = PresentFilteredFrame(surface, &timing);
         RecordFrameTiming(g_activeFilter, &timing);
+        if (captureScreen)
+        {
+            CaptureScreen(surface);
+        }
+
         if (g_flipLogCount < 4 || (FAILED(result) && g_flipLogCount < 8))
         {
             ++g_flipLogCount;
@@ -2268,6 +2311,11 @@ static HRESULT WINAPI HookedSurfaceFlip(
         NULL);
     QueryPerformanceCounter(&timing.presented);
     RecordFrameTiming(kFilterNone, &timing);
+    if (captureScreen)
+    {
+        CaptureScreen(surface);
+    }
+
     if (g_flipLogCount < 4 || (FAILED(result) && g_flipLogCount < 8))
     {
         ++g_flipLogCount;
