@@ -6,7 +6,7 @@
 #include "fps_overlay.h"
 #include "worker_pool.h"
 #include "sharp_bilinear.h"
-#include "bicubic.h"
+#include "resampler.h"
 #include "xbr.h"
 #include "scanlines.h"
 #include "screenshot.h"
@@ -228,6 +228,13 @@ static DWORD g_scanlineStrength = 0;
 static DWORD g_hqxScale = 2;
 // The game palette as X8R8G8B8, refreshed every presented frame.
 static DWORD g_paletteRgb[256];
+// The bicubic filter, and the smooth final scaling of the hqx and xbr
+// output (an area resampler) from its whole-factor size to the display
+// size. If the final scaling cannot start, the present stretches instead.
+static Resampler g_bicubic;
+static Resampler g_finalScale;
+static DWORD* g_pixelArtFrame = NULL;
+static BOOL g_finalScaleFailed = FALSE;
 // Two staging surfaces take turns, so a frame is never written into the
 // surface the previous present may still be reading.
 static LPVOID g_staging = NULL;
@@ -1252,10 +1259,13 @@ static HRESULT SetVirtualDisplayMode(
             caller);
         if (SUCCEEDED(result) && ProbePresenterDisplay(directDraw))
         {
+            // Automatic: the smallest factor whose output reaches the
+            // display height, so the final scaling never has to enlarge
+            // much (at 1080 lines, 3x output is reduced: supersampling).
             g_hqxScale = g_hqxScaleSetting;
             if (g_hqxScale == 0)
             {
-                g_hqxScale = height >= kOriginalDisplayHeight * 3 ? 3 : 2;
+                g_hqxScale = height <= kOriginalDisplayHeight * 2 ? 2 : 3;
             }
 
             g_presenterDisplayActive = TRUE;
@@ -1274,14 +1284,41 @@ static HRESULT SetVirtualDisplayMode(
     return CallOriginalSetDisplayMode(directDraw, width, height, 8, caller);
 }
 
+// The pixel-art filters (hqx, xbr) scale by a whole factor; this is their
+// output size before the final scaling.
+static void GetPixelArtSize(DWORD* width, DWORD* height)
+{
+    *width = kVirtualDisplayWidth * g_hqxScale;
+    *height = kOriginalDisplayHeight * g_hqxScale;
+}
+
+// Whether the pixel-art output is scaled smoothly to the display size, as
+// opposed to stretched by the present.
+static BOOL UsesFinalScale()
+{
+    DWORD width;
+    DWORD height;
+
+    GetPixelArtSize(&width, &height);
+    return !g_finalScaleFailed &&
+        (width != g_realDisplayWidth || height != g_realDisplayHeight);
+}
+
 // The size of a filter's output in the staging surface.
 static void GetFilterOutputSize(DWORD filter, DWORD* width, DWORD* height)
 {
-    // The pixel-art filters scale by a whole factor; the present stretches.
     if (filter == kFilterHqx || filter == kFilterXbr)
     {
-        *width = kVirtualDisplayWidth * g_hqxScale;
-        *height = kOriginalDisplayHeight * g_hqxScale;
+        if (UsesFinalScale())
+        {
+            *width = g_realDisplayWidth;
+            *height = g_realDisplayHeight;
+        }
+        else
+        {
+            GetPixelArtSize(width, height);
+        }
+
         return;
     }
 
@@ -1373,6 +1410,17 @@ static HRESULT CreatePresenterResources(LPVOID directDraw)
         }
     }
 
+    // Room for the unscaled pixel-art output too, in case the final scaling
+    // cannot start.
+    {
+        DWORD width;
+        DWORD height;
+
+        GetPixelArtSize(&width, &height);
+        stagingWidth = width > stagingWidth ? width : stagingWidth;
+        stagingHeight = height > stagingHeight ? height : stagingHeight;
+    }
+
     BuildOffscreenDescription(description, stagingWidth, stagingHeight);
     SetSystemMemoryCaps(description);
     result = g_hookState.originalCreateSurface(
@@ -1425,8 +1473,58 @@ static void ReleasePresenterResources()
     HqxUpscalerShutdown();
     XbrShutdown();
     SharpBilinearShutdown();
-    BicubicShutdown();
+    ResamplerShutdown(&g_bicubic);
+    ResamplerShutdown(&g_finalScale);
+    if (g_pixelArtFrame != NULL)
+    {
+        VirtualFree(g_pixelArtFrame, 0, MEM_RELEASE);
+        g_pixelArtFrame = NULL;
+    }
+
+    g_finalScaleFailed = FALSE;
     WorkerPoolStop();
+}
+
+// Prepares the smooth final scaling of the pixel-art output on first use.
+// If it cannot start, the present stretches the output instead.
+static void PrepareFinalScale()
+{
+    DWORD width;
+    DWORD height;
+
+    if (!UsesFinalScale() || ResamplerIsReady(&g_finalScale))
+    {
+        return;
+    }
+
+    GetPixelArtSize(&width, &height);
+    g_pixelArtFrame = reinterpret_cast<DWORD*>(VirtualAlloc(
+        NULL,
+        width * height * sizeof(DWORD),
+        MEM_COMMIT | MEM_RESERVE,
+        PAGE_READWRITE));
+    if (g_pixelArtFrame != NULL &&
+        ResamplerInitialize(
+            &g_finalScale,
+            kResamplerArea,
+            width,
+            height,
+            g_realDisplayWidth,
+            g_realDisplayHeight))
+    {
+        return;
+    }
+
+    if (g_pixelArtFrame != NULL)
+    {
+        VirtualFree(g_pixelArtFrame, 0, MEM_RELEASE);
+        g_pixelArtFrame = NULL;
+    }
+
+    g_finalScaleFailed = TRUE;
+    LogMessage(
+        "Smooth final scaling unavailable; the pixel-art output is stretched.\r\n",
+        sizeof("Smooth final scaling unavailable; the pixel-art output is stretched.\r\n") - 1);
 }
 
 // Prepares the filter's buffers on first use. A filter that cannot start is
@@ -1479,9 +1577,16 @@ static BOOL PrepareFilter(DWORD filter)
         }
     }
 
-    if (filter == kFilterBicubic && !BicubicIsReady())
+    if (filter == kFilterHqx || filter == kFilterXbr)
     {
-        if (!BicubicInitialize(
+        PrepareFinalScale();
+    }
+
+    if (filter == kFilterBicubic && !ResamplerIsReady(&g_bicubic))
+    {
+        if (!ResamplerInitialize(
+                &g_bicubic,
+                kResamplerBicubic,
                 kVirtualDisplayWidth,
                 kOriginalDisplayHeight,
                 g_realDisplayWidth,
@@ -2059,17 +2164,51 @@ static HRESULT PresentFilteredFrame(LPVOID primary, FrameTiming* timing)
             switch (filter)
             {
             case kFilterHqx:
-                HqxUpscalerScale(
-                    sourcePixels, sourcePitch, stagingPixels, stagingPitch);
-                break;
             case kFilterXbr:
-                XbrScale(
-                    sourcePixels,
-                    sourcePitch,
-                    g_paletteRgb,
-                    stagingPixels,
-                    stagingPitch);
+            {
+                // Scale by the whole factor, then smoothly to the display
+                // size, or straight into the staging surface when the
+                // present stretches it.
+                BOOL finalScale = UsesFinalScale();
+                BYTE* target = stagingPixels;
+                LONG targetPitch = stagingPitch;
+                DWORD width;
+                DWORD height;
+
+                GetPixelArtSize(&width, &height);
+                if (finalScale)
+                {
+                    target = reinterpret_cast<BYTE*>(g_pixelArtFrame);
+                    targetPitch = static_cast<LONG>(width * sizeof(DWORD));
+                }
+
+                if (filter == kFilterHqx)
+                {
+                    HqxUpscalerScale(
+                        sourcePixels, sourcePitch, target, targetPitch);
+                }
+                else
+                {
+                    XbrScale(
+                        sourcePixels,
+                        sourcePitch,
+                        g_paletteRgb,
+                        target,
+                        targetPitch);
+                }
+
+                if (finalScale)
+                {
+                    ResamplerScaleRgb(
+                        &g_finalScale,
+                        target,
+                        targetPitch,
+                        stagingPixels,
+                        stagingPitch);
+                }
+
                 break;
+            }
             case kFilterSharpBilinear:
                 SharpBilinearScale(
                     sourcePixels,
@@ -2079,7 +2218,8 @@ static HRESULT PresentFilteredFrame(LPVOID primary, FrameTiming* timing)
                     stagingPitch);
                 break;
             case kFilterBicubic:
-                BicubicScale(
+                ResamplerScaleIndexed(
+                    &g_bicubic,
                     sourcePixels,
                     sourcePitch,
                     g_paletteRgb,
