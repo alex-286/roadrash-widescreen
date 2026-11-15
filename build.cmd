@@ -143,6 +143,29 @@ if errorlevel 1 (
 
 echo Created: %BUILD%\ddraw.dll
 
+rem RRWSPatch.exe points ROADRASH.EXE at RRWS.dll (the same DLL under another
+rem name), because Windows 9x keeps using the system ddraw.dll otherwise.
+if exist "%BUILD%\RRWSPatch.exe" del /q "%BUILD%\RRWSPatch.exe"
+cl.exe /nologo /Zl /GS- /O2 /W3 /DWIN32 /D_WINDOWS /D_MBCS /Fo"%BUILD%\win9x_patcher.obj" /c "%ROOT%\src\win9x_patcher.cpp"
+if errorlevel 1 (
+    echo Windows 9x patcher compilation failed.
+    exit /b 1
+)
+
+rc.exe /fo"%BUILD%\win9x_patcher.res" "%ROOT%\src\win9x_patcher.rc"
+if errorlevel 1 (
+    echo Windows 9x patcher resource compilation failed.
+    exit /b 1
+)
+
+link.exe /nologo /NODEFAULTLIB /MACHINE:I386 /SUBSYSTEM:WINDOWS,4.0 /ENTRY:PatcherMain@0 /OUT:"%BUILD%\RRWSPatch.exe" "%BUILD%\win9x_patcher.obj" "%BUILD%\win9x_patcher.res" kernel32.lib user32.lib
+if errorlevel 1 (
+    echo Windows 9x patcher linking failed.
+    exit /b 1
+)
+
+echo Created: %BUILD%\RRWSPatch.exe
+
 rem Assemble the release package: the DLL plus the files from dist\ and the
 rem license texts, renamed to .txt so they open in Notepad.
 set "RELEASE=%BUILD%\release"
@@ -154,6 +177,8 @@ if errorlevel 1 (
 )
 
 copy /y "%BUILD%\ddraw.dll" "%RELEASE%\ddraw.dll" >nul && ^
+copy /y "%BUILD%\ddraw.dll" "%RELEASE%\RRWS.dll" >nul && ^
+copy /y "%BUILD%\RRWSPatch.exe" "%RELEASE%\RRWSPatch.exe" >nul && ^
 copy /y "%ROOT%\dist\RoadRashWidescreen.ini" "%RELEASE%\RoadRashWidescreen.ini" >nul && ^
 copy /y "%ROOT%\dist\README.txt" "%RELEASE%\README.txt" >nul && ^
 copy /y "%ROOT%\LICENSE" "%RELEASE%\LICENSE.txt" >nul && ^

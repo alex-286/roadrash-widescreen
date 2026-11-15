@@ -6,16 +6,23 @@ game at the native resolution of your monitor with a view that matches its
 aspect ratio, so you see more of the road instead of a stretched 4:3
 picture. Optional filters smooth the classic graphics on modern displays.
 
-The patch changes nothing on disk. Delete ddraw.dll and the game is back to
-normal.
+On Windows XP and newer, the patch changes nothing on disk: delete
+ddraw.dll and the game is back to normal. On Windows 95/98/ME, a small tool
+changes one name in ROADRASH.EXE so that the game loads the patch; it can
+undo the change.
 
 
 Files
 -----
 
-ddraw.dll                 The patch. It is loaded by the game instead of
-                          the Windows DirectDraw library and forwards all
-                          calls to it, adding the widescreen changes.
+ddraw.dll                 The patch for Windows XP and newer. It is loaded
+                          by the game instead of the Windows DirectDraw
+                          library and forwards all calls to it, adding the
+                          widescreen changes.
+RRWS.dll                  The same patch under another name, for Windows
+                          95/98/ME.
+RRWSPatch.exe             Windows 95/98/ME only: sets up ROADRASH.EXE to
+                          load RRWS.dll, and undoes it when run again.
 RoadRashWidescreen.ini    Optional settings (resolution, filters, ...).
 README.txt                This file.
 LICENSE.txt               The license of the patch (GNU GPL v3).
@@ -34,20 +41,43 @@ Requirements
 Installation
 ------------
 
+Never replace the ddraw.dll in the Windows system folder!
+
+Windows XP and newer:
+
 1. Copy ddraw.dll and RoadRashWidescreen.ini into the game folder, next to
    ROADRASH.EXE.
-   Never replace the ddraw.dll in the Windows system folder!
 2. Start the game and make sure "High Resolution" is enabled.
 3. Optional: open RoadRashWidescreen.ini in a text editor to change the
    settings. Every setting is explained in the file.
+
+Windows 95, 98 and ME:
+
+Windows 9x ignores a ddraw.dll in the game folder, so the game has to load
+the patch under the name RRWS.dll.
+
+1. Copy RRWS.dll, RRWSPatch.exe and RoadRashWidescreen.ini into the game
+   folder, next to ROADRASH.EXE. Do not copy ddraw.dll.
+2. Run RRWSPatch.exe and click "Yes". It changes the name DDRAW.dll in
+   ROADRASH.EXE to RRWS.dll (nothing else) and saves the unchanged program
+   as ROADRASH.BAK.
+3. Start the game as usual and make sure "High Resolution" is enabled.
+4. Optional: change the settings in RoadRashWidescreen.ini.
+
+Keep RRWS.dll in the game folder: the changed ROADRASH.EXE does not start
+without it.
 
 
 Uninstallation
 --------------
 
-Delete these files from the game folder:
-ddraw.dll, RoadRashWidescreen.ini, RoadRashWidescreen.log and, if present,
-the screenshots RoadRashScreen001.bmp, ... and RoadRashFrame.bmp.
+On Windows 95/98/ME, first run RRWSPatch.exe again and click "Yes" to undo
+the change to ROADRASH.EXE (or copy ROADRASH.BAK back to ROADRASH.EXE).
+
+Then delete these files from the game folder:
+ddraw.dll or RRWS.dll and RRWSPatch.exe, RoadRashWidescreen.ini,
+RoadRashWidescreen.log and, if present, the screenshots
+RoadRashScreen001.bmp, ... and RoadRashFrame.bmp.
 
 
 Hotkeys during a race
@@ -68,6 +98,9 @@ game folder. It shows whether the game version was recognized and which
 display mode and filter are used. Please attach it when reporting a
 problem.
 
+- No log file at all: the game did not load the patch. On Windows 95/98/ME,
+  use RRWS.dll and RRWSPatch.exe as described above; a ddraw.dll in the
+  game folder is ignored there.
 - Nothing changes: make sure "High Resolution" is enabled and check the log
   for the recognized game version.
 - A filter is set but not used: the 32-bit display mode is not available at

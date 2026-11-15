@@ -1,0 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Alexander Schmidt
+
+// Without a manifest, newer Windows treats an exe named "...Patch" as an
+// installer and asks for administrator rights. Windows 9x ignores it.
+1 24 "win9x_patcher.manifest"
