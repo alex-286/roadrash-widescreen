@@ -1,2 +1,5 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Alexander Schmidt
+
 // Empty stand-in for <iostream>. The vendored hqx sources include it but never
 // use it; the real header would pull the C++ runtime into this CRT-free DLL.

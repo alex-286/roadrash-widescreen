@@ -1,3 +1,5 @@
+; SPDX-License-Identifier: GPL-3.0-or-later
+; Copyright (C) 2026 Alexander Schmidt
 LIBRARY ddraw
 EXPORTS
     DirectDrawCreate=_DirectDrawCreate@12

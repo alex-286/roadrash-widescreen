@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Alexander Schmidt
+
 /* Minimal <stdint.h> for Visual C++ 2005, which does not ship one. Only the
  * vendored hqx sources are compiled with this directory on the include path. */
 #ifndef ROAD_RASH_HQX_COMPAT_STDINT_H

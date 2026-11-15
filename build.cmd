@@ -1,4 +1,6 @@
 @echo off
+rem SPDX-License-Identifier: GPL-3.0-or-later
+rem Copyright (C) 2026 Alexander Schmidt
 setlocal
 
 set "ROOT=%~dp0"
@@ -134,4 +136,26 @@ if errorlevel 1 (
 )
 
 echo Created: %BUILD%\ddraw.dll
+
+rem Assemble the release package: the DLL plus the files from dist\ and the
+rem license texts, renamed to .txt so they open in Notepad.
+set "RELEASE=%BUILD%\release"
+if exist "%RELEASE%\." rmdir /s /q "%RELEASE%"
+mkdir "%RELEASE%"
+if errorlevel 1 (
+    echo Could not create the release directory: %RELEASE%
+    exit /b 1
+)
+
+copy /y "%BUILD%\ddraw.dll" "%RELEASE%\ddraw.dll" >nul && ^
+copy /y "%ROOT%\dist\RoadRashWidescreen.ini" "%RELEASE%\RoadRashWidescreen.ini" >nul && ^
+copy /y "%ROOT%\dist\README.txt" "%RELEASE%\README.txt" >nul && ^
+copy /y "%ROOT%\LICENSE" "%RELEASE%\LICENSE.txt" >nul && ^
+copy /y "%ROOT%\THIRD_PARTY_NOTICES.md" "%RELEASE%\THIRD_PARTY_NOTICES.txt" >nul
+if errorlevel 1 (
+    echo Could not assemble the release package.
+    exit /b 1
+)
+
+echo Created: %RELEASE%
 endlocal & exit /b 0

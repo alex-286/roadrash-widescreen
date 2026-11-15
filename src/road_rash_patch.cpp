@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Alexander Schmidt
+
 #include "road_rash_patch.h"
 #include "hqx_upscaler.h"
 #include "fps_overlay.h"

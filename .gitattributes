@@ -1,0 +1,6 @@
+# Files shipped in the release package are read on Windows (down to
+# Windows 98 Notepad), so they always use CRLF line endings.
+dist/*.txt text eol=crlf
+dist/*.ini text eol=crlf
+LICENSE text eol=crlf
+THIRD_PARTY_NOTICES.md text eol=crlf

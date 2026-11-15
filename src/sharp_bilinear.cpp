@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Alexander Schmidt
+
 #include "sharp_bilinear.h"
 #include "worker_pool.h"
 

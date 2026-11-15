@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Alexander Schmidt
+
 #include "worker_pool.h"
 
 static const DWORD kMaxThreads = 8;
