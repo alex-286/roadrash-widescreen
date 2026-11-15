@@ -19,6 +19,10 @@ struct ScaleJob
     const BYTE* source;
     LONG sourcePitch;
     const DWORD* rgb;
+    // When set, X8R8G8B8 source rows come from this callback instead of
+    // source.
+    ResamplerRowSource rowSource;
+    void* rowContext;
     BYTE* destination;
     LONG destinationPitch;
 };
@@ -279,6 +283,33 @@ static __forceinline BOOL IsPair(const SHORT* weights)
     return weights[2] == 0 && weights[3] == 0;
 }
 
+// Combine for three taps with non-negative weights (the fourth is zero).
+// Such a sum stays within 0-255 per channel, so it needs no clamping; the
+// result equals Combine's.
+static __forceinline DWORD CombineTriple(
+    DWORD c0, DWORD c1, DWORD c2, const SHORT* weights)
+{
+    LONG w0 = weights[0];
+    LONG w1 = weights[1];
+    LONG w2 = weights[2];
+    LONG red =
+        static_cast<LONG>((c0 >> 16) & 0xFF) * w0 +
+        static_cast<LONG>((c1 >> 16) & 0xFF) * w1 +
+        static_cast<LONG>((c2 >> 16) & 0xFF) * w2;
+    LONG green =
+        static_cast<LONG>((c0 >> 8) & 0xFF) * w0 +
+        static_cast<LONG>((c1 >> 8) & 0xFF) * w1 +
+        static_cast<LONG>((c2 >> 8) & 0xFF) * w2;
+    LONG blue =
+        static_cast<LONG>(c0 & 0xFF) * w0 +
+        static_cast<LONG>(c1 & 0xFF) * w1 +
+        static_cast<LONG>(c2 & 0xFF) * w2;
+
+    return (static_cast<DWORD>((red + kOne / 2) >> kWeightBits) << 16) |
+        (static_cast<DWORD>((green + kOne / 2) >> kWeightBits) << 8) |
+        static_cast<DWORD>((blue + kOne / 2) >> kWeightBits);
+}
+
 // Blends two colors with the second tap's weight rescaled to 0-256; red
 // and blue are processed together. Only valid for non-negative weights.
 static __forceinline DWORD BlendPair(DWORD first, DWORD second, const SHORT* weights)
@@ -293,11 +324,14 @@ static __forceinline DWORD BlendPair(DWORD first, DWORD second, const SHORT* wei
     return (redBlue & 0x00FF00FF) | (green & 0x0000FF00);
 }
 
-static void FilterRow(const ScaleJob* job, DWORD sourceRow, DWORD* output)
+static void FilterRow(
+    const ScaleJob* job, DWORD part, DWORD sourceRow, DWORD* output)
 {
     const Resampler* resampler = job->resampler;
-    const BYTE* line = job->source +
-        static_cast<LONG>(sourceRow) * job->sourcePitch;
+    const BYTE* line = job->rowSource != NULL ?
+        reinterpret_cast<const BYTE*>(
+            job->rowSource(job->rowContext, part, sourceRow)) :
+        job->source + static_cast<LONG>(sourceRow) * job->sourcePitch;
     const DWORD* index = resampler->columnIndex;
     const SHORT* weight = resampler->columnWeight;
     DWORD width = resampler->destinationWidth;
@@ -339,6 +373,12 @@ static void FilterRow(const ScaleJob* job, DWORD sourceRow, DWORD* output)
                 output[column] = BlendPair(
                     pixels[index[0]], pixels[index[1]], weight);
             }
+            else if (blendPairs && weight[3] == 0)
+            {
+                output[column] = CombineTriple(
+                    pixels[index[0]], pixels[index[1]], pixels[index[2]],
+                    weight);
+            }
             else
             {
                 output[column] = Combine(
@@ -357,14 +397,19 @@ static void FilterRow(const ScaleJob* job, DWORD sourceRow, DWORD* output)
 
 // Each part keeps the last four horizontally filtered source rows, in slot
 // row % 4. The rows a destination row needs are consecutive (or repeat the
-// edge row), so they never share a slot.
+// edge row), so they never share a slot. As destination rows advance, the
+// rows filtered here only increase, which a row source may rely on.
 static const DWORD* GetRow(const ScaleJob* job, ResamplerRows* part, DWORD row)
 {
     DWORD slot = row & (kTaps - 1);
 
     if (part->tags[slot] != static_cast<LONG>(row))
     {
-        FilterRow(job, row, part->rows[slot]);
+        FilterRow(
+            job,
+            static_cast<DWORD>(part - job->resampler->parts),
+            row,
+            part->rows[slot]);
         part->tags[slot] = static_cast<LONG>(row);
     }
 
@@ -430,6 +475,17 @@ static void ScaleTask(DWORD part, DWORD, void* context)
         }
 
         row2 = GetRow(job, rows, index[2]);
+        if (resampler->blendPairs && weight[3] == 0)
+        {
+            for (column = 0; column < width; ++column)
+            {
+                output[column] = CombineTriple(
+                    row0[column], row1[column], row2[column], weight);
+            }
+
+            continue;
+        }
+
         row3 = GetRow(job, rows, index[3]);
         for (column = 0; column < width; ++column)
         {
@@ -551,6 +607,33 @@ static void Run(
     job.source = source;
     job.sourcePitch = sourcePitch;
     job.rgb = rgb;
+    job.rowSource = NULL;
+    job.rowContext = NULL;
+    job.destination = destination;
+    job.destinationPitch = destinationPitch;
+    WorkerPoolRun(ScaleTask, &job);
+}
+
+void ResamplerScaleRgbRows(
+    Resampler* resampler,
+    ResamplerRowSource rowSource,
+    void* context,
+    BYTE* destination,
+    LONG destinationPitch)
+{
+    ScaleJob job;
+
+    if (resampler->partCount == 0)
+    {
+        return;
+    }
+
+    job.resampler = resampler;
+    job.source = NULL;
+    job.sourcePitch = 0;
+    job.rgb = NULL;
+    job.rowSource = rowSource;
+    job.rowContext = context;
     job.destination = destination;
     job.destinationPitch = destinationPitch;
     WorkerPoolRun(ScaleTask, &job);

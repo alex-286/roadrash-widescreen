@@ -1536,17 +1536,17 @@ static void PrepareFinalScale(DWORD filter)
 {
     DWORD width;
     DWORD height;
+    BOOL frameReady;
 
     GetPixelArtSize(filter, &width, &height);
-    if (!UsesFinalScale(filter) ||
-        (ResamplerIsReady(&g_finalScale) &&
-         g_finalScale.sourceWidth == width &&
-         g_finalScale.sourceHeight == height))
+    if (!UsesFinalScale(filter))
     {
         return;
     }
 
-    if (g_pixelArtFrame == NULL)
+    // hqx writes its whole output before the final scaling; xbr hands its
+    // rows to the final scaling as they are made and needs no frame buffer.
+    if (filter == kFilterHqx && g_pixelArtFrame == NULL)
     {
         g_pixelArtFrame = reinterpret_cast<DWORD*>(VirtualAlloc(
             NULL,
@@ -1556,7 +1556,16 @@ static void PrepareFinalScale(DWORD filter)
             PAGE_READWRITE));
     }
 
-    if (g_pixelArtFrame != NULL &&
+    frameReady = filter != kFilterHqx || g_pixelArtFrame != NULL;
+    if (frameReady &&
+        ResamplerIsReady(&g_finalScale) &&
+        g_finalScale.sourceWidth == width &&
+        g_finalScale.sourceHeight == height)
+    {
+        return;
+    }
+
+    if (frameReady &&
         ResamplerInitialize(
             &g_finalScale,
             kResamplerArea,
@@ -2240,6 +2249,25 @@ static HRESULT PresentFilteredFrame(LPVOID primary, FrameTiming* timing)
                 LONG targetPitch = stagingPitch;
                 DWORD width;
                 DWORD height;
+
+                // xbr makes its rows as the final scaling reads them, so
+                // the large scaled frame never goes through memory (it
+                // would not fit in a Pentium 4's cache).
+                if (filter == kFilterXbr && finalScale)
+                {
+                    if (XbrPrepareFrame(
+                            sourcePixels, sourcePitch, g_paletteRgb))
+                    {
+                        ResamplerScaleRgbRows(
+                            &g_finalScale,
+                            XbrRow,
+                            NULL,
+                            stagingPixels,
+                            stagingPitch);
+                    }
+
+                    break;
+                }
 
                 GetPixelArtSize(filter, &width, &height);
                 if (finalScale)

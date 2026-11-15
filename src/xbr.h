@@ -24,4 +24,13 @@ void XbrScale(
     BYTE* destination,
     LONG destinationPitch);
 
+// Row-by-row use, without the whole scaled frame in memory: XbrPrepareFrame
+// takes the frame, then XbrRow returns scaled row `row` (width * scale
+// pixels) for worker part `part` (0-7), computing the scale rows of one
+// source row at a time. It matches ResamplerRowSource. Asked in increasing
+// order, each source row is computed once per part; a returned row stays
+// valid until that part asks for a row of another source row.
+BOOL XbrPrepareFrame(const BYTE* source, LONG sourcePitch, const DWORD* rgb);
+const DWORD* XbrRow(void* context, DWORD part, DWORD row);
+
 #endif

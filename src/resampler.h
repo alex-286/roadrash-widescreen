@@ -77,4 +77,19 @@ void ResamplerScaleRgb(
     BYTE* destination,
     LONG destinationPitch);
 
+// Returns source row `row` (X8R8G8B8, sourceWidth pixels) for worker part
+// `part`. Within one scaling, each part asks for rows in increasing order
+// and reads a row completely before asking for the next, so a source can
+// produce rows on demand into a small per-part buffer.
+typedef const DWORD* (*ResamplerRowSource)(void* context, DWORD part, DWORD row);
+
+// Scales an X8R8G8B8 frame whose rows come from rowSource, so the whole
+// source image never has to exist in memory.
+void ResamplerScaleRgbRows(
+    Resampler* resampler,
+    ResamplerRowSource rowSource,
+    void* context,
+    BYTE* destination,
+    LONG destinationPitch);
+
 #endif

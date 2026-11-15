@@ -18,17 +18,13 @@
 // shallow slopes ("left": the edge continues along the bottom, "up": along
 // the right side), which cover more subpixels. The other three corners use
 // the same rule with the neighborhood rotated by 90, 180 and 270 degrees.
-enum Neighbor
-{
-    kE, kF, kH, kI, kB, kC, kD, kG, kF4, kI4, kH5, kI5, kNeighborCount
-};
-
-static const int kNeighborOffsets[kNeighborCount][2] =
-{
-    { 0, 0 }, { 1, 0 }, { 0, 1 }, { 1, 1 },
-    { 0, -1 }, { 1, -1 }, { -1, 0 }, { -1, 1 },
-    { 2, 0 }, { 2, 1 }, { 0, 2 }, { 1, 2 }
-};
+//
+// Speed (this runs on single-core Pentium 4 PCs too): the frame is first
+// copied into a buffer with a two-pixel border of repeated edge pixels, so
+// neighbors are read through fixed offsets without clamping. In that copy,
+// palette indices are replaced by the first index of the same color, so
+// "same color" is a byte compare. A rotation is just a pair of steps: one
+// canonical step right and one down. Output is written in place.
 
 // Subpixels a corner can touch, named in the canonical (bottom-right)
 // orientation: the corner itself, then outward along the right column and
@@ -67,27 +63,53 @@ static const int kSubpixelOffsets4x[kSubpixelCount][2] =
 };
 
 static const DWORD kMaxScale = 4;
+static const DWORD kBorder = 2;
+static const DWORD kMaxParts = 8;
+static const DWORD kNoRow = 0xFFFFFFFF;
 static const LONG kSimilarY = 48;
 static const LONG kSimilarU = 7;
 static const LONG kSimilarV = 6;
 
-struct ScaleJob
+// Byte offset of each subpixel from the top-left of its output block, per
+// rotation, for one output pitch.
+typedef LONG SubpixelOffsets[4][kSubpixelCount];
+
+struct PadJob
 {
     const BYTE* source;
     LONG sourcePitch;
+};
+
+struct ScaleJob
+{
     BYTE* destination;
     LONG destinationPitch;
+    SubpixelOffsets subpixelOffset;
+};
+
+// The output rows of one source row, kept for a worker part that reads the
+// scaled frame row by row (XbrRow).
+struct PartBlock
+{
+    DWORD* pixels;
+    DWORD sourceRow;
 };
 
 static DWORD g_width = 0;
 static DWORD g_height = 0;
 static DWORD g_scale = 0;
-// Per rotation: each neighbor's index in the 5x5 window and each subpixel's
-// index in the scale x scale output block.
-static BYTE g_neighborIndex[4][kNeighborCount];
-static BYTE g_subpixelIndex[4][kSubpixelCount];
+// The frame with a kBorder-pixel border, in first-index-of-a-color form.
+static BYTE* g_padded = NULL;
+static LONG g_paddedPitch = 0;
+// Per rotation: each subpixel's column and row in the output block.
+static BYTE g_subpixelColumn[4][kSubpixelCount];
+static BYTE g_subpixelRow[4][kSubpixelCount];
+static PartBlock g_parts[kMaxParts];
+static LONG g_blockPitch = 0;
+static SubpixelOffsets g_blockOffsets;
 // Palette-dependent tables, indexed by (first << 8) | second.
 static DWORD g_rgb[256];
+static BYTE g_firstOfColor[256];
 static WORD g_distance[256 * 256];
 static BYTE g_similar[256 * 256];
 static BOOL g_tablesValid = FALSE;
@@ -128,15 +150,6 @@ static void BuildRotations(DWORD scale)
 
     for (rotation = 0; rotation < 4; ++rotation)
     {
-        for (item = 0; item < kNeighborCount; ++item)
-        {
-            int x;
-            int y;
-
-            Rotate(rotation, kNeighborOffsets[item][0], kNeighborOffsets[item][1], &x, &y);
-            g_neighborIndex[rotation][item] = static_cast<BYTE>((y + 2) * 5 + (x + 2));
-        }
-
         for (item = 0; item < kSubpixelCount; ++item)
         {
             int x;
@@ -144,9 +157,8 @@ static void BuildRotations(DWORD scale)
 
             // Doubled centered coordinates back to column and row.
             Rotate(rotation, subpixels[item][0], subpixels[item][1], &x, &y);
-            x = (x + last) / 2;
-            y = (y + last) / 2;
-            g_subpixelIndex[rotation][item] = static_cast<BYTE>(y * scale + x);
+            g_subpixelColumn[rotation][item] = static_cast<BYTE>((x + last) / 2);
+            g_subpixelRow[rotation][item] = static_cast<BYTE>((y + last) / 2);
         }
     }
 }
@@ -176,6 +188,15 @@ static void BuildTables(const DWORD* rgb)
     {
         g_rgb[first] = rgb[first] & 0x00FFFFFF;
         ComputeYuv(g_rgb[first], &y[first], &u[first], &v[first]);
+        g_firstOfColor[first] = static_cast<BYTE>(first);
+        for (second = 0; second < first; ++second)
+        {
+            if (g_rgb[second] == g_rgb[first])
+            {
+                g_firstOfColor[first] = static_cast<BYTE>(second);
+                break;
+            }
+        }
     }
 
     for (first = 0; first < 256; ++first)
@@ -209,11 +230,6 @@ static __forceinline BOOL Similar(BYTE first, BYTE second)
     return g_similar[(static_cast<DWORD>(first) << 8) | second];
 }
 
-static __forceinline BOOL Same(BYTE first, BYTE second)
-{
-    return g_rgb[first] == g_rgb[second];
-}
-
 // Moves color toward target by weight/256.
 static __forceinline DWORD Blend(DWORD color, DWORD target, DWORD weight)
 {
@@ -226,40 +242,40 @@ static __forceinline DWORD Blend(DWORD color, DWORD target, DWORD weight)
     return (redBlue & 0x00FF00FF) | (green & 0x0000FF00);
 }
 
-static void ApplyCorner(const BYTE* window, int rotation, DWORD* block)
+#define XBR_PIXEL(name) \
+    (*reinterpret_cast<DWORD*>(block + sub[name]))
+#define XBR_SET(name) \
+    (XBR_PIXEL(name) = target)
+#define XBR_BLEND(name, weight) \
+    (XBR_PIXEL(name) = Blend(XBR_PIXEL(name), target, weight))
+
+// The corner rule for one rotation. p points at E in the bordered frame;
+// right and down are the offsets of one canonical step. The caller has
+// checked that E differs from F and from H. block is the top-left of the
+// output block, sub the subpixel offsets of this rotation.
+template <DWORD Scale>
+static __forceinline void ApplyCorner(
+    const BYTE* p,
+    LONG right,
+    LONG down,
+    BYTE* block,
+    const LONG* sub)
 {
-    const BYTE* at = g_neighborIndex[rotation];
-    const BYTE* sub = g_subpixelIndex[rotation];
-    BYTE e = window[at[kE]];
-    BYTE f = window[at[kF]];
-    BYTE h = window[at[kH]];
-    BYTE i;
-    BYTE b;
-    BYTE c;
-    BYTE d;
-    BYTE g;
-    BYTE f4;
-    BYTE i4;
-    BYTE h5;
-    BYTE i5;
+    BYTE e = p[0];
+    BYTE f = p[right];
+    BYTE h = p[down];
+    BYTE i = p[right + down];
+    BYTE b = p[-down];
+    BYTE c = p[right - down];
+    BYTE d = p[-right];
+    BYTE g = p[down - right];
+    BYTE f4 = p[2 * right];
+    BYTE i4 = p[2 * right + down];
+    BYTE h5 = p[2 * down];
+    BYTE i5 = p[right + 2 * down];
     DWORD edge;
     DWORD across;
     DWORD target;
-
-    if (Same(e, f) || Same(e, h))
-    {
-        return;
-    }
-
-    i = window[at[kI]];
-    b = window[at[kB]];
-    c = window[at[kC]];
-    d = window[at[kD]];
-    g = window[at[kG]];
-    f4 = window[at[kF4]];
-    i4 = window[at[kI4]];
-    h5 = window[at[kH5]];
-    i5 = window[at[kI5]];
 
     // Color changes along the H-F diagonal against changes across it.
     edge = Distance(e, c) + Distance(e, g) + Distance(i, h5) +
@@ -279,106 +295,235 @@ static void ApplyCorner(const BYTE* window, int rotation, DWORD* block)
     {
         DWORD slopeLeft = Distance(f, g);
         DWORD slopeUp = Distance(h, c);
-        BOOL left = 2 * slopeLeft <= slopeUp && !Same(e, g) && !Same(d, g);
-        BOOL up = slopeLeft >= 2 * slopeUp && !Same(e, c) && !Same(b, c);
+        BOOL left = 2 * slopeLeft <= slopeUp && e != g && d != g;
+        BOOL up = slopeLeft >= 2 * slopeUp && e != c && b != c;
 
-        if (g_scale == 4)
+        if (Scale == 4)
         {
             // "left" and "up" mirror each other across the diagonal.
             if (left && up)
             {
-                block[sub[kBottomInner]] = Blend(block[sub[kBottomInner]], target, 192);
-                block[sub[kBottomOuter]] = Blend(block[sub[kBottomOuter]], target, 64);
-                block[sub[kRightInner]] = Blend(block[sub[kRightInner]], target, 192);
-                block[sub[kRightOuter]] = Blend(block[sub[kRightOuter]], target, 64);
-                block[sub[kInner]] = Blend(block[sub[kInner]], target, 64);
-                block[sub[kCorner]] = target;
-                block[sub[kBelowCorner]] = target;
-                block[sub[kRightOfCorner]] = target;
+                XBR_BLEND(kBottomInner, 192);
+                XBR_BLEND(kBottomOuter, 64);
+                XBR_BLEND(kRightInner, 192);
+                XBR_BLEND(kRightOuter, 64);
+                XBR_BLEND(kInner, 64);
+                XBR_SET(kCorner);
+                XBR_SET(kBelowCorner);
+                XBR_SET(kRightOfCorner);
             }
             else if (left)
             {
-                block[sub[kRightOfCorner]] = Blend(block[sub[kRightOfCorner]], target, 192);
-                block[sub[kBottomInner]] = Blend(block[sub[kBottomInner]], target, 192);
-                block[sub[kInner]] = Blend(block[sub[kInner]], target, 64);
-                block[sub[kBottomOuter]] = Blend(block[sub[kBottomOuter]], target, 64);
-                block[sub[kBelowCorner]] = target;
-                block[sub[kCorner]] = target;
+                XBR_BLEND(kRightOfCorner, 192);
+                XBR_BLEND(kBottomInner, 192);
+                XBR_BLEND(kInner, 64);
+                XBR_BLEND(kBottomOuter, 64);
+                XBR_SET(kBelowCorner);
+                XBR_SET(kCorner);
             }
             else if (up)
             {
-                block[sub[kBelowCorner]] = Blend(block[sub[kBelowCorner]], target, 192);
-                block[sub[kRightInner]] = Blend(block[sub[kRightInner]], target, 192);
-                block[sub[kInner]] = Blend(block[sub[kInner]], target, 64);
-                block[sub[kRightOuter]] = Blend(block[sub[kRightOuter]], target, 64);
-                block[sub[kRightOfCorner]] = target;
-                block[sub[kCorner]] = target;
+                XBR_BLEND(kBelowCorner, 192);
+                XBR_BLEND(kRightInner, 192);
+                XBR_BLEND(kInner, 64);
+                XBR_BLEND(kRightOuter, 64);
+                XBR_SET(kRightOfCorner);
+                XBR_SET(kCorner);
             }
             else
             {
-                block[sub[kRightOfCorner]] = Blend(block[sub[kRightOfCorner]], target, 128);
-                block[sub[kBelowCorner]] = Blend(block[sub[kBelowCorner]], target, 128);
-                block[sub[kCorner]] = target;
+                XBR_BLEND(kRightOfCorner, 128);
+                XBR_BLEND(kBelowCorner, 128);
+                XBR_SET(kCorner);
             }
         }
-        else if (g_scale == 3)
+        else if (Scale == 3)
         {
             if (left && up)
             {
-                block[sub[kBelowCorner]] = Blend(block[sub[kBelowCorner]], target, 192);
-                block[sub[kBottomInner]] = Blend(block[sub[kBottomInner]], target, 64);
-                block[sub[kRightOfCorner]] = Blend(block[sub[kRightOfCorner]], target, 192);
-                block[sub[kRightInner]] = Blend(block[sub[kRightInner]], target, 64);
-                block[sub[kCorner]] = target;
+                XBR_BLEND(kBelowCorner, 192);
+                XBR_BLEND(kBottomInner, 64);
+                XBR_BLEND(kRightOfCorner, 192);
+                XBR_BLEND(kRightInner, 64);
+                XBR_SET(kCorner);
             }
             else if (left)
             {
-                block[sub[kBelowCorner]] = Blend(block[sub[kBelowCorner]], target, 192);
-                block[sub[kRightOfCorner]] = Blend(block[sub[kRightOfCorner]], target, 64);
-                block[sub[kBottomInner]] = Blend(block[sub[kBottomInner]], target, 64);
-                block[sub[kCorner]] = target;
+                XBR_BLEND(kBelowCorner, 192);
+                XBR_BLEND(kRightOfCorner, 64);
+                XBR_BLEND(kBottomInner, 64);
+                XBR_SET(kCorner);
             }
             else if (up)
             {
-                block[sub[kRightOfCorner]] = Blend(block[sub[kRightOfCorner]], target, 192);
-                block[sub[kBelowCorner]] = Blend(block[sub[kBelowCorner]], target, 64);
-                block[sub[kRightInner]] = Blend(block[sub[kRightInner]], target, 64);
-                block[sub[kCorner]] = target;
+                XBR_BLEND(kRightOfCorner, 192);
+                XBR_BLEND(kBelowCorner, 64);
+                XBR_BLEND(kRightInner, 64);
+                XBR_SET(kCorner);
             }
             else
             {
-                block[sub[kCorner]] = Blend(block[sub[kCorner]], target, 224);
-                block[sub[kRightOfCorner]] = Blend(block[sub[kRightOfCorner]], target, 32);
-                block[sub[kBelowCorner]] = Blend(block[sub[kBelowCorner]], target, 32);
+                XBR_BLEND(kCorner, 224);
+                XBR_BLEND(kRightOfCorner, 32);
+                XBR_BLEND(kBelowCorner, 32);
             }
         }
         else
         {
             if (left && up)
             {
-                block[sub[kCorner]] = Blend(block[sub[kCorner]], target, 224);
-                block[sub[kBelowCorner]] = Blend(block[sub[kBelowCorner]], target, 64);
-                block[sub[kRightOfCorner]] = Blend(block[sub[kRightOfCorner]], target, 64);
+                XBR_BLEND(kCorner, 224);
+                XBR_BLEND(kBelowCorner, 64);
+                XBR_BLEND(kRightOfCorner, 64);
             }
             else if (left)
             {
-                block[sub[kCorner]] = Blend(block[sub[kCorner]], target, 192);
-                block[sub[kBelowCorner]] = Blend(block[sub[kBelowCorner]], target, 64);
+                XBR_BLEND(kCorner, 192);
+                XBR_BLEND(kBelowCorner, 64);
             }
             else if (up)
             {
-                block[sub[kCorner]] = Blend(block[sub[kCorner]], target, 192);
-                block[sub[kRightOfCorner]] = Blend(block[sub[kRightOfCorner]], target, 64);
+                XBR_BLEND(kCorner, 192);
+                XBR_BLEND(kRightOfCorner, 64);
             }
             else
             {
-                block[sub[kCorner]] = Blend(block[sub[kCorner]], target, 128);
+                XBR_BLEND(kCorner, 128);
             }
         }
     }
     else
     {
-        block[sub[kCorner]] = Blend(block[sub[kCorner]], target, 128);
+        XBR_BLEND(kCorner, 128);
+    }
+}
+
+#undef XBR_SET
+#undef XBR_BLEND
+#undef XBR_PIXEL
+
+// Copies source rows into the bordered frame (rows and columns beyond the
+// edges repeat the edge pixels), mapping each index to the first index of
+// its color.
+static void PadTask(DWORD part, DWORD parts, void* context)
+{
+    const PadJob* job = reinterpret_cast<const PadJob*>(context);
+    DWORD rows = g_height + 2 * kBorder;
+    DWORD firstRow = rows * part / parts;
+    DWORD lastRow = rows * (part + 1) / parts;
+    DWORD row;
+
+    for (row = firstRow; row < lastRow; ++row)
+    {
+        LONG sourceRow = static_cast<LONG>(row) - static_cast<LONG>(kBorder);
+        const BYTE* line;
+        BYTE* output = g_padded + static_cast<LONG>(row) * g_paddedPitch;
+        DWORD column;
+        BYTE edge;
+
+        if (sourceRow < 0)
+        {
+            sourceRow = 0;
+        }
+        else if (sourceRow >= static_cast<LONG>(g_height))
+        {
+            sourceRow = static_cast<LONG>(g_height) - 1;
+        }
+
+        line = job->source + sourceRow * job->sourcePitch;
+        edge = g_firstOfColor[line[0]];
+        for (column = 0; column < kBorder; ++column)
+        {
+            output[column] = edge;
+        }
+
+        for (column = 0; column < g_width; ++column)
+        {
+            output[kBorder + column] = g_firstOfColor[line[column]];
+        }
+
+        edge = g_firstOfColor[line[g_width - 1]];
+        for (column = 0; column < kBorder; ++column)
+        {
+            output[kBorder + g_width + column] = edge;
+        }
+    }
+}
+
+// Scales source row `row` into its Scale output rows, which start at block.
+template <DWORD Scale>
+static void ScaleRow(
+    DWORD row,
+    BYTE* block,
+    LONG outputPitch,
+    const SubpixelOffsets& offsets)
+{
+    LONG pitch = g_paddedPitch;
+    const BYTE* p = g_padded +
+        static_cast<LONG>(row + kBorder) * pitch + kBorder;
+    DWORD column;
+
+    for (column = 0; column < g_width; ++column, ++p, block += Scale * 4)
+    {
+        BYTE e = p[0];
+        BOOL differsRight = e != p[1];
+        BOOL differsDown = e != p[pitch];
+        BOOL differsLeft = e != p[-1];
+        BOOL differsUp = e != p[-pitch];
+        DWORD color = g_rgb[e];
+        BYTE* line = block;
+        DWORD y;
+        DWORD x;
+
+        for (y = 0; y < Scale; ++y, line += outputPitch)
+        {
+            for (x = 0; x < Scale; ++x)
+            {
+                reinterpret_cast<DWORD*>(line)[x] = color;
+            }
+        }
+
+        // Each corner rule needs E to differ from both of its side
+        // neighbors (F and H in canonical terms).
+        if (differsRight && differsDown)
+        {
+            ApplyCorner<Scale>(p, 1, pitch, block, offsets[0]);
+        }
+
+        if (differsUp && differsRight)
+        {
+            ApplyCorner<Scale>(p, -pitch, 1, block, offsets[1]);
+        }
+
+        if (differsLeft && differsUp)
+        {
+            ApplyCorner<Scale>(p, -1, -pitch, block, offsets[2]);
+        }
+
+        if (differsDown && differsLeft)
+        {
+            ApplyCorner<Scale>(p, pitch, -1, block, offsets[3]);
+        }
+    }
+}
+
+static void ScaleRowAnyScale(
+    DWORD row,
+    BYTE* block,
+    LONG outputPitch,
+    const SubpixelOffsets& offsets)
+{
+    switch (g_scale)
+    {
+    case 4:
+        ScaleRow<4>(row, block, outputPitch, offsets);
+        break;
+    case 3:
+        ScaleRow<3>(row, block, outputPitch, offsets);
+        break;
+    default:
+        ScaleRow<2>(row, block, outputPitch, offsets);
+        break;
     }
 }
 
@@ -391,108 +536,48 @@ static void ScaleTask(DWORD part, DWORD parts, void* context)
 
     for (row = firstRow; row < lastRow; ++row)
     {
-        const BYTE* lines[5];
-        BYTE* output = job->destination +
-            static_cast<LONG>(row * g_scale) * job->destinationPitch;
-        DWORD column;
-        int line;
+        ScaleRowAnyScale(
+            row,
+            job->destination +
+                static_cast<LONG>(row * g_scale) * job->destinationPitch,
+            job->destinationPitch,
+            job->subpixelOffset);
+    }
+}
 
-        for (line = 0; line < 5; ++line)
+static void ComputeSubpixelOffsets(LONG outputPitch, SubpixelOffsets& offsets)
+{
+    int rotation;
+    int item;
+
+    for (rotation = 0; rotation < 4; ++rotation)
+    {
+        for (item = 0; item < kSubpixelCount; ++item)
         {
-            LONG y = static_cast<LONG>(row) + line - 2;
-
-            if (y < 0)
-            {
-                y = 0;
-            }
-            else if (y >= static_cast<LONG>(g_height))
-            {
-                y = static_cast<LONG>(g_height) - 1;
-            }
-
-            lines[line] = job->source + y * job->sourcePitch;
-        }
-
-        for (column = 0; column < g_width; ++column)
-        {
-            BYTE window[25];
-            DWORD block[kMaxScale * kMaxScale];
-            DWORD color;
-            DWORD sub;
-            int rotation;
-            int x;
-            BYTE center = lines[2][column];
-            BYTE left = lines[2][column > 0 ? column - 1 : 0];
-            BYTE right = lines[2][column + 1 < g_width ? column + 1 : column];
-
-            // Every corner rule needs the center to differ from both of its
-            // side neighbors; a pixel equal to all four keeps its color.
-            if (Same(center, left) && Same(center, right) &&
-                Same(center, lines[1][column]) && Same(center, lines[3][column]))
-            {
-                color = g_rgb[center];
-                for (line = 0; line < static_cast<int>(g_scale); ++line)
-                {
-                    DWORD* pixels = reinterpret_cast<DWORD*>(
-                        output + line * job->destinationPitch) + column * g_scale;
-
-                    for (x = 0; x < static_cast<int>(g_scale); ++x)
-                    {
-                        pixels[x] = color;
-                    }
-                }
-
-                continue;
-            }
-
-            for (x = 0; x < 5; ++x)
-            {
-                LONG sourceColumn = static_cast<LONG>(column) + x - 2;
-
-                if (sourceColumn < 0)
-                {
-                    sourceColumn = 0;
-                }
-                else if (sourceColumn >= static_cast<LONG>(g_width))
-                {
-                    sourceColumn = static_cast<LONG>(g_width) - 1;
-                }
-
-                for (line = 0; line < 5; ++line)
-                {
-                    window[line * 5 + x] = lines[line][sourceColumn];
-                }
-            }
-
-            color = g_rgb[window[12]];
-            for (sub = 0; sub < g_scale * g_scale; ++sub)
-            {
-                block[sub] = color;
-            }
-
-            for (rotation = 0; rotation < 4; ++rotation)
-            {
-                ApplyCorner(window, rotation, block);
-            }
-
-            for (line = 0; line < static_cast<int>(g_scale); ++line)
-            {
-                DWORD* pixels = reinterpret_cast<DWORD*>(
-                    output + line * job->destinationPitch) + column * g_scale;
-
-                for (x = 0; x < static_cast<int>(g_scale); ++x)
-                {
-                    pixels[x] = block[line * g_scale + x];
-                }
-            }
+            offsets[rotation][item] =
+                static_cast<LONG>(g_subpixelRow[rotation][item]) * outputPitch +
+                static_cast<LONG>(g_subpixelColumn[rotation][item]) * 4;
         }
     }
 }
 
 BOOL XbrInitialize(DWORD width, DWORD height, DWORD scale)
 {
+    DWORD part;
+
     XbrShutdown();
     if (width == 0 || height == 0 || (scale < 2 || scale > kMaxScale))
+    {
+        return FALSE;
+    }
+
+    g_paddedPitch = static_cast<LONG>(width + 2 * kBorder);
+    g_padded = reinterpret_cast<BYTE*>(VirtualAlloc(
+        NULL,
+        g_paddedPitch * (height + 2 * kBorder),
+        MEM_COMMIT | MEM_RESERVE,
+        PAGE_READWRITE));
+    if (g_padded == NULL)
     {
         return FALSE;
     }
@@ -502,11 +587,45 @@ BOOL XbrInitialize(DWORD width, DWORD height, DWORD scale)
     g_scale = scale;
     g_tablesValid = FALSE;
     BuildRotations(scale);
+    g_blockPitch = static_cast<LONG>(width * scale * sizeof(DWORD));
+    ComputeSubpixelOffsets(g_blockPitch, g_blockOffsets);
+    for (part = 0; part < kMaxParts; ++part)
+    {
+        g_parts[part].sourceRow = kNoRow;
+        g_parts[part].pixels = reinterpret_cast<DWORD*>(VirtualAlloc(
+            NULL,
+            g_blockPitch * scale,
+            MEM_COMMIT | MEM_RESERVE,
+            PAGE_READWRITE));
+        if (g_parts[part].pixels == NULL)
+        {
+            XbrShutdown();
+            return FALSE;
+        }
+    }
+
     return TRUE;
 }
 
 void XbrShutdown()
 {
+    DWORD part;
+
+    for (part = 0; part < kMaxParts; ++part)
+    {
+        if (g_parts[part].pixels != NULL)
+        {
+            VirtualFree(g_parts[part].pixels, 0, MEM_RELEASE);
+            g_parts[part].pixels = NULL;
+        }
+    }
+
+    if (g_padded != NULL)
+    {
+        VirtualFree(g_padded, 0, MEM_RELEASE);
+        g_padded = NULL;
+    }
+
     g_width = 0;
     g_height = 0;
     g_scale = 0;
@@ -517,19 +636,14 @@ BOOL XbrIsReady()
     return g_scale != 0;
 }
 
-void XbrScale(
-    const BYTE* source,
-    LONG sourcePitch,
-    const DWORD* rgb,
-    BYTE* destination,
-    LONG destinationPitch)
+BOOL XbrPrepareFrame(const BYTE* source, LONG sourcePitch, const DWORD* rgb)
 {
-    ScaleJob job;
+    PadJob job;
     DWORD index;
 
     if (g_scale == 0)
     {
-        return;
+        return FALSE;
     }
 
     for (index = 0; index < 256 && g_tablesValid; ++index)
@@ -545,9 +659,53 @@ void XbrScale(
         BuildTables(rgb);
     }
 
+    for (index = 0; index < kMaxParts; ++index)
+    {
+        g_parts[index].sourceRow = kNoRow;
+    }
+
+    // Scaling a row reads up to two rows above and below it, so the
+    // bordered frame is complete before any row is scaled.
     job.source = source;
     job.sourcePitch = sourcePitch;
+    WorkerPoolRun(PadTask, &job);
+    return TRUE;
+}
+
+const DWORD* XbrRow(void*, DWORD part, DWORD row)
+{
+    PartBlock* block = &g_parts[part < kMaxParts ? part : 0];
+    DWORD sourceRow = row / g_scale;
+
+    if (block->sourceRow != sourceRow)
+    {
+        ScaleRowAnyScale(
+            sourceRow,
+            reinterpret_cast<BYTE*>(block->pixels),
+            g_blockPitch,
+            g_blockOffsets);
+        block->sourceRow = sourceRow;
+    }
+
+    return block->pixels + (row - sourceRow * g_scale) * g_width * g_scale;
+}
+
+void XbrScale(
+    const BYTE* source,
+    LONG sourcePitch,
+    const DWORD* rgb,
+    BYTE* destination,
+    LONG destinationPitch)
+{
+    ScaleJob job;
+
+    if (!XbrPrepareFrame(source, sourcePitch, rgb))
+    {
+        return;
+    }
+
     job.destination = destination;
     job.destinationPitch = destinationPitch;
+    ComputeSubpixelOffsets(destinationPitch, job.subpixelOffset);
     WorkerPoolRun(ScaleTask, &job);
 }
