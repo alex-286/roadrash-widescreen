@@ -8,7 +8,14 @@ Optional filters smooth the classic 640x480 graphics on modern displays.
 The patch is a drop-in `ddraw.dll` placed next to the game. It changes nothing
 on disk: delete the file and the game is back to normal.
 
-<!-- Screenshots will be added here. -->
+![Road Rash in 2560x1440 widescreen with the hqx filter](docs/screenshots/coast-hqx.png)
+
+| | |
+|---|---|
+| ![Mountain road with rivals and traffic](docs/screenshots/mountains.png) | ![City race](docs/screenshots/city.png) |
+
+<sub>Screenshots taken with F12 at 2560x1440 (16:9) and reduced to half size.
+Top: `hqx` with `Scanlines=35`; bottom: `nearest`.</sub>
 
 ## Features
 
@@ -100,6 +107,17 @@ decides how:
 | `xbr` | Like hqx, with rounder outlines and cleaner diagonals. | Pixel-art style. |
 | `sharp-bilinear` | Crisp pixels of even size, also at non-integer scales such as 1080p. | A clean pixel look on any resolution. |
 | `bicubic` | Smooth, photo-like enlargement; also softens the game's blocky near sprites. | A soft, modern look. |
+
+The cockpit at 2560x1440, unscaled crops (with `Scanlines=35`, which
+`nearest` does not show):
+
+| Filter | Result |
+|---|---|
+| `nearest` | ![Cockpit with the nearest filter](docs/screenshots/cockpit-nearest.png) |
+| `hqx` | ![Cockpit with the hqx filter](docs/screenshots/cockpit-hqx.png) |
+| `xbr` | ![Cockpit with the xbr filter](docs/screenshots/cockpit-xbr.png) |
+| `sharp-bilinear` | ![Cockpit with the sharp-bilinear filter](docs/screenshots/cockpit-sharp-bilinear.png) |
+| `bicubic` | ![Cockpit with the bicubic filter](docs/screenshots/cockpit-bicubic.png) |
 
 With any filter except `none`, press **F11** during a race to cycle through
 `nearest`, `hqx`, `xbr`, `sharp-bilinear` and `bicubic`; the choice is kept
