@@ -1750,9 +1750,17 @@ static HRESULT CreateVirtualPrimary(
         backDescription,
         kVirtualDisplayWidth,
         kOriginalDisplayHeight);
+    // The game draws into the back buffer with the CPU, so it lives in system
+    // memory in both paths. With it in video memory, the 8-bit path ran at
+    // about 5 fps on a Windows 98 PC that ran the system-memory 32-bit path
+    // at 58 fps.
     if (g_presenterDisplayActive)
     {
         SetIndexedSystemMemoryFormat(backDescription);
+    }
+    else
+    {
+        SetSystemMemoryCaps(backDescription);
     }
 
     result = g_hookState.originalCreateSurface(
@@ -2084,13 +2092,14 @@ static void AppendTimingField(
 }
 
 // Logs, once per filter (kFilterNone is the 8-bit path), where the time of a
-// frame goes, averaged over 300 frames: the game's own work between
+// frame goes, averaged over 300 frames (or 10 seconds): the game's own work between
 // presents, the conversion (palette, filter, overlay), the vertical-blank
 // wait, and the present blit.
 static void RecordFrameTiming(DWORD slot, const FrameTiming* timing)
 {
     static const DWORD kFrames = 300;
     static const DWORD kMaxGameMicroseconds = 250000;
+    static const DWORD kMaxMicroseconds = 10000000;
     static DWORD frames[kFilterCount];
     static DWORD game[kFilterCount];
     static DWORD convert[kFilterCount];
@@ -2103,6 +2112,7 @@ static void RecordFrameTiming(DWORD slot, const FrameTiming* timing)
     CHAR message[192];
     DWORD length;
     DWORD total;
+    DWORD count;
 
     g_lastPresentEnd = timing->presented;
     g_lastPresentValid = TRUE;
@@ -2122,21 +2132,24 @@ static void RecordFrameTiming(DWORD slot, const FrameTiming* timing)
     convert[slot] += ElapsedMicroseconds(timing->start, timing->converted);
     wait[slot] += ElapsedMicroseconds(timing->converted, timing->waited);
     present[slot] += ElapsedMicroseconds(timing->waited, timing->presented);
-    if (++frames[slot] < kFrames)
+    // 300 frames, or fewer when they took 10 seconds (slow paths).
+    if (++frames[slot] < kFrames &&
+        game[slot] + convert[slot] + wait[slot] + present[slot] < kMaxMicroseconds)
     {
         return;
     }
 
     logged[slot] = TRUE;
-    total = (game[slot] + convert[slot] + wait[slot] + present[slot]) / kFrames;
+    count = frames[slot];
+    total = (game[slot] + convert[slot] + wait[slot] + present[slot]) / count;
     lstrcpyA(message, "Frame timing, filter=");
     lstrcatA(message, slot == kFilterNone ? "none (8-bit)" : kFilterNames[slot]);
     lstrcatA(message, " (average us):");
     length = lstrlenA(message);
-    AppendTimingField(message, &length, " game=", game[slot] / kFrames);
-    AppendTimingField(message, &length, " convert=", convert[slot] / kFrames);
-    AppendTimingField(message, &length, " vblank-wait=", wait[slot] / kFrames);
-    AppendTimingField(message, &length, " present=", present[slot] / kFrames);
+    AppendTimingField(message, &length, " game=", game[slot] / count);
+    AppendTimingField(message, &length, " convert=", convert[slot] / count);
+    AppendTimingField(message, &length, " vblank-wait=", wait[slot] / count);
+    AppendTimingField(message, &length, " present=", present[slot] / count);
     AppendTimingField(message, &length, " frame=", total);
     AppendTimingField(
         message, &length, " fps=", total != 0 ? 1000000 / total : 0);
@@ -2693,8 +2706,12 @@ static HRESULT WINAPI HookedCreateSurface(
             outer);
     }
 
+    // The game's offscreen surfaces go to system memory too, next to the
+    // back buffer they are drawn into. With the 32-bit presenter they also
+    // must stay 8-bit palettized; in the 8-bit path they keep the display
+    // format.
     if (directDraw == g_hookState.object &&
-        g_presenterDisplayActive &&
+        g_virtualDisplayActive &&
         caller - g_gameBase < kExpectedImageSize &&
         surfaceDescription != NULL)
     {
@@ -2717,7 +2734,15 @@ static HRESULT WINAPI HookedCreateSurface(
                     *DescriptionDword(description, index);
             }
 
-            SetIndexedSystemMemoryFormat(indexedDescription);
+            if (g_presenterDisplayActive)
+            {
+                SetIndexedSystemMemoryFormat(indexedDescription);
+            }
+            else
+            {
+                SetSystemMemoryCaps(indexedDescription);
+            }
+
             result = g_hookState.originalCreateSurface(
                 directDraw,
                 indexedDescription,
