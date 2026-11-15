@@ -30,30 +30,43 @@ static const int kNeighborOffsets[kNeighborCount][2] =
     { 2, 0 }, { 2, 1 }, { 0, 2 }, { 1, 2 }
 };
 
-// Subpixels a corner can touch, in canonical centered coordinates. For 2x
-// the coordinates are -1 and 1 (subpixel centers at -0.5 and 0.5, doubled);
-// for 3x they are -1, 0 and 1.
+// Subpixels a corner can touch, named in the canonical (bottom-right)
+// orientation: the corner itself, then outward along the right column and
+// the bottom row of the output block. Positions are subpixel centers in
+// doubled units relative to the block center: 2x uses -1 and 1, 3x -2, 0
+// and 2, 4x -3, -1, 1 and 3. Unused names of a scale repeat the corner.
 enum Subpixel
 {
-    kCorner,        // the corner subpixel
-    kRightOfCorner, // 3x: right middle; 2x: top right
-    kBelowCorner,   // 3x: bottom middle; 2x: bottom left
-    kTopRight,      // 3x only
-    kBottomLeft,    // 3x only
+    kCorner,
+    kRightOfCorner, // right column, next to the corner
+    kBelowCorner,   // bottom row, next to the corner
+    kRightInner,    // right column, second from the corner (3x, 4x)
+    kBottomInner,   // bottom row, second from the corner (3x, 4x)
+    kRightOuter,    // right column, third from the corner (4x)
+    kBottomOuter,   // bottom row, third from the corner (4x)
+    kInner,         // diagonally inward from the corner (4x)
     kSubpixelCount
 };
 
 static const int kSubpixelOffsets2x[kSubpixelCount][2] =
 {
-    { 1, 1 }, { 1, -1 }, { -1, 1 }, { 1, -1 }, { -1, 1 }
+    { 1, 1 }, { 1, -1 }, { -1, 1 },
+    { 1, 1 }, { 1, 1 }, { 1, 1 }, { 1, 1 }, { 1, 1 }
 };
 
 static const int kSubpixelOffsets3x[kSubpixelCount][2] =
 {
-    { 1, 1 }, { 1, 0 }, { 0, 1 }, { 1, -1 }, { -1, 1 }
+    { 2, 2 }, { 2, 0 }, { 0, 2 }, { 2, -2 }, { -2, 2 },
+    { 2, 2 }, { 2, 2 }, { 2, 2 }
 };
 
-static const DWORD kMaxScale = 3;
+static const int kSubpixelOffsets4x[kSubpixelCount][2] =
+{
+    { 3, 3 }, { 3, 1 }, { 1, 3 }, { 3, -1 }, { -1, 3 },
+    { 3, -3 }, { -3, 3 }, { 1, 1 }
+};
+
+static const DWORD kMaxScale = 4;
 static const LONG kSimilarY = 48;
 static const LONG kSimilarU = 7;
 static const LONG kSimilarV = 6;
@@ -106,7 +119,10 @@ static void Rotate(int rotation, int x, int y, int* outX, int* outY)
 
 static void BuildRotations(DWORD scale)
 {
-    const int (*subpixels)[2] = scale == 3 ? kSubpixelOffsets3x : kSubpixelOffsets2x;
+    const int (*subpixels)[2] =
+        scale == 4 ? kSubpixelOffsets4x :
+        scale == 3 ? kSubpixelOffsets3x : kSubpixelOffsets2x;
+    int last = static_cast<int>(scale) - 1;
     int rotation;
     int item;
 
@@ -126,18 +142,10 @@ static void BuildRotations(DWORD scale)
             int x;
             int y;
 
+            // Doubled centered coordinates back to column and row.
             Rotate(rotation, subpixels[item][0], subpixels[item][1], &x, &y);
-            if (scale == 2)
-            {
-                x = (x + 1) / 2;
-                y = (y + 1) / 2;
-            }
-            else
-            {
-                x += 1;
-                y += 1;
-            }
-
+            x = (x + last) / 2;
+            y = (y + last) / 2;
             g_subpixelIndex[rotation][item] = static_cast<BYTE>(y * scale + x);
         }
     }
@@ -274,28 +282,67 @@ static void ApplyCorner(const BYTE* window, int rotation, DWORD* block)
         BOOL left = 2 * slopeLeft <= slopeUp && !Same(e, g) && !Same(d, g);
         BOOL up = slopeLeft >= 2 * slopeUp && !Same(e, c) && !Same(b, c);
 
-        if (g_scale == 3)
+        if (g_scale == 4)
+        {
+            // "left" and "up" mirror each other across the diagonal.
+            if (left && up)
+            {
+                block[sub[kBottomInner]] = Blend(block[sub[kBottomInner]], target, 192);
+                block[sub[kBottomOuter]] = Blend(block[sub[kBottomOuter]], target, 64);
+                block[sub[kRightInner]] = Blend(block[sub[kRightInner]], target, 192);
+                block[sub[kRightOuter]] = Blend(block[sub[kRightOuter]], target, 64);
+                block[sub[kInner]] = Blend(block[sub[kInner]], target, 64);
+                block[sub[kCorner]] = target;
+                block[sub[kBelowCorner]] = target;
+                block[sub[kRightOfCorner]] = target;
+            }
+            else if (left)
+            {
+                block[sub[kRightOfCorner]] = Blend(block[sub[kRightOfCorner]], target, 192);
+                block[sub[kBottomInner]] = Blend(block[sub[kBottomInner]], target, 192);
+                block[sub[kInner]] = Blend(block[sub[kInner]], target, 64);
+                block[sub[kBottomOuter]] = Blend(block[sub[kBottomOuter]], target, 64);
+                block[sub[kBelowCorner]] = target;
+                block[sub[kCorner]] = target;
+            }
+            else if (up)
+            {
+                block[sub[kBelowCorner]] = Blend(block[sub[kBelowCorner]], target, 192);
+                block[sub[kRightInner]] = Blend(block[sub[kRightInner]], target, 192);
+                block[sub[kInner]] = Blend(block[sub[kInner]], target, 64);
+                block[sub[kRightOuter]] = Blend(block[sub[kRightOuter]], target, 64);
+                block[sub[kRightOfCorner]] = target;
+                block[sub[kCorner]] = target;
+            }
+            else
+            {
+                block[sub[kRightOfCorner]] = Blend(block[sub[kRightOfCorner]], target, 128);
+                block[sub[kBelowCorner]] = Blend(block[sub[kBelowCorner]], target, 128);
+                block[sub[kCorner]] = target;
+            }
+        }
+        else if (g_scale == 3)
         {
             if (left && up)
             {
                 block[sub[kBelowCorner]] = Blend(block[sub[kBelowCorner]], target, 192);
-                block[sub[kBottomLeft]] = Blend(block[sub[kBottomLeft]], target, 64);
+                block[sub[kBottomInner]] = Blend(block[sub[kBottomInner]], target, 64);
                 block[sub[kRightOfCorner]] = Blend(block[sub[kRightOfCorner]], target, 192);
-                block[sub[kTopRight]] = Blend(block[sub[kTopRight]], target, 64);
+                block[sub[kRightInner]] = Blend(block[sub[kRightInner]], target, 64);
                 block[sub[kCorner]] = target;
             }
             else if (left)
             {
                 block[sub[kBelowCorner]] = Blend(block[sub[kBelowCorner]], target, 192);
                 block[sub[kRightOfCorner]] = Blend(block[sub[kRightOfCorner]], target, 64);
-                block[sub[kBottomLeft]] = Blend(block[sub[kBottomLeft]], target, 64);
+                block[sub[kBottomInner]] = Blend(block[sub[kBottomInner]], target, 64);
                 block[sub[kCorner]] = target;
             }
             else if (up)
             {
                 block[sub[kRightOfCorner]] = Blend(block[sub[kRightOfCorner]], target, 192);
                 block[sub[kBelowCorner]] = Blend(block[sub[kBelowCorner]], target, 64);
-                block[sub[kTopRight]] = Blend(block[sub[kTopRight]], target, 64);
+                block[sub[kRightInner]] = Blend(block[sub[kRightInner]], target, 64);
                 block[sub[kCorner]] = target;
             }
             else
@@ -445,7 +492,7 @@ static void ScaleTask(DWORD part, DWORD parts, void* context)
 BOOL XbrInitialize(DWORD width, DWORD height, DWORD scale)
 {
     XbrShutdown();
-    if (width == 0 || height == 0 || (scale != 2 && scale != 3))
+    if (width == 0 || height == 0 || (scale < 2 || scale > kMaxScale))
     {
         return FALSE;
     }

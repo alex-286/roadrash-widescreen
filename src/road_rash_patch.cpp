@@ -222,6 +222,8 @@ static DWORD g_filterSetting = kFilterNone;
 static DWORD g_activeFilter = kFilterNone;
 static BOOL g_presenterDisplayActive = FALSE;
 static BOOL g_filterUnavailable[kFilterCount];
+// The pixel-art scale factor (HqxScale): 2-4, or 0 for automatic.
+static const DWORD kMaxPixelArtScale = 4;
 static DWORD g_hqxScaleSetting = 0;
 // Scanline darkening in percent; 0 is off.
 static DWORD g_scanlineStrength = 0;
@@ -695,7 +697,7 @@ static void ReadVirtualWidthSetting()
             g_scanlineStrength = 100;
         }
         width = GetPrivateProfileIntA("Display", "HqxScale", 0, path);
-        if (width == 2 || width == 3)
+        if (width >= 2 && width <= kMaxPixelArtScale)
         {
             g_hqxScaleSetting = width;
         }
@@ -1265,13 +1267,18 @@ static HRESULT SetVirtualDisplayMode(
             g_hqxScale = g_hqxScaleSetting;
             if (g_hqxScale == 0)
             {
-                g_hqxScale = height <= kOriginalDisplayHeight * 2 ? 2 : 3;
+                g_hqxScale = kMaxPixelArtScale;
+                while (g_hqxScale > 2 &&
+                       kOriginalDisplayHeight * (g_hqxScale - 1) >= height)
+                {
+                    --g_hqxScale;
+                }
             }
 
             g_presenterDisplayActive = TRUE;
             LogHRESULTResult(
-                "32-bit presenter enabled; hqx scale=0x",
-                sizeof("32-bit presenter enabled; hqx scale=0x") - 1,
+                "32-bit presenter enabled; pixel-art scale=0x",
+                sizeof("32-bit presenter enabled; pixel-art scale=0x") - 1,
                 g_hqxScale);
             return result;
         }
@@ -1284,22 +1291,28 @@ static HRESULT SetVirtualDisplayMode(
     return CallOriginalSetDisplayMode(directDraw, width, height, 8, caller);
 }
 
-// The pixel-art filters (hqx, xbr) scale by a whole factor; this is their
-// output size before the final scaling.
-static void GetPixelArtSize(DWORD* width, DWORD* height)
+// The pixel-art filters (hqx, xbr) scale by a whole factor: HqxScale, except
+// that hqx stops at 3x (the hqx library has no hq4x).
+static DWORD GetPixelArtScale(DWORD filter)
 {
-    *width = kVirtualDisplayWidth * g_hqxScale;
-    *height = kOriginalDisplayHeight * g_hqxScale;
+    return filter == kFilterHqx && g_hqxScale > 3 ? 3 : g_hqxScale;
 }
 
-// Whether the pixel-art output is scaled smoothly to the display size, as
-// opposed to stretched by the present.
-static BOOL UsesFinalScale()
+// A pixel-art filter's output size before the final scaling.
+static void GetPixelArtSize(DWORD filter, DWORD* width, DWORD* height)
+{
+    *width = kVirtualDisplayWidth * GetPixelArtScale(filter);
+    *height = kOriginalDisplayHeight * GetPixelArtScale(filter);
+}
+
+// Whether a pixel-art filter's output is scaled smoothly to the display
+// size, as opposed to stretched by the present.
+static BOOL UsesFinalScale(DWORD filter)
 {
     DWORD width;
     DWORD height;
 
-    GetPixelArtSize(&width, &height);
+    GetPixelArtSize(filter, &width, &height);
     return !g_finalScaleFailed &&
         (width != g_realDisplayWidth || height != g_realDisplayHeight);
 }
@@ -1309,14 +1322,14 @@ static void GetFilterOutputSize(DWORD filter, DWORD* width, DWORD* height)
 {
     if (filter == kFilterHqx || filter == kFilterXbr)
     {
-        if (UsesFinalScale())
+        if (UsesFinalScale(filter))
         {
             *width = g_realDisplayWidth;
             *height = g_realDisplayHeight;
         }
         else
         {
-            GetPixelArtSize(width, height);
+            GetPixelArtSize(filter, width, height);
         }
 
         return;
@@ -1416,7 +1429,7 @@ static HRESULT CreatePresenterResources(LPVOID directDraw)
         DWORD width;
         DWORD height;
 
-        GetPixelArtSize(&width, &height);
+        GetPixelArtSize(kFilterXbr, &width, &height);
         stagingWidth = width > stagingWidth ? width : stagingWidth;
         stagingHeight = height > stagingHeight ? height : stagingHeight;
     }
@@ -1485,24 +1498,34 @@ static void ReleasePresenterResources()
     WorkerPoolStop();
 }
 
-// Prepares the smooth final scaling of the pixel-art output on first use.
+// Prepares the smooth final scaling of a pixel-art filter's output. The
+// resampler is rebuilt when F11 switches to a filter with a different
+// factor (hqx at 3x, xbr at 4x); the frame buffer is sized for the largest.
 // If it cannot start, the present stretches the output instead.
-static void PrepareFinalScale()
+static void PrepareFinalScale(DWORD filter)
 {
     DWORD width;
     DWORD height;
 
-    if (!UsesFinalScale() || ResamplerIsReady(&g_finalScale))
+    GetPixelArtSize(filter, &width, &height);
+    if (!UsesFinalScale(filter) ||
+        (ResamplerIsReady(&g_finalScale) &&
+         g_finalScale.sourceWidth == width &&
+         g_finalScale.sourceHeight == height))
     {
         return;
     }
 
-    GetPixelArtSize(&width, &height);
-    g_pixelArtFrame = reinterpret_cast<DWORD*>(VirtualAlloc(
-        NULL,
-        width * height * sizeof(DWORD),
-        MEM_COMMIT | MEM_RESERVE,
-        PAGE_READWRITE));
+    if (g_pixelArtFrame == NULL)
+    {
+        g_pixelArtFrame = reinterpret_cast<DWORD*>(VirtualAlloc(
+            NULL,
+            kVirtualDisplayWidth * g_hqxScale *
+                kOriginalDisplayHeight * g_hqxScale * sizeof(DWORD),
+            MEM_COMMIT | MEM_RESERVE,
+            PAGE_READWRITE));
+    }
+
     if (g_pixelArtFrame != NULL &&
         ResamplerInitialize(
             &g_finalScale,
@@ -1536,7 +1559,7 @@ static BOOL PrepareFilter(DWORD filter)
         if (!HqxUpscalerInitialize(
                 kVirtualDisplayWidth,
                 kOriginalDisplayHeight,
-                g_hqxScale))
+                GetPixelArtScale(kFilterHqx)))
         {
             LogMessage(
                 "hqx buffer allocation failed; filter disabled.\r\n",
@@ -1579,7 +1602,7 @@ static BOOL PrepareFilter(DWORD filter)
 
     if (filter == kFilterHqx || filter == kFilterXbr)
     {
-        PrepareFinalScale();
+        PrepareFinalScale(filter);
     }
 
     if (filter == kFilterBicubic && !ResamplerIsReady(&g_bicubic))
@@ -2169,13 +2192,13 @@ static HRESULT PresentFilteredFrame(LPVOID primary, FrameTiming* timing)
                 // Scale by the whole factor, then smoothly to the display
                 // size, or straight into the staging surface when the
                 // present stretches it.
-                BOOL finalScale = UsesFinalScale();
+                BOOL finalScale = UsesFinalScale(filter);
                 BYTE* target = stagingPixels;
                 LONG targetPitch = stagingPitch;
                 DWORD width;
                 DWORD height;
 
-                GetPixelArtSize(&width, &height);
+                GetPixelArtSize(filter, &width, &height);
                 if (finalScale)
                 {
                     target = reinterpret_cast<BYTE*>(g_pixelArtFrame);

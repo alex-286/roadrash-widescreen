@@ -71,7 +71,7 @@ DisplayHeight=0  ; 0 (default) = desktop height, or a height in pixels
 VirtualWidth=0   ; 0 (default) = fit the display's aspect ratio, or 640-1280
 WaitForVBlank=1  ; 1 (default) = wait for vertical blank, 0 = no wait
 Filter=none      ; none (default), nearest, hqx, xbr, sharp-bilinear, bicubic
-HqxScale=0       ; hqx/xbr factor: 0 (default) = auto (2 up to 960 lines, else 3), 2, or 3
+HqxScale=0       ; hqx/xbr factor: 0 (default) = auto, or 2, 3, 4 (hqx: up to 3)
 Scanlines=0      ; 0 (default) = off, or 1-100 = scanline darkening in percent
 ShowFps=0        ; 0 (default) = off, 1 = show the frame rate during races
 ShowFilter=0     ; 0 (default) = off, 1 = show the active filter's name
@@ -83,7 +83,7 @@ ShowFilter=0     ; 0 (default) = off, 1 = show the active filter's name
 | `VirtualWidth` | The width the game renders at (multiple of 8). By default it matches your display's aspect ratio; other values change the aspect ratio. |
 | `WaitForVBlank` | Prevents tearing, but limits the frame rate to the monitor's refresh rate. |
 | `Filter` | The display filter, see [Filters](#filters). `none` keeps the game's original 8-bit display mode. |
-| `HqxScale` | Scale factor of the pixel-art filters `hqx` and `xbr`; their result is then scaled smoothly to the screen. The automatic choice is the smallest factor that reaches the screen height, so at 1080p the 3x result is reduced (supersampling). A lower factor is faster. |
+| `HqxScale` | Scale factor of the pixel-art filters `hqx` and `xbr` (2, 3 or 4; `hqx` stops at 3); their result is then scaled smoothly to the screen. The automatic choice is the smallest factor that reaches the screen height: 2 up to 960 lines, 3 up to 1440 lines (so at 1080p the 3x result is reduced: supersampling), 4 above, e.g. for 4K. A lower factor is faster. |
 | `Scanlines` | Strength of the scanline effect; 30 to 50 is a good start. |
 | `ShowFps`, `ShowFilter` | On-screen display in the top-left corner, for example `60 FPS  BICUBIC`. |
 
@@ -106,7 +106,7 @@ With any filter except `none`, press **F11** during a race to cycle through
 for later races. Switching to or from `none` requires restarting the game.
 `Scanlines` apply to every filter except `nearest`.
 
-`hqx` and `xbr` enlarge by a whole factor (2x or 3x); their result is then
+`hqx` and `xbr` enlarge by a whole factor (2x to 4x); their result is then
 scaled to the exact screen size with area averaging. That avoids doubled
 rows and columns at non-integer sizes such as 1080p or 4K, and at 1080p the
 3x result is reduced, which gives a supersampled, particularly clean picture.
