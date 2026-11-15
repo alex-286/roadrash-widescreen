@@ -282,9 +282,11 @@ static void LogMessage(const char* message, DWORD length)
 
     lstrcpyA(path + directoryLength, fileName);
 
+    // Windows 9x only knows GENERIC_READ/GENERIC_WRITE (not FILE_APPEND_DATA),
+    // so open for writing and seek to the end.
     file = CreateFileA(
         path,
-        FILE_APPEND_DATA,
+        GENERIC_WRITE,
         FILE_SHARE_READ | FILE_SHARE_WRITE,
         NULL,
         g_truncateLog ? CREATE_ALWAYS : OPEN_ALWAYS,
@@ -294,6 +296,14 @@ static void LogMessage(const char* message, DWORD length)
     if (file == INVALID_HANDLE_VALUE)
     {
         OutputDebugStringA(message);
+        return;
+    }
+
+    if (SetFilePointer(file, 0, NULL, FILE_END) == INVALID_SET_FILE_POINTER &&
+        GetLastError() != NO_ERROR)
+    {
+        OutputDebugStringA(message);
+        CloseHandle(file);
         return;
     }
 
@@ -810,6 +820,23 @@ static DWORD FindSupportedGameBase()
         ntHeaders->OptionalHeader.ImageBase != kExpectedImageBase ||
         ntHeaders->OptionalHeader.SizeOfImage != kExpectedImageSize)
     {
+        static const CHAR prefix[] =
+            "The executable is not the supported Road Rash German 1.0A "
+            "(timestamp ";
+        CHAR message[192];
+        DWORD length = sizeof(prefix) - 1;
+
+        lstrcpyA(message, prefix);
+        AppendHex32(message, &length, ntHeaders->FileHeader.TimeDateStamp);
+        lstrcpyA(message + length, ", expected ");
+        length += sizeof(", expected ") - 1;
+        AppendHex32(message, &length, kExpectedTimestamp);
+        lstrcpyA(message + length, "; image size ");
+        length += sizeof("; image size ") - 1;
+        AppendHex32(message, &length, ntHeaders->OptionalHeader.SizeOfImage);
+        lstrcpyA(message + length, "). Widescreen stays off.\r\n");
+        length += sizeof("). Widescreen stays off.\r\n") - 1;
+        LogMessage(message, length);
         return 0;
     }
 
@@ -842,6 +869,9 @@ static DWORD FindSupportedGameBase()
             hudMessageJump,
             sizeof(hudMessageJump)))
     {
+        LogMessage(
+            "The executable headers match Road Rash German 1.0A, but its code differs (patched or modified exe). Widescreen stays off.\r\n",
+            sizeof("The executable headers match Road Rash German 1.0A, but its code differs (patched or modified exe). Widescreen stays off.\r\n") - 1);
         return 0;
     }
 
@@ -2920,14 +2950,21 @@ BOOL InstallRoadRashWidescreenHook(LPVOID directDraw)
 
     if (g_gameBase == 0)
     {
-        base = FindSupportedGameBase();
-        if (base == 0)
+        static BOOL unsupported = FALSE;
+
+        if (unsupported)
         {
             return FALSE;
         }
 
+        base = FindSupportedGameBase();
+        if (base == 0)
+        {
+            unsupported = TRUE;
+            return FALSE;
+        }
+
         g_gameBase = base;
-        g_truncateLog = TRUE;
         ReadVirtualWidthSetting();
         LogMessage(
             "Recognized the supported Road Rash German 1.0A executable.\r\n",
@@ -3010,4 +3047,92 @@ BOOL InstallRoadRashWidescreenHook(LPVOID directDraw)
         "Installed the in-place DirectDraw surface and display-mode hooks.\r\n",
         sizeof("Installed the in-place DirectDraw surface and display-mode hooks.\r\n") - 1);
     return TRUE;
+}
+
+// Called from DllMain on process attach, so it only uses kernel32. It starts
+// a new log, which shows that Windows loaded this proxy at all.
+void LogProxyAttach(HMODULE proxy)
+{
+    static const CHAR prefix[] = "Road Rash widescreen DLL loaded from ";
+    CHAR message[MAX_PATH + 128];
+    DWORD length = sizeof(prefix) - 1;
+    DWORD pathLength;
+    OSVERSIONINFOA version;
+
+    lstrcpyA(message, prefix);
+    pathLength = GetModuleFileNameA(proxy, message + length, MAX_PATH);
+    if (pathLength == 0 || pathLength >= MAX_PATH)
+    {
+        lstrcpyA(message + length, "(unknown path)");
+        pathLength = sizeof("(unknown path)") - 1;
+    }
+    length += pathLength;
+
+    version.dwOSVersionInfoSize = sizeof(version);
+    if (GetVersionExA(&version))
+    {
+        lstrcpyA(message + length, " on Windows ");
+        length += sizeof(" on Windows ") - 1;
+        AppendDecimal(message, &length, version.dwMajorVersion);
+        message[length++] = '.';
+        AppendDecimal(message, &length, version.dwMinorVersion);
+        lstrcpyA(message + length, " build ");
+        length += sizeof(" build ") - 1;
+        AppendDecimal(message, &length, version.dwBuildNumber & 0xFFFF);
+        if (version.dwPlatformId == VER_PLATFORM_WIN32_WINDOWS)
+        {
+            lstrcpyA(message + length, " (9x)");
+            length += sizeof(" (9x)") - 1;
+        }
+        else
+        {
+            lstrcpyA(message + length, " (NT)");
+            length += sizeof(" (NT)") - 1;
+        }
+    }
+
+    lstrcpyA(message + length, ".\r\n");
+    length += sizeof(".\r\n") - 1;
+    g_truncateLog = TRUE;
+    LogMessage(message, length);
+}
+
+// Logs text, an optional path and, when error is not 0, the Win32 error code.
+void LogProxyMessage(const CHAR* text, const CHAR* path, DWORD error)
+{
+    CHAR message[MAX_PATH + 192];
+    DWORD length = 0;
+    DWORD part;
+
+    part = lstrlenA(text);
+    if (part > 160)
+    {
+        part = 160;
+    }
+    lstrcpynA(message, text, part + 1);
+    length = part;
+
+    if (path != NULL)
+    {
+        part = lstrlenA(path);
+        if (part >= MAX_PATH)
+        {
+            part = MAX_PATH - 1;
+        }
+        message[length++] = ' ';
+        lstrcpynA(message + length, path, part + 1);
+        length += part;
+    }
+
+    if (error != 0)
+    {
+        lstrcpyA(message + length, " (error 0x");
+        length += sizeof(" (error 0x") - 1;
+        AppendHex32(message, &length, error);
+        message[length++] = ')';
+    }
+
+    message[length++] = '\r';
+    message[length++] = '\n';
+    LogMessage(message, length);
 }

@@ -14,6 +14,7 @@ typedef HRESULT (WINAPI *DirectDrawEnumerateExAFn)(LPVOID, LPVOID, DWORD);
 typedef HRESULT (WINAPI *DirectDrawEnumerateExWFn)(LPVOID, LPVOID, DWORD);
 
 static HMODULE g_systemDdraw = NULL;
+static HMODULE g_proxyModule = NULL;
 static volatile LONG g_loadLock = 0;
 static CHAR g_systemPath[MAX_PATH];
 
@@ -63,6 +64,31 @@ static HMODULE LoadSystemDdraw()
         }
 
         g_systemDdraw = LoadLibraryA(g_systemPath);
+        if (g_systemDdraw == NULL)
+        {
+            DWORD error = GetLastError();
+            LogProxyMessage(
+                "Could not load the system DirectDraw library", g_systemPath,
+                error);
+            SetLastError(error);
+        }
+        else if (g_systemDdraw == g_proxyModule)
+        {
+            // Windows 9x matches loaded modules by name, so a full path
+            // to the system ddraw.dll can return this proxy. Forwarding
+            // to it would call these exports again forever.
+            FreeLibrary(g_systemDdraw);
+            g_systemDdraw = NULL;
+            LogProxyMessage(
+                "Windows returned this proxy instead of the system DirectDraw library",
+                g_systemPath, 0);
+            SetLastError(ERROR_DLL_INIT_FAILED);
+        }
+        else
+        {
+            LogProxyMessage(
+                "Loaded the system DirectDraw library", g_systemPath, 0);
+        }
     }
 
     HMODULE module = g_systemDdraw;
@@ -108,6 +134,12 @@ extern "C" HRESULT WINAPI DirectDrawCreate(
     if (SUCCEEDED(result) && lplpDD != NULL && *lplpDD != NULL)
     {
         InstallRoadRashWidescreenHook(*lplpDD);
+    }
+    else if (FAILED(result))
+    {
+        LogProxyMessage(
+            "The system DirectDrawCreate failed with HRESULT", NULL,
+            static_cast<DWORD>(result));
     }
     return result;
 }
@@ -191,8 +223,11 @@ extern "C" BOOL WINAPI DllMain(
     DWORD reason,
     LPVOID reserved)
 {
-    instance;
-    reason;
     reserved;
+    if (reason == DLL_PROCESS_ATTACH)
+    {
+        g_proxyModule = instance;
+        LogProxyAttach(instance);
+    }
     return TRUE;
 }

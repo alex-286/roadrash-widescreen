@@ -7,5 +7,7 @@
 #include <windows.h>
 
 BOOL InstallRoadRashWidescreenHook(LPVOID directDraw);
+void LogProxyAttach(HMODULE proxy);
+void LogProxyMessage(const CHAR* text, const CHAR* path, DWORD error);
 
 #endif

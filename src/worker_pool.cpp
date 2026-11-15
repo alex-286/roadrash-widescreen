@@ -46,6 +46,7 @@ void WorkerPoolStart(DWORD maxThreads)
     SYSTEM_INFO system;
     DWORD count;
     DWORD part;
+    DWORD threadId;
 
     WorkerPoolStop();
     GetSystemInfo(&system);
@@ -74,13 +75,14 @@ void WorkerPoolStart(DWORD maxThreads)
             break;
         }
 
+        // Windows 9x fails CreateThread without a thread id pointer.
         g_workers[part].thread = CreateThread(
             NULL,
             kWorkerStackSize,
             WorkerMain,
             reinterpret_cast<LPVOID>(static_cast<DWORD_PTR>(part)),
             0,
-            NULL);
+            &threadId);
         if (g_workers[part].thread == NULL)
         {
             break;
