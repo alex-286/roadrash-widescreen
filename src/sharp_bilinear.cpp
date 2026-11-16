@@ -2,11 +2,16 @@
 // Copyright (C) 2026 Alexander Schmidt
 
 #include "sharp_bilinear.h"
+#include "cpu_features.h"
 #include "worker_pool.h"
 
 #include <intrin.h>
+#include <mmintrin.h>
 
 #pragma intrinsic(__movsd)
+// The MMX row functions leave the MMX state to ScaleTask, which clears it
+// once with _mm_empty after all rows.
+#pragma warning(disable : 4799)
 
 static const DWORD kMaxParts = 8;
 
@@ -30,6 +35,8 @@ struct ScaleJob
     const BYTE* source;
     LONG sourcePitch;
     const DWORD* rgb;
+    // With MMX: the palette with each color's channels in 16-bit lanes.
+    const __m64* palette;
     BYTE* destination;
     LONG destinationPitch;
 };
@@ -42,6 +49,8 @@ static AxisTable g_columns;
 static AxisTable g_rows;
 static PartRows g_parts[kMaxParts];
 static DWORD g_partCount = 0;
+// With MMX: each column's weight in all four 16-bit lanes.
+static __m64* g_columnWeights = NULL;
 
 static void* Allocate(DWORD bytes)
 {
@@ -152,6 +161,77 @@ static void FilterRow(const ScaleJob* job, DWORD sourceRow, DWORD* output)
     }
 }
 
+// MMX: the blend of Blend for the four channels at once, as
+// (a * 256 + (b - a) * weight) >> 8 = (a * (256 - weight) + b * weight) >> 8.
+// The intermediate (b - a) * weight may leave the 16-bit range, but the
+// final sum lies in 0-65280, so the wrapping 16-bit arithmetic is exact and
+// the result equals Blend's.
+static __forceinline __m64 BlendMmx(__m64 first, __m64 second, __m64 weight)
+{
+    return _mm_srli_pi16(
+        _mm_add_pi16(
+            _mm_slli_pi16(first, 8),
+            _mm_mullo_pi16(_mm_sub_pi16(second, first), weight)),
+        8);
+}
+
+static void FilterRowMmx(const ScaleJob* job, DWORD sourceRow, DWORD* output)
+{
+    const BYTE* source = job->source +
+        static_cast<LONG>(sourceRow) * job->sourcePitch;
+    const DWORD* rgb = job->rgb;
+    const __m64* palette = job->palette;
+    const DWORD* index = g_columns.index;
+    const BYTE* weight = g_columns.weight;
+    const __m64* weights = g_columnWeights;
+    __m64 zero = _mm_setzero_si64();
+    DWORD column;
+
+    for (column = 0; column < g_destinationWidth; ++column)
+    {
+        const BYTE* pixel = source + index[column];
+
+        if (weight[column] == 0)
+        {
+            output[column] = rgb[pixel[0]];
+            continue;
+        }
+
+        output[column] = static_cast<DWORD>(_mm_cvtsi64_si32(_mm_packs_pu16(
+            BlendMmx(palette[pixel[0]], palette[pixel[1]], weights[column]),
+            zero)));
+    }
+}
+
+static void BlendRowsMmx(
+    const DWORD* upper, const DWORD* lower, DWORD weight, DWORD* output)
+{
+    __m64 zero = _mm_setzero_si64();
+    __m64 factor = _mm_set1_pi16(static_cast<short>(weight));
+    DWORD column = 0;
+
+    for (; column + 2 <= g_destinationWidth; column += 2)
+    {
+        __m64 top = *reinterpret_cast<const __m64*>(upper + column);
+        __m64 bottom = *reinterpret_cast<const __m64*>(lower + column);
+
+        *reinterpret_cast<__m64*>(output + column) = _mm_packs_pu16(
+            BlendMmx(
+                _mm_unpacklo_pi8(top, zero),
+                _mm_unpacklo_pi8(bottom, zero),
+                factor),
+            BlendMmx(
+                _mm_unpackhi_pi8(top, zero),
+                _mm_unpackhi_pi8(bottom, zero),
+                factor));
+    }
+
+    for (; column < g_destinationWidth; ++column)
+    {
+        output[column] = Blend(upper[column], lower[column], weight);
+    }
+}
+
 // Returns the filtered source row, computing it into a slot that does not
 // hold keep.
 static DWORD* GetRow(const ScaleJob* job, PartRows* part, LONG row, LONG keep)
@@ -169,7 +249,14 @@ static DWORD* GetRow(const ScaleJob* job, PartRows* part, LONG row, LONG keep)
     }
 
     slot = part->tags[0] == keep ? 1 : 0;
-    FilterRow(job, static_cast<DWORD>(row), part->rows[slot]);
+    if (g_columnWeights != NULL)
+    {
+        FilterRowMmx(job, static_cast<DWORD>(row), part->rows[slot]);
+    }
+    else
+    {
+        FilterRow(job, static_cast<DWORD>(row), part->rows[slot]);
+    }
     part->tags[slot] = row;
     return part->rows[slot];
 }
@@ -211,10 +298,22 @@ static void ScaleTask(DWORD part, DWORD, void* context)
         }
 
         lower = GetRow(job, rows, sourceRow + 1, sourceRow);
+        if (g_columnWeights != NULL)
+        {
+            BlendRowsMmx(upper, lower, weight, output);
+            continue;
+        }
+
         for (column = 0; column < g_destinationWidth; ++column)
         {
             output[column] = Blend(upper[column], lower[column], weight);
         }
+    }
+
+    // The FPU (shared with MMX) must be usable again by the caller.
+    if (g_columnWeights != NULL)
+    {
+        _mm_empty();
     }
 }
 
@@ -250,6 +349,25 @@ BOOL SharpBilinearInitialize(
         return FALSE;
     }
 
+    if (CpuHasMmx())
+    {
+        g_columnWeights = reinterpret_cast<__m64*>(
+            Allocate(destinationWidth * sizeof(__m64)));
+        if (g_columnWeights != NULL)
+        {
+            for (index = 0; index < destinationWidth; ++index)
+            {
+                WORD weight = g_columns.weight[index];
+                WORD* lanes = reinterpret_cast<WORD*>(&g_columnWeights[index]);
+
+                lanes[0] = weight;
+                lanes[1] = weight;
+                lanes[2] = weight;
+                lanes[3] = weight;
+            }
+        }
+    }
+
     for (index = 0; index < count; ++index)
     {
         g_parts[index].rows[0] = reinterpret_cast<DWORD*>(
@@ -281,6 +399,8 @@ void SharpBilinearShutdown()
 
     FreeAxis(&g_columns);
     FreeAxis(&g_rows);
+    Free(g_columnWeights);
+    g_columnWeights = NULL;
     g_partCount = 0;
     g_sourceWidth = 0;
     g_sourceHeight = 0;
@@ -310,6 +430,23 @@ void SharpBilinearScale(
     job.source = source;
     job.sourcePitch = sourcePitch;
     job.rgb = rgb;
+    job.palette = NULL;
+    if (g_columnWeights != NULL)
+    {
+        static __m64 unpacked[256];
+        __m64 zero = _mm_setzero_si64();
+        DWORD index;
+
+        for (index = 0; index < 256; ++index)
+        {
+            unpacked[index] = _mm_unpacklo_pi8(
+                _mm_cvtsi32_si64(static_cast<int>(rgb[index])), zero);
+        }
+
+        _mm_empty();
+        job.palette = unpacked;
+    }
+
     job.destination = destination;
     job.destinationPitch = destinationPitch;
     WorkerPoolRun(ScaleTask, &job);

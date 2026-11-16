@@ -2,11 +2,16 @@
 // Copyright (C) 2026 Alexander Schmidt
 
 #include "resampler.h"
+#include "cpu_features.h"
 #include "worker_pool.h"
 
 #include <intrin.h>
+#include <mmintrin.h>
 
 #pragma intrinsic(__movsd)
+// The MMX row functions leave the MMX state to ScaleTask, which clears it
+// once with _mm_empty after all rows.
+#pragma warning(disable : 4799)
 
 static const DWORD kTaps = kResamplerTaps;
 // Weights are fixed point with 10 fractional bits; they sum to kOne.
@@ -19,6 +24,9 @@ struct ScaleJob
     const BYTE* source;
     LONG sourcePitch;
     const DWORD* rgb;
+    // With MMX and rgb: the palette with each color's channels already in
+    // 16-bit lanes.
+    const __m64* palette;
     // When set, X8R8G8B8 source rows come from this callback instead of
     // source.
     ResamplerRowSource rowSource;
@@ -324,6 +332,142 @@ static __forceinline DWORD BlendPair(DWORD first, DWORD second, const SHORT* wei
     return (redBlue & 0x00FF00FF) | (green & 0x0000FF00);
 }
 
+// MMX is used when the processor has it; the results are identical.
+static BOOL g_useMmx = FALSE;
+
+// MMX: Combine for the four channels at once. pmaddwd forms the sums of
+// two taps per channel in 32 bits, which are added, rounded and shifted as
+// in ClampChannel; the signed and unsigned saturating packs then clamp to
+// 0-255 exactly like ClampChannel. Combine leaves the top byte 0.
+// The colors come with their channels in 16-bit lanes.
+static __forceinline DWORD CombineMmxLanes(
+    const __m64* c0, const __m64* c1, const __m64* c2, const __m64* c3,
+    const __m64* weights)
+{
+    __m64 p0 = *c0;
+    __m64 p1 = *c1;
+    __m64 p2 = *c2;
+    __m64 p3 = *c3;
+    __m64 zero = _mm_setzero_si64();
+    __m64 round = _mm_set1_pi32(kOne / 2);
+    __m64 weights01 = weights[0];
+    __m64 weights23 = weights[1];
+    __m64 blueGreen = _mm_add_pi32(
+        _mm_madd_pi16(_mm_unpacklo_pi16(p0, p1), weights01),
+        _mm_madd_pi16(_mm_unpacklo_pi16(p2, p3), weights23));
+    __m64 redTop = _mm_add_pi32(
+        _mm_madd_pi16(_mm_unpackhi_pi16(p0, p1), weights01),
+        _mm_madd_pi16(_mm_unpackhi_pi16(p2, p3), weights23));
+
+    blueGreen = _mm_srai_pi32(_mm_add_pi32(blueGreen, round), kWeightBits);
+    redTop = _mm_srai_pi32(_mm_add_pi32(redTop, round), kWeightBits);
+    return static_cast<DWORD>(_mm_cvtsi64_si32(_mm_packs_pu16(
+        _mm_packs_pi32(blueGreen, redTop), zero))) & 0x00FFFFFF;
+}
+
+static __forceinline __m64 Unpack(DWORD color)
+{
+    return _mm_unpacklo_pi8(
+        _mm_cvtsi32_si64(static_cast<int>(color)), _mm_setzero_si64());
+}
+
+static __forceinline DWORD CombineMmx(
+    DWORD c0, DWORD c1, DWORD c2, DWORD c3, const __m64* weights)
+{
+    __m64 lanes[4];
+
+    lanes[0] = Unpack(c0);
+    lanes[1] = Unpack(c1);
+    lanes[2] = Unpack(c2);
+    lanes[3] = Unpack(c3);
+    return CombineMmxLanes(
+        &lanes[0], &lanes[1], &lanes[2], &lanes[3], weights);
+}
+
+// The tap pairs (w0, w1, w0, w1) and (w2, w3, w2, w3) for pmaddwd.
+static __forceinline void SplitWeights(const SHORT* weights, __m64* split)
+{
+    __m64 all = *reinterpret_cast<const __m64*>(weights);
+
+    split[0] = _mm_unpacklo_pi32(all, all);
+    split[1] = _mm_unpackhi_pi32(all, all);
+}
+
+static void FilterRowMmx(
+    const ScaleJob* job, const BYTE* line, DWORD* output)
+{
+    const Resampler* resampler = job->resampler;
+    const DWORD* index = resampler->columnIndex;
+    const SHORT* weight = resampler->columnWeight;
+    DWORD width = resampler->destinationWidth;
+    DWORD column;
+
+    if (job->rgb != NULL)
+    {
+        const DWORD* rgb = job->rgb;
+        const __m64* palette = job->palette;
+
+        for (column = 0; column < width; ++column)
+        {
+            if (IsCopy(weight))
+            {
+                output[column] = rgb[line[index[0]]];
+            }
+            else
+            {
+                __m64 split[2];
+
+                SplitWeights(weight, split);
+                output[column] = CombineMmxLanes(
+                    &palette[line[index[0]]],
+                    &palette[line[index[1]]],
+                    &palette[line[index[2]]],
+                    &palette[line[index[3]]],
+                    split);
+            }
+
+            index += kTaps;
+            weight += kTaps;
+        }
+
+        return;
+    }
+
+    {
+        const DWORD* pixels = reinterpret_cast<const DWORD*>(line);
+        BOOL blendPairs = resampler->blendPairs;
+
+        for (column = 0; column < width; ++column)
+        {
+            if (IsCopy(weight))
+            {
+                output[column] = pixels[index[0]];
+            }
+            else if (blendPairs && IsPair(weight))
+            {
+                output[column] = BlendPair(
+                    pixels[index[0]], pixels[index[1]], weight);
+            }
+            else
+            {
+                // Also for three taps: CombineTriple equals Combine.
+                __m64 split[2];
+
+                SplitWeights(weight, split);
+                output[column] = CombineMmx(
+                    pixels[index[0]],
+                    pixels[index[1]],
+                    pixels[index[2]],
+                    pixels[index[3]],
+                    split);
+            }
+
+            index += kTaps;
+            weight += kTaps;
+        }
+    }
+}
+
 static void FilterRow(
     const ScaleJob* job, DWORD part, DWORD sourceRow, DWORD* output)
 {
@@ -336,6 +480,12 @@ static void FilterRow(
     const SHORT* weight = resampler->columnWeight;
     DWORD width = resampler->destinationWidth;
     DWORD column;
+
+    if (g_useMmx)
+    {
+        FilterRowMmx(job, line, output);
+        return;
+    }
 
     if (job->rgb != NULL)
     {
@@ -475,6 +625,23 @@ static void ScaleTask(DWORD part, DWORD, void* context)
         }
 
         row2 = GetRow(job, rows, index[2]);
+        if (g_useMmx)
+        {
+            __m64 split[2];
+
+            // Also for three rows: CombineTriple equals Combine.
+            row3 = weight[3] == 0 ? row2 : GetRow(job, rows, index[3]);
+            SplitWeights(weight, split);
+            for (column = 0; column < width; ++column)
+            {
+                output[column] = CombineMmx(
+                    row0[column], row1[column], row2[column], row3[column],
+                    split);
+            }
+
+            continue;
+        }
+
         if (resampler->blendPairs && weight[3] == 0)
         {
             for (column = 0; column < width; ++column)
@@ -493,6 +660,12 @@ static void ScaleTask(DWORD part, DWORD, void* context)
                 row0[column], row1[column], row2[column], row3[column],
                 weight);
         }
+    }
+
+    // The FPU (shared with MMX) must be usable again by the caller.
+    if (g_useMmx)
+    {
+        _mm_empty();
     }
 }
 
@@ -521,6 +694,7 @@ BOOL ResamplerInitialize(
     }
 
     resampler->blendPairs = kernel == kResamplerArea;
+    g_useMmx = CpuHasMmx();
     resampler->sourceWidth = sourceWidth;
     resampler->sourceHeight = sourceHeight;
     resampler->destinationWidth = destinationWidth;
@@ -607,6 +781,21 @@ static void Run(
     job.source = source;
     job.sourcePitch = sourcePitch;
     job.rgb = rgb;
+    job.palette = NULL;
+    if (g_useMmx && rgb != NULL)
+    {
+        static __m64 unpacked[256];
+        DWORD index;
+
+        for (index = 0; index < 256; ++index)
+        {
+            unpacked[index] = Unpack(rgb[index]);
+        }
+
+        _mm_empty();
+        job.palette = unpacked;
+    }
+
     job.rowSource = NULL;
     job.rowContext = NULL;
     job.destination = destination;
@@ -632,6 +821,7 @@ void ResamplerScaleRgbRows(
     job.source = NULL;
     job.sourcePitch = 0;
     job.rgb = NULL;
+    job.palette = NULL;
     job.rowSource = rowSource;
     job.rowContext = context;
     job.destination = destination;

@@ -4,6 +4,7 @@
 #include "road_rash_patch.h"
 #include "game_fixes.h"
 #include "render_scale.h"
+#include "cpu_features.h"
 #include "hqx_upscaler.h"
 #include "fps_overlay.h"
 #include "worker_pool.h"
@@ -1758,6 +1759,18 @@ static HRESULT CreatePresenterResources(LPVOID directDraw)
         "Filter threads=0x",
         sizeof("Filter threads=0x") - 1,
         WorkerPoolSize());
+    if (CpuHasMmx())
+    {
+        LogMessage(
+            "Filters use MMX.\r\n",
+            sizeof("Filters use MMX.\r\n") - 1);
+    }
+    else
+    {
+        LogMessage(
+            "No MMX; filters use plain C.\r\n",
+            sizeof("No MMX; filters use plain C.\r\n") - 1);
+    }
     if (g_activeFilter == kFilterNone || g_filterUnavailable[g_activeFilter])
     {
         g_activeFilter = kFilterNearest;
