@@ -3,6 +3,7 @@
 
 #include "road_rash_patch.h"
 #include "game_fixes.h"
+#include "render_scale.h"
 #include "hqx_upscaler.h"
 #include "fps_overlay.h"
 #include "worker_pool.h"
@@ -193,6 +194,21 @@ static DWORD g_flipLogCount = 0;
 static DWORD g_displayModeLogCount = 0;
 static BOOL g_nativeDisplayModesLogged = FALSE;
 static BOOL g_waitForVerticalBlank = TRUE;
+
+// Experimental (RenderScale=2): the world is drawn at twice the 480-line
+// resolution into a back buffer of twice the size. The sky and the HUD still
+// draw at 480 lines, into the top-left quarter. Uses the 8-bit path only.
+static DWORD g_renderScale = 1;
+
+// RenderScale=2: the HUD is drawn into a 480-line surface and then enlarged
+// over the world; g_hudBefore holds that surface as it was before the HUD
+// was drawn, to find the pixels the HUD changed.
+static LPVOID g_hudSurface = NULL;
+static BYTE* g_hudBefore = NULL;
+static DWORD g_hudWidth = 0;
+
+// The sky camera; the sky scroll is -(camera >> 15) in HiRes.
+static const DWORD kSkyCameraRva = 0x000BC7E8;
 // Frame filters. "none" keeps the game's 8-bit display mode; every other
 // filter uses the 32-bit presenter, which converts the 8-bit frame through
 // the game palette. F11 cycles through the 32-bit filters during a race.
@@ -749,6 +765,19 @@ static void ReadVirtualWidthSetting()
         {
             g_virtualWidthOverride = width;
         }
+
+        if (GetPrivateProfileIntA("Display", "RenderScale", 1, path) == 2)
+        {
+            g_renderScale = 2;
+            if (g_filterSetting != kFilterNone)
+            {
+                g_filterSetting = kFilterNone;
+                g_activeFilter = kFilterNone;
+                LogMessage(
+                    "RenderScale=2 is experimental and uses Filter=none.\r\n",
+                    sizeof("RenderScale=2 is experimental and uses Filter=none.\r\n") - 1);
+            }
+        }
     }
 
     if (displayWidth < kOriginalDisplayWidth ||
@@ -911,6 +940,122 @@ typedef void (__fastcall *SkyDrawFn)(int, int);
 typedef void (__fastcall *SurfaceRestoreFn)(LPVOID);
 typedef HRESULT (WINAPI *SurfaceBltFastFn)(
     LPVOID, DWORD, DWORD, LPVOID, RECT*, DWORD);
+typedef HRESULT (WINAPI *SurfaceLockFn)(LPVOID, LPVOID, LPVOID, DWORD, HANDLE);
+typedef HRESULT (WINAPI *SurfaceUnlockFn)(LPVOID, LPVOID);
+
+// A locked 8-bit surface for direct pixel access.
+struct LockedSurface
+{
+    LPVOID surface;
+    BYTE* pixels;
+    LONG pitch;
+    LONG width;
+    LONG height;
+};
+
+static BOOL LockWholeSurface(LPVOID surface, DWORD flags, LockedSurface* locked)
+{
+    BYTE description[kDdsurfaceDescSize];
+    LPVOID* vtable = *reinterpret_cast<LPVOID**>(surface);
+    volatile DWORD* words = reinterpret_cast<volatile DWORD*>(description);
+    DWORD index;
+
+    for (index = 0; index < kDdsurfaceDescSize / sizeof(DWORD); ++index)
+    {
+        words[index] = 0;
+    }
+
+    words[0] = kDdsurfaceDescSize;
+    if (FAILED(reinterpret_cast<SurfaceLockFn>(
+            vtable[kSurfaceLockVtableIndex])(
+                surface, NULL, description, flags | kDdlockWait, NULL)))
+    {
+        return FALSE;
+    }
+
+    locked->surface = surface;
+    locked->pixels = *reinterpret_cast<BYTE**>(
+        description + kDdsurfaceDescSurfaceOffset);
+    locked->pitch = *reinterpret_cast<LONG*>(
+        description + kDdsurfaceDescPitchOffset);
+    locked->width = *reinterpret_cast<LONG*>(
+        description + kDdsurfaceDescWidthOffset);
+    locked->height = *reinterpret_cast<LONG*>(
+        description + kDdsurfaceDescHeightOffset);
+    if (locked->pixels == NULL)
+    {
+        reinterpret_cast<SurfaceUnlockFn>(
+            vtable[kSurfaceUnlockVtableIndex])(surface, NULL);
+        return FALSE;
+    }
+
+    return TRUE;
+}
+
+static void UnlockWholeSurface(LockedSurface* locked)
+{
+    LPVOID* vtable = *reinterpret_cast<LPVOID**>(locked->surface);
+
+    reinterpret_cast<SurfaceUnlockFn>(
+        vtable[kSurfaceUnlockVtableIndex])(locked->surface, NULL);
+}
+
+// RenderScale=2: draws the sky at twice its size straight into the back
+// buffer, so it covers the 960-line view down to the horizon.
+static BOOL DrawDoubledSky(
+    LPVOID back, LPVOID first, LPVOID second,
+    LONG half, LONG period, LONG height, LONG top)
+{
+    LockedSurface target;
+    LockedSurface firstHalf;
+    LockedSurface secondHalf;
+    LONG camera = static_cast<LONG>(ReadGameDword(kSkyCameraRva));
+
+    if (!LockWholeSurface(first, kDdlockReadOnly, &firstHalf))
+    {
+        return FALSE;
+    }
+
+    if (!LockWholeSurface(second, kDdlockReadOnly, &secondHalf))
+    {
+        UnlockWholeSurface(&firstHalf);
+        return FALSE;
+    }
+
+    if (!LockWholeSurface(back, kDdlockWriteOnly, &target))
+    {
+        UnlockWholeSurface(&secondHalf);
+        UnlockWholeSurface(&firstHalf);
+        return FALSE;
+    }
+
+    if (height > firstHalf.height)
+    {
+        height = firstHalf.height;
+    }
+
+    if (height > secondHalf.height)
+    {
+        height = secondHalf.height;
+    }
+
+    if (half <= firstHalf.width && half <= secondHalf.width)
+    {
+        RenderScaleDrawSky(
+            target.pixels, target.pitch, target.width, target.height,
+            firstHalf.pixels, firstHalf.pitch,
+            secondHalf.pixels, secondHalf.pitch,
+            half, period, height,
+            -(camera >> 14),
+            static_cast<LONG>(ReadGameDword(kDisplayOriginXRva)) * 2,
+            (static_cast<LONG>(ReadGameDword(kDisplayOriginYRva)) + top) * 2);
+    }
+
+    UnlockWholeSurface(&target);
+    UnlockWholeSurface(&secondHalf);
+    UnlockWholeSurface(&firstHalf);
+    return TRUE;
+}
 
 // The game draws the sky panorama in three pieces, which leaves a gap on
 // the right when the view is wider than 720 pixels. Draw the remaining
@@ -943,6 +1088,14 @@ static void __fastcall HookedSkyDraw(int scroll, int top)
     reinterpret_cast<SurfaceRestoreFn>(g_gameBase + kSurfaceRestoreRva)(back);
     reinterpret_cast<SurfaceRestoreFn>(g_gameBase + kSurfaceRestoreRva)(first);
     reinterpret_cast<SurfaceRestoreFn>(g_gameBase + kSurfaceRestoreRva)(second);
+
+    if (g_renderScale == 2 && g_virtualDisplayActive && back == g_virtualBack &&
+        DrawDoubledSky(
+            back, first, second,
+            static_cast<LONG>(half), static_cast<LONG>(period), height, top))
+    {
+        return;
+    }
 
     while (phase >= static_cast<LONG>(period))
     {
@@ -1010,11 +1163,75 @@ static void __fastcall HookedSkyDraw(int scroll, int top)
 
 typedef DWORD (__cdecl *HudDrawFn)(void);
 
+static void SetWidescreenGameState(
+    DWORD logicalWidth,
+    DWORD logicalHeight,
+    DWORD displayWidth,
+    DWORD displayHeight);
+
 // Draws the cockpit, gauges, and text with the display origin shifted so the
 // 640-pixel-wide HUD is centered in the wider virtual buffer.
 static DWORD __cdecl HookedHudDraw(void)
 {
     DWORD result;
+
+    // RenderScale=2: the HUD art and text exist at 480 lines only. The game
+    // draws them into a 480-line surface, and every pixel it changed is
+    // enlarged 2x over the world.
+    if (g_renderScale == 2 && g_hudSurface != NULL && g_hudBefore != NULL &&
+        ReadGameDword(kGameBackBufferRva) == reinterpret_cast<DWORD>(g_virtualBack))
+    {
+        LockedSurface hud;
+        LockedSurface target;
+
+        if (LockWholeSurface(g_hudSurface, 0, &hud))
+        {
+            RenderScalePrepareHud(
+                hud.pixels, hud.pitch, g_hudWidth, kOriginalDisplayHeight,
+                g_hudBefore);
+            UnlockWholeSurface(&hud);
+
+            // The HUD sees the 480-line game state, as without RenderScale:
+            // it centers texts (such as the Escape prompt) in the display
+            // width.
+            SetWidescreenGameState(
+                kVirtualLogicalWidth,
+                kOriginalLogicalHeight,
+                kVirtualDisplayWidth,
+                kOriginalDisplayHeight);
+            WriteGameDword(
+                kGameBackBufferRva, reinterpret_cast<DWORD>(g_hudSurface));
+            WriteGameDword(
+                kDisplayOriginXRva,
+                (kVirtualDisplayWidth - kHudCockpitWidth) / 2);
+            result = reinterpret_cast<HudDrawFn>(g_gameBase + kHudFunctionRva)();
+            WriteGameDword(kDisplayOriginXRva, 0);
+            WriteGameDword(
+                kGameBackBufferRva, reinterpret_cast<DWORD>(g_virtualBack));
+            SetWidescreenGameState(
+                kVirtualLogicalWidth,
+                kOriginalLogicalHeight,
+                kVirtualDisplayWidth * 2,
+                kOriginalDisplayHeight * 2);
+
+            if (LockWholeSurface(g_hudSurface, kDdlockReadOnly, &hud))
+            {
+                if (LockWholeSurface(g_virtualBack, 0, &target))
+                {
+                    RenderScaleComposeHud(
+                        hud.pixels, hud.pitch, g_hudBefore,
+                        g_hudWidth, kOriginalDisplayHeight,
+                        target.pixels, target.pitch,
+                        target.width, target.height);
+                    UnlockWholeSurface(&target);
+                }
+
+                UnlockWholeSurface(&hud);
+            }
+
+            return result;
+        }
+    }
 
     WriteGameDword(
         kDisplayOriginXRva,
@@ -1104,6 +1321,7 @@ static void RestoreOriginalGameState()
     WriteGameDword(kClipTopRva, 0);
     WriteGameDword(kClipRightRva, kOriginalDisplayWidth);
     WriteGameDword(kClipBottomRva, kOriginalDisplayHeight - 1);
+    RenderScaleSetDoubled(FALSE);
     if (g_virtualDisplayActive)
     {
         SetHudCentering(FALSE);
@@ -1126,8 +1344,6 @@ static void ZeroDescription(BYTE* description)
 
 static void InstallSurfaceHooks(LPVOID surface);
 
-typedef HRESULT (WINAPI *SurfaceLockFn)(LPVOID, LPVOID, LPVOID, DWORD, HANDLE);
-typedef HRESULT (WINAPI *SurfaceUnlockFn)(LPVOID, LPVOID);
 typedef HRESULT (WINAPI *SurfaceGetPaletteFn)(LPVOID, LPVOID*);
 typedef HRESULT (WINAPI *SurfaceSetPaletteFn)(LPVOID, LPVOID);
 typedef HRESULT (WINAPI *PaletteGetEntriesFn)(
@@ -1776,8 +1992,8 @@ static HRESULT CreateVirtualPrimary(
     InstallSurfaceHooks(*surface);
     BuildOffscreenDescription(
         backDescription,
-        kVirtualDisplayWidth,
-        kOriginalDisplayHeight);
+        kVirtualDisplayWidth * g_renderScale,
+        kOriginalDisplayHeight * g_renderScale);
     // The game draws into the back buffer with the CPU, so it lives in system
     // memory in both paths. With it in video memory, the 8-bit path ran at
     // about 5 fps on a Windows 98 PC that ran the system-memory 32-bit path
@@ -1819,6 +2035,46 @@ static HRESULT CreateVirtualPrimary(
         }
     }
 
+    if (g_renderScale == 2)
+    {
+        BYTE hudDescription[kDdsurfaceDescSize];
+        LPVOID hudSurface = NULL;
+        HRESULT hudResult;
+
+        BuildOffscreenDescription(
+            hudDescription, kVirtualDisplayWidth, kOriginalDisplayHeight);
+        SetSystemMemoryCaps(hudDescription);
+        hudResult = g_hookState.originalCreateSurface(
+            directDraw, hudDescription, &hudSurface, NULL);
+        g_hudBefore = static_cast<BYTE*>(VirtualAlloc(
+            NULL,
+            kVirtualDisplayWidth * kOriginalDisplayHeight,
+            MEM_COMMIT,
+            PAGE_READWRITE));
+        if (FAILED(hudResult) || g_hudBefore == NULL)
+        {
+            if (SUCCEEDED(hudResult))
+            {
+                g_originalSurfaceRelease(hudSurface);
+            }
+
+            if (g_hudBefore != NULL)
+            {
+                VirtualFree(g_hudBefore, 0, MEM_RELEASE);
+                g_hudBefore = NULL;
+            }
+
+            LogMessage(
+                "RenderScale=2: the HUD surface could not be created; the HUD stays small.\r\n",
+                sizeof("RenderScale=2: the HUD surface could not be created; the HUD stays small.\r\n") - 1);
+        }
+        else
+        {
+            g_hudSurface = hudSurface;
+            g_hudWidth = kVirtualDisplayWidth;
+        }
+    }
+
     g_backPalette = NULL;
     g_lastPresentValid = FALSE;
     g_virtualPrimary = *surface;
@@ -1838,9 +2094,22 @@ static ULONG WINAPI HookedSurfaceRelease(LPVOID surface)
         LPVOID back = g_virtualBack;
         LPVOID staging = g_staging;
         LPVOID spare = g_stagingSpare;
+        LPVOID hud = g_hudSurface;
 
         g_virtualPrimary = NULL;
         g_virtualBack = NULL;
+        g_hudSurface = NULL;
+        if (hud != NULL)
+        {
+            g_originalSurfaceRelease(hud);
+        }
+
+        if (g_hudBefore != NULL)
+        {
+            VirtualFree(g_hudBefore, 0, MEM_RELEASE);
+            g_hudBefore = NULL;
+        }
+
         g_staging = NULL;
         g_stagingSpare = NULL;
         g_backPalette = NULL;
@@ -1946,13 +2215,16 @@ static void DumpVirtualBackBuffer()
             FALSE,
             *reinterpret_cast<BYTE**>(description + kDdsurfaceDescSurfaceOffset),
             *reinterpret_cast<LONG*>(description + kDdsurfaceDescPitchOffset),
-            kVirtualDisplayWidth,
-            kOriginalDisplayHeight,
+            kVirtualDisplayWidth * g_renderScale,
+            kOriginalDisplayHeight * g_renderScale,
             8,
             palette,
             savedName))
     {
-        LogSavedImage(savedName, kVirtualDisplayWidth, kOriginalDisplayHeight);
+        LogSavedImage(
+            savedName,
+            kVirtualDisplayWidth * g_renderScale,
+            kOriginalDisplayHeight * g_renderScale);
     }
     else
     {
@@ -2927,8 +3199,9 @@ static HRESULT WINAPI HookedSetDisplayMode(
                 SetWidescreenGameState(
                     kVirtualLogicalWidth,
                     kOriginalLogicalHeight,
-                    kVirtualDisplayWidth,
-                    kOriginalDisplayHeight);
+                    kVirtualDisplayWidth * g_renderScale,
+                    kOriginalDisplayHeight * g_renderScale);
+                RenderScaleSetDoubled(g_renderScale == 2);
                 g_virtualDisplayActive = TRUE;
                 SetHudCentering(TRUE);
                 g_widescreenActive = TRUE;
@@ -3048,6 +3321,11 @@ BOOL InstallRoadRashWidescreenHook(LPVOID directDraw)
             ApplyGameFixes(
                 base,
                 GetSettingsPath(settingsPath) ? settingsPath : NULL);
+        }
+
+        if (g_renderScale == 2 && !RenderScaleInstall(base))
+        {
+            g_renderScale = 1;
         }
     }
 

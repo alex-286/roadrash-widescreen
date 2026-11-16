@@ -109,6 +109,7 @@ HqxScale=0       ; hqx/xbr factor: 0 (default) = auto, or 2, 3, 4 (hqx: up to 3)
 Scanlines=0      ; 0 (default) = off, or 1-100 = scanline darkening in percent
 ShowFps=0        ; 0 (default) = off, 1 = show the frame rate during races
 ShowFilter=0     ; 0 (default) = off, 1 = show the active filter's name
+RenderScale=1    ; 1 (default) = 480 lines, 2 = 960 lines (experimental, Filter=none)
 
 [Fixes]
 FixBikeColors=1   ; 1 (default) = Rat and Super bikes in their own colors, 0 = original
@@ -125,6 +126,7 @@ MidiVolumeGuard=1 ; 1 (default) = music volume 0 no longer mutes the game, 0 = o
 | `HqxScale` | Scale factor of the pixel-art filters `hqx` and `xbr` (2, 3 or 4; `hqx` stops at 3); their result is then scaled smoothly to the screen. The automatic choice is the smallest factor that reaches the screen height: 2 up to 960 lines, 3 up to 1440 lines (so at 1080p the 3x result is reduced: supersampling), 4 above, e.g. for 4K. A lower factor is faster. |
 | `Scanlines` | Strength of the scanline effect; 30 to 50 is a good start. |
 | `ShowFps`, `ShowFilter` | On-screen display in the top-left corner, for example `60 FPS  BICUBIC`. |
+| `RenderScale` | Experimental. `2` makes the game's own rasterizer draw the race world at twice the resolution (960 lines, 1712x960 at 16:9), so roads, scenery and riders are sharper; the sky and the cockpit are enlarged from their 480-line art. It uses the `none` filter. On a Windows 98 PC with a Pentium Dual-Core E5800, a frame takes about 5.4 ms of game time at 1920x1080. |
 | `FixBikeColors` | The original game swaps the race colors of the Rat and Super bikes (the shop shows them correctly). The fix swaps the two groups of color tables back. |
 | `SmoothSprites` | In High Resolution mode the game keeps every corner of buildings, riders and cars on an even pixel, so they move in 2-pixel steps (about 4.5 screen pixels at 1080p). The fix uses the full 640x480 precision. |
 | `MidiVolumeGuard` | The game sets its music volume with `midiOutSetVolume`. Since Windows Vista, that call changes the volume of the whole game in the Windows volume mixer, and Windows keeps it, so a music volume of 0 also silenced all sound effects. With the fix, a song at volume 0 is not started at all, as when music is muted. Other volumes are passed on unchanged. |
