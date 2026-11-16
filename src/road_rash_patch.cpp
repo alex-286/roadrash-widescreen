@@ -9,6 +9,7 @@
 #include "fps_overlay.h"
 #include "worker_pool.h"
 #include "sharp_bilinear.h"
+#include "nearest.h"
 #include "resampler.h"
 #include "xbr.h"
 #include "scanlines.h"
@@ -267,6 +268,9 @@ static Resampler g_bicubic;
 static Resampler g_finalScale;
 static DWORD* g_pixelArtFrame = NULL;
 static BOOL g_finalScaleFailed = FALSE;
+// Set when nearest cannot scale to the display size itself; the present
+// then stretches the converted frame.
+static BOOL g_nearestFailed = FALSE;
 // Two staging surfaces take turns, so a frame is never written into the
 // surface the previous present may still be reading.
 static LPVOID g_staging = NULL;
@@ -1619,7 +1623,8 @@ static void GetFilterOutputSize(DWORD filter, DWORD* width, DWORD* height)
     }
 
     // Filters that scale to the display size are presented 1:1.
-    if (filter == kFilterSharpBilinear || filter == kFilterBicubic)
+    if (filter == kFilterSharpBilinear || filter == kFilterBicubic ||
+        (filter == kFilterNearest && NearestIsReady()))
     {
         *width = g_realDisplayWidth;
         *height = g_realDisplayHeight;
@@ -1711,6 +1716,13 @@ static HRESULT CreatePresenterResources(LPVOID directDraw)
         }
     }
 
+    // Room for nearest at the display size, and for the converted frame in
+    // case nearest cannot scale.
+    stagingWidth = g_realDisplayWidth > stagingWidth ? g_realDisplayWidth : stagingWidth;
+    stagingHeight = g_realDisplayHeight > stagingHeight ? g_realDisplayHeight : stagingHeight;
+    stagingWidth = GetFrameWidth() > stagingWidth ? GetFrameWidth() : stagingWidth;
+    stagingHeight = GetFrameHeight() > stagingHeight ? GetFrameHeight() : stagingHeight;
+
     // Room for the unscaled pixel-art output too, in case the final scaling
     // cannot start.
     if (!g_filterUnavailable[kFilterXbr])
@@ -1787,6 +1799,8 @@ static void ReleasePresenterResources()
     HqxUpscalerShutdown();
     XbrShutdown();
     SharpBilinearShutdown();
+    NearestShutdown();
+    g_nearestFailed = FALSE;
     ResamplerShutdown(&g_bicubic);
     ResamplerShutdown(&g_finalScale);
     if (g_pixelArtFrame != NULL)
@@ -1907,6 +1921,21 @@ static BOOL PrepareFilter(DWORD filter)
                 sizeof("Sharp bilinear buffer allocation failed; filter disabled.\r\n") - 1);
             g_filterUnavailable[kFilterSharpBilinear] = TRUE;
             return FALSE;
+        }
+    }
+
+    if (filter == kFilterNearest && !g_nearestFailed && !NearestIsReady())
+    {
+        if (!NearestInitialize(
+                GetFrameWidth(),
+                GetFrameHeight(),
+                g_realDisplayWidth,
+                g_realDisplayHeight))
+        {
+            LogMessage(
+                "Nearest scaling unavailable; the frame is stretched instead.\r\n",
+                sizeof("Nearest scaling unavailable; the frame is stretched instead.\r\n") - 1);
+            g_nearestFailed = TRUE;
         }
     }
 
@@ -2525,6 +2554,7 @@ static HRESULT PresentFilteredFrame(LPVOID primary, FrameTiming* timing)
     {
         filter = kFilterNearest;
         g_activeFilter = kFilterNearest;
+        PrepareFilter(kFilterNearest);
     }
 
     if (ReadGamePalette(palette))
@@ -2660,18 +2690,34 @@ static HRESULT PresentFilteredFrame(LPVOID primary, FrameTiming* timing)
                     stagingPitch);
                 break;
             default:
-                ConvertFrame(
-                    sourcePixels, sourcePitch, stagingPixels, stagingPitch);
+                if (NearestIsReady())
+                {
+                    NearestScale(
+                        sourcePixels,
+                        sourcePitch,
+                        g_paletteRgb,
+                        stagingPixels,
+                        stagingPitch);
+                }
+                else
+                {
+                    ConvertFrame(
+                        sourcePixels, sourcePitch, stagingPixels, stagingPitch);
+                }
                 break;
             }
 
-            ScanlinesApply(
-                stagingPixels,
-                stagingPitch,
-                outputWidth,
-                outputHeight,
-                kOriginalDisplayHeight,
-                g_scanlineStrength);
+            // nearest keeps its plain pixel look without scanlines.
+            if (filter != kFilterNearest)
+            {
+                ScanlinesApply(
+                    stagingPixels,
+                    stagingPitch,
+                    outputWidth,
+                    outputHeight,
+                    kOriginalDisplayHeight,
+                    g_scanlineStrength);
+            }
             if (g_showFps || g_showFilter)
             {
                 FpsOverlayDraw(
