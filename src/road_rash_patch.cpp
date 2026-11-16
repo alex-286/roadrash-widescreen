@@ -200,10 +200,22 @@ static BOOL g_waitForVerticalBlank = TRUE;
 // draw at 480 lines, into the top-left quarter. Uses the 8-bit path only.
 static DWORD g_renderScale = 1;
 
+// The size of the game's frame in the virtual back buffer.
+static DWORD GetFrameWidth()
+{
+    return kVirtualDisplayWidth * g_renderScale;
+}
+
+static DWORD GetFrameHeight()
+{
+    return kOriginalDisplayHeight * g_renderScale;
+}
+
 // RenderScale=2: the HUD is drawn into a 480-line surface and then enlarged
 // over the world; g_hudBefore holds that surface as it was before the HUD
 // was drawn, to find the pixels the HUD changed.
 static LPVOID g_hudSurface = NULL;
+static LPVOID g_hudPalette = NULL;
 static BYTE* g_hudBefore = NULL;
 static DWORD g_hudWidth = 0;
 
@@ -769,14 +781,6 @@ static void ReadVirtualWidthSetting()
         if (GetPrivateProfileIntA("Display", "RenderScale", 1, path) == 2)
         {
             g_renderScale = 2;
-            if (g_filterSetting != kFilterNone)
-            {
-                g_filterSetting = kFilterNone;
-                g_activeFilter = kFilterNone;
-                LogMessage(
-                    "RenderScale=2 is experimental and uses Filter=none.\r\n",
-                    sizeof("RenderScale=2 is experimental and uses Filter=none.\r\n") - 1);
-            }
         }
     }
 
@@ -1444,6 +1448,19 @@ static void AttachGamePaletteToBackBuffer()
     LPVOID palette = reinterpret_cast<LPVOID>(ReadGameDword(kGamePaletteRva));
     HRESULT result;
 
+    // RenderScale=2: GDI draws the HUD text into the HUD surface.
+    if (palette != NULL && palette != g_hudPalette && g_hudSurface != NULL)
+    {
+        result = reinterpret_cast<SurfaceSetPaletteFn>(
+            GetVtable(g_hudSurface)[kSurfaceSetPaletteVtableIndex])(
+                g_hudSurface, palette);
+        g_hudPalette = palette;
+        LogHRESULTResult(
+            "Attached the game palette to the HUD surface=0x",
+            sizeof("Attached the game palette to the HUD surface=0x") - 1,
+            result);
+    }
+
     if (palette == NULL || palette == g_backPalette || g_virtualBack == NULL)
     {
         return;
@@ -1608,8 +1625,8 @@ static void GetFilterOutputSize(DWORD filter, DWORD* width, DWORD* height)
         return;
     }
 
-    *width = kVirtualDisplayWidth;
-    *height = kOriginalDisplayHeight;
+    *width = GetFrameWidth();
+    *height = GetFrameHeight();
 }
 
 // The glyph scale of the FPS overlay, so it appears at about the same size
@@ -1676,6 +1693,11 @@ static HRESULT CreatePresenterResources(LPVOID directDraw)
         DWORD width;
         DWORD height;
 
+        if (g_filterUnavailable[filter])
+        {
+            continue;
+        }
+
         GetFilterOutputSize(filter, &width, &height);
         if (width > stagingWidth)
         {
@@ -1690,6 +1712,7 @@ static HRESULT CreatePresenterResources(LPVOID directDraw)
 
     // Room for the unscaled pixel-art output too, in case the final scaling
     // cannot start.
+    if (!g_filterUnavailable[kFilterXbr])
     {
         DWORD width;
         DWORD height;
@@ -1861,8 +1884,8 @@ static BOOL PrepareFilter(DWORD filter)
     if (filter == kFilterSharpBilinear && !SharpBilinearIsReady())
     {
         if (!SharpBilinearInitialize(
-                kVirtualDisplayWidth,
-                kOriginalDisplayHeight,
+                GetFrameWidth(),
+                GetFrameHeight(),
                 g_realDisplayWidth,
                 g_realDisplayHeight))
         {
@@ -1884,8 +1907,8 @@ static BOOL PrepareFilter(DWORD filter)
         if (!ResamplerInitialize(
                 &g_bicubic,
                 kResamplerBicubic,
-                kVirtualDisplayWidth,
-                kOriginalDisplayHeight,
+                GetFrameWidth(),
+                GetFrameHeight(),
                 g_realDisplayWidth,
                 g_realDisplayHeight))
         {
@@ -1909,12 +1932,14 @@ static void ConvertFrame(
 {
     DWORD row;
     DWORD column;
+    DWORD width = GetFrameWidth();
+    DWORD height = GetFrameHeight();
 
-    for (row = 0; row < kOriginalDisplayHeight; ++row)
+    for (row = 0; row < height; ++row)
     {
         DWORD* output = reinterpret_cast<DWORD*>(destination);
 
-        for (column = 0; column < kVirtualDisplayWidth; ++column)
+        for (column = 0; column < width; ++column)
         {
             output[column] = g_paletteRgb[source[column]];
         }
@@ -2041,9 +2066,18 @@ static HRESULT CreateVirtualPrimary(
         LPVOID hudSurface = NULL;
         HRESULT hudResult;
 
+        // Like the back buffer: 8-bit palettized also under the 32-bit
+        // presenter, because the game draws palette indices into it.
         BuildOffscreenDescription(
             hudDescription, kVirtualDisplayWidth, kOriginalDisplayHeight);
-        SetSystemMemoryCaps(hudDescription);
+        if (g_presenterDisplayActive)
+        {
+            SetIndexedSystemMemoryFormat(hudDescription);
+        }
+        else
+        {
+            SetSystemMemoryCaps(hudDescription);
+        }
         hudResult = g_hookState.originalCreateSurface(
             directDraw, hudDescription, &hudSurface, NULL);
         g_hudBefore = static_cast<BYTE*>(VirtualAlloc(
@@ -2099,6 +2133,7 @@ static ULONG WINAPI HookedSurfaceRelease(LPVOID surface)
         g_virtualPrimary = NULL;
         g_virtualBack = NULL;
         g_hudSurface = NULL;
+        g_hudPalette = NULL;
         if (hud != NULL)
         {
             g_originalSurfaceRelease(hud);
@@ -3326,6 +3361,22 @@ BOOL InstallRoadRashWidescreenHook(LPVOID directDraw)
         if (g_renderScale == 2 && !RenderScaleInstall(base))
         {
             g_renderScale = 1;
+        }
+
+        // hqx and xbr enlarge pixel art on its original 480-line grid,
+        // which a 960-line frame no longer has.
+        if (g_renderScale == 2)
+        {
+            g_filterUnavailable[kFilterHqx] = TRUE;
+            g_filterUnavailable[kFilterXbr] = TRUE;
+            if (g_filterSetting == kFilterHqx || g_filterSetting == kFilterXbr)
+            {
+                g_filterSetting = kFilterSharpBilinear;
+                g_activeFilter = kFilterSharpBilinear;
+                LogMessage(
+                    "RenderScale=2: hqx and xbr are not available; using sharp-bilinear.\r\n",
+                    sizeof("RenderScale=2: hqx and xbr are not available; using sharp-bilinear.\r\n") - 1);
+            }
         }
     }
 
