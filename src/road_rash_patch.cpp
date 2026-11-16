@@ -2,6 +2,7 @@
 // Copyright (C) 2026 Alexander Schmidt
 
 #include "road_rash_patch.h"
+#include "game_fixes.h"
 #include "hqx_upscaler.h"
 #include "fps_overlay.h"
 #include "worker_pool.h"
@@ -662,11 +663,35 @@ static DWORD ReadFilterSetting(const CHAR* path)
     return kFilterNone;
 }
 
+// The settings file next to ROADRASH.EXE. Returns FALSE when its path does
+// not fit; the defaults are used then.
+static BOOL GetSettingsPath(CHAR* path)
+{
+    DWORD length = GetModuleFileNameA(NULL, path, MAX_PATH);
+    static const CHAR fileName[] = "RoadRashWidescreen.ini";
+
+    if (length == 0 || length >= MAX_PATH)
+    {
+        return FALSE;
+    }
+
+    while (length > 0 && path[length - 1] != '\\')
+    {
+        --length;
+    }
+
+    if (length == 0 || length + sizeof(fileName) > MAX_PATH)
+    {
+        return FALSE;
+    }
+
+    lstrcpyA(path + length, fileName);
+    return TRUE;
+}
+
 static void ReadVirtualWidthSetting()
 {
     CHAR path[MAX_PATH];
-    DWORD length = GetModuleFileNameA(NULL, path, MAX_PATH);
-    static const CHAR fileName[] = "RoadRashWidescreen.ini";
     typedef BOOL (WINAPI *SetProcessDPIAwareFn)(void);
     SetProcessDPIAwareFn setDpiAware;
     DWORD width;
@@ -684,14 +709,8 @@ static void ReadVirtualWidthSetting()
     displayWidth = GetSystemMetrics(SM_CXSCREEN);
     displayHeight = GetSystemMetrics(SM_CYSCREEN);
 
-    while (length > 0 && path[length - 1] != '\\')
+    if (GetSettingsPath(path))
     {
-        --length;
-    }
-
-    if (length != 0 && length + sizeof(fileName) <= MAX_PATH)
-    {
-        lstrcpyA(path + length, fileName);
         g_waitForVerticalBlank = GetPrivateProfileIntA(
             "Display", "WaitForVBlank", 1, path) != 0;
         g_filterSetting = ReadFilterSetting(path);
@@ -3022,6 +3041,14 @@ BOOL InstallRoadRashWidescreenHook(LPVOID directDraw)
         LogMessage(
             "Recognized the supported Road Rash German 1.0A executable.\r\n",
             sizeof("Recognized the supported Road Rash German 1.0A executable.\r\n") - 1);
+
+        {
+            CHAR settingsPath[MAX_PATH];
+
+            ApplyGameFixes(
+                base,
+                GetSettingsPath(settingsPath) ? settingsPath : NULL);
+        }
     }
 
     if (g_hookState.object == directDraw)

@@ -32,6 +32,9 @@ Top: `hqx` with `Scanlines=35`; bottom: `nearest`.</sub>
 - **No tearing:** waits for the vertical blank before each frame (can be
   turned off).
 - **FPS and filter display:** optional on-screen frame rate and filter name.
+- **Game fixes:** the Rat and Super bikes race in their own colors, objects
+  move smoothly in 1-pixel steps, and a music volume of 0 no longer mutes the
+  whole game on newer Windows. Each fix can be turned off.
 - **Screenshots:** **F12** saves exactly what is on screen, at full
   resolution with the filter applied.
 - **Multi-core:** filters spread their work across up to 8 CPU cores.
@@ -106,6 +109,11 @@ HqxScale=0       ; hqx/xbr factor: 0 (default) = auto, or 2, 3, 4 (hqx: up to 3)
 Scanlines=0      ; 0 (default) = off, or 1-100 = scanline darkening in percent
 ShowFps=0        ; 0 (default) = off, 1 = show the frame rate during races
 ShowFilter=0     ; 0 (default) = off, 1 = show the active filter's name
+
+[Fixes]
+FixBikeColors=1   ; 1 (default) = Rat and Super bikes in their own colors, 0 = original
+SmoothSprites=1   ; 1 (default) = objects move in 1-pixel steps in HiRes, 0 = original
+MidiVolumeGuard=1 ; 1 (default) = music volume 0 no longer mutes the game, 0 = original
 ```
 
 | Setting | Description |
@@ -117,6 +125,9 @@ ShowFilter=0     ; 0 (default) = off, 1 = show the active filter's name
 | `HqxScale` | Scale factor of the pixel-art filters `hqx` and `xbr` (2, 3 or 4; `hqx` stops at 3); their result is then scaled smoothly to the screen. The automatic choice is the smallest factor that reaches the screen height: 2 up to 960 lines, 3 up to 1440 lines (so at 1080p the 3x result is reduced: supersampling), 4 above, e.g. for 4K. A lower factor is faster. |
 | `Scanlines` | Strength of the scanline effect; 30 to 50 is a good start. |
 | `ShowFps`, `ShowFilter` | On-screen display in the top-left corner, for example `60 FPS  BICUBIC`. |
+| `FixBikeColors` | The original game swaps the race colors of the Rat and Super bikes (the shop shows them correctly). The fix swaps the two groups of color tables back. |
+| `SmoothSprites` | In High Resolution mode the game keeps every corner of buildings, riders and cars on an even pixel, so they move in 2-pixel steps (about 4.5 screen pixels at 1080p). The fix uses the full 640x480 precision. |
+| `MidiVolumeGuard` | The game sets its music volume with `midiOutSetVolume`. Since Windows Vista, that call changes the volume of the whole game in the Windows volume mixer, and Windows keeps it, so a music volume of 0 also silenced all sound effects. With the fix, a song at volume 0 is not started at all, as when music is muted. Other volumes are passed on unchanged. |
 
 ## Filters
 

@@ -80,6 +80,19 @@ RoadRashWidescreen.log and, if present, the screenshots
 RoadRashScreen001.bmp, ... and RoadRashFrame.bmp.
 
 
+Game fixes
+----------
+
+The patch also repairs some faults of the original game. Each can be
+turned off in the [Fixes] section of RoadRashWidescreen.ini.
+
+- The Rat and Super bikes race in their own colors, as in the shop.
+- Buildings, riders and cars move smoothly in High Resolution mode instead
+  of in steps of 2 pixels.
+- On Windows Vista and newer, a music volume of 0 no longer mutes all other
+  sound of the game.
+
+
 Hotkeys during a race
 ---------------------
 
