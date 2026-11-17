@@ -181,7 +181,7 @@ BOOL RenderScaleInstall(DWORD gameBase)
     }
 
     g_scaleInstalled = TRUE;
-    LogScale("RenderScale=2 (experimental): the world rasterizer accepts 960 lines.");
+    LogScale("RenderScale=2: the world rasterizer accepts 960 lines.");
     return TRUE;
 }
 

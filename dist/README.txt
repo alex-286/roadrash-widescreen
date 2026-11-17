@@ -4,7 +4,8 @@ Road Rash Widescreen Patch
 A widescreen patch for the Windows 95 version of Road Rash. It runs the
 game at the native resolution of your monitor with a view that matches its
 aspect ratio, so you see more of the road instead of a stretched 4:3
-picture. Optional filters smooth the classic graphics on modern displays.
+picture. Races are drawn at twice the original resolution (960 lines), and
+optional filters smooth the classic graphics on modern displays.
 
 On Windows XP and newer, the patch changes nothing on disk: delete
 ddraw.dll and the game is back to normal. On Windows 95/98/ME, a small tool
@@ -118,8 +119,8 @@ problem.
   for the recognized game version.
 - A filter is set but not used: the 32-bit display mode is not available at
   your resolution; the log says so and the game runs in 8-bit mode.
-- Low frame rate with a filter: try Filter=sharp-bilinear, HqxScale=2, or
-  Filter=none.
+- Low frame rate with a filter: try Filter=sharp-bilinear, HqxScale=2,
+  WaitForVBlank=0, RenderScale=1 or Filter=none.
 
 
 License

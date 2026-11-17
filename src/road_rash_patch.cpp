@@ -196,13 +196,14 @@ static DWORD g_flipLogCount = 0;
 static DWORD g_displayModeLogCount = 0;
 static BOOL g_nativeDisplayModesLogged = FALSE;
 static BOOL g_waitForVerticalBlank = TRUE;
-// DirectPresent=1: filters write straight into the primary surface.
-static BOOL g_directPresent = FALSE;
+// DirectPresent=1 (default): filters write straight into the primary surface.
+static BOOL g_directPresent = TRUE;
 
-// Experimental (RenderScale=2): the world is drawn at twice the 480-line
-// resolution into a back buffer of twice the size. The sky and the HUD still
-// draw at 480 lines, into the top-left quarter. Uses the 8-bit path only.
-static DWORD g_renderScale = 1;
+// RenderScale=2 (default): the world is drawn at twice the 480-line
+// resolution into a back buffer of twice the size; the sky and the HUD are
+// enlarged into it from their 480-line art. 1 when RenderScale=1 or when the
+// rasterizer could not be prepared.
+static DWORD g_renderScale = 2;
 
 // The size of the game's frame in the virtual back buffer.
 static DWORD GetFrameWidth()
@@ -749,7 +750,7 @@ static void ReadVirtualWidthSetting()
         g_waitForVerticalBlank = GetPrivateProfileIntA(
             "Display", "WaitForVBlank", 1, path) != 0;
         g_directPresent = GetPrivateProfileIntA(
-            "Display", "DirectPresent", 0, path) != 0;
+            "Display", "DirectPresent", 1, path) != 0;
         g_filterSetting = ReadFilterSetting(path);
         g_activeFilter = g_filterSetting;
         g_showFps = GetPrivateProfileIntA(
@@ -787,10 +788,8 @@ static void ReadVirtualWidthSetting()
             g_virtualWidthOverride = width;
         }
 
-        if (GetPrivateProfileIntA("Display", "RenderScale", 1, path) == 2)
-        {
-            g_renderScale = 2;
-        }
+        g_renderScale = GetPrivateProfileIntA(
+            "Display", "RenderScale", 2, path) == 1 ? 1 : 2;
     }
 
     if (displayWidth < kOriginalDisplayWidth ||

@@ -6,8 +6,8 @@
 
 #include <windows.h>
 
-// Experimental: lets the game's own world rasterizer draw at twice the
-// HiRes resolution (960 lines). See render_scale.cpp.
+// Lets the game's own world rasterizer draw at twice the HiRes resolution
+// (960 lines). See render_scale.cpp.
 
 // Prepares the rasterizer for up to 960 lines. Call once, after the
 // executable was recognized. Returns FALSE (and changes nothing) when the

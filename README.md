@@ -24,6 +24,9 @@ Top: `hqx` with `Scanlines=35`; bottom: `nearest`.</sub>
 - **Native resolution, true widescreen:** the game renders a 480-line view as
   wide as your display's aspect ratio (856x480 for 16:9, 1120x480 for 21:9),
   which is scaled to the full screen. Uses the desktop resolution by default.
+- **Twice the resolution:** the race world is drawn at 960 lines (1712x960
+  at 16:9) by the game's own renderer, for sharper roads, scenery and
+  riders, also on Windows 98.
 - **Fixed HUD and sky:** the cockpit, gauges and messages stay centered, and
   the sky panorama fills the whole width.
 - **Display filters:** optional `nearest`, `hqx`, `xbr`, `sharp-bilinear` and
@@ -106,10 +109,11 @@ VirtualWidth=0   ; 0 (default) = fit the display's aspect ratio, or 640-1280
 WaitForVBlank=1  ; 1 (default) = wait for vertical blank, 0 = no wait
 Filter=none      ; none (default), nearest, hqx, xbr, sharp-bilinear, bicubic
 HqxScale=0       ; hqx/xbr factor: 0 (default) = auto, or 2, 3, 4 (hqx: up to 3)
+DirectPresent=1  ; 1 (default) = filters write into the screen, 0 = copy each frame
 Scanlines=0      ; 0 (default) = off, or 1-100 = scanline darkening in percent
 ShowFps=0        ; 0 (default) = off, 1 = show the frame rate during races
 ShowFilter=0     ; 0 (default) = off, 1 = show the active filter's name
-RenderScale=1    ; 1 (default) = 480 lines, 2 = 960 lines (experimental)
+RenderScale=2    ; 2 (default) = race world at 960 lines, 1 = the original 480 lines
 
 [Fixes]
 FixBikeColors=1   ; 1 (default) = Rat and Super bikes in their own colors, 0 = original
@@ -124,17 +128,18 @@ MidiVolumeGuard=1 ; 1 (default) = music volume 0 no longer mutes the game, 0 = o
 | `WaitForVBlank` | Prevents tearing, but limits the frame rate to the monitor's refresh rate. |
 | `Filter` | The display filter, see [Filters](#filters). `none` keeps the game's original 8-bit display mode. |
 | `HqxScale` | Scale factor of the pixel-art filters `hqx` and `xbr` (2, 3 or 4; `hqx` stops at 3); their result is then scaled smoothly to the screen. The automatic choice is the smallest factor that reaches the screen height: 2 up to 960 lines, 3 up to 1440 lines (so at 1080p the 3x result is reduced: supersampling), 4 above, e.g. for 4K. A lower factor is faster. |
+| `DirectPresent` | Only for the filters other than `none`. With `1`, a filter whose output has the screen size writes straight into the screen surface after the vertical blank, instead of into system memory that is then copied to the graphics card. That copy took 8 ms per frame at 1920x1080 on a Windows 98 PC. While `Scanlines` are on (which read the frame back), frames are still copied, except with `nearest`. If the screen surface cannot be locked, the frame is copied as with `0`. |
 | `Scanlines` | Strength of the scanline effect; 30 to 50 is a good start. |
 | `ShowFps`, `ShowFilter` | On-screen display in the top-left corner, for example `60 FPS  BICUBIC`. |
-| `RenderScale` | Experimental. `2` makes the game's own rasterizer draw the race world at twice the resolution (960 lines, 1712x960 at 16:9), so roads, scenery and riders are sharper; the sky and the cockpit are enlarged from their 480-line art. It works with `none`, `nearest`, `sharp-bilinear` (recommended) and `bicubic`; `hqx` and `xbr` are made for the 480-line pixel grid, so they fall back to `sharp-bilinear` and F11 skips them. On a Windows 98 PC with a Pentium Dual-Core E5800 at 1920x1080, `none` runs at 59 fps (5.4 ms of game time per frame), while `sharp-bilinear` (19 fps) and `bicubic` (12 fps) are too slow there, so use `none` on such PCs. |
+| `RenderScale` | `2` (default) makes the game's own rasterizer draw the race world at twice the resolution (960 lines, 1712x960 at 16:9), so roads, scenery and riders are sharper; the sky and the cockpit are enlarged from their 480-line art. It works with `none`, `nearest`, `sharp-bilinear` and `bicubic`. `hqx` and `xbr` are made for the original 480-line pixel grid, so with `2` they fall back to `sharp-bilinear` and F11 skips them; set `RenderScale=1` to use them. On a Windows 98 PC with a Pentium Dual-Core E5800 at 1920x1080, `none` runs at 59 fps (5.4 ms of game time per frame); with `WaitForVBlank=0`, `nearest` reaches 59 fps, `sharp-bilinear` 44 and `bicubic` 28. |
 | `FixBikeColors` | The original game swaps the race colors of the Rat and Super bikes (the shop shows them correctly). The fix swaps the two groups of color tables back. |
 | `SmoothSprites` | In High Resolution mode the game keeps every corner of buildings, riders and cars on an even pixel, so they move in 2-pixel steps (about 4.5 screen pixels at 1080p). The fix uses the full 640x480 precision. |
 | `MidiVolumeGuard` | The game sets its music volume with `midiOutSetVolume`. Since Windows Vista, that call changes the volume of the whole game in the Windows volume mixer, and Windows keeps it, so a music volume of 0 also silenced all sound effects. With the fix, a song at volume 0 is not started at all, as when music is muted. Other volumes are passed on unchanged. |
 
 ## Filters
 
-The game draws at 480 lines, so the picture is always enlarged. A filter
-decides how:
+The game draws at 960 lines (`RenderScale=2`) or 480 lines, so the picture
+is always enlarged. A filter decides how:
 
 | Filter | Look | Best for |
 |---|---|---|
@@ -175,7 +180,7 @@ single-core CPU such as a Pentium 4, `sharp-bilinear` is the fastest choice;
 | Key | Action |
 |---|---|
 | **F11** | Cycle through the display filters (during a race, with a filter enabled). |
-| **F12** | Save a screenshot of the screen as `RoadRashScreen001.bmp`, `002`, ... in the game folder. It shows exactly what is displayed, including filter, scanlines and on-screen display. The game's unscaled 856x480 frame is also saved as `RoadRashFrame.bmp` (replaced each time). |
+| **F12** | Save a screenshot of the screen as `RoadRashScreen001.bmp`, `002`, ... in the game folder. It shows exactly what is displayed, including filter, scanlines and on-screen display. The game's unscaled frame (1712x960 at 16:9 with `RenderScale=2`) is also saved as `RoadRashFrame.bmp` (replaced each time). |
 
 ## Troubleshooting
 
@@ -193,7 +198,7 @@ Please attach it when reporting a problem.
 - **No filter, although one is set:** the 32-bit display mode is not available
   at your resolution; the log says so and the game runs in 8-bit mode.
 - **Low frame rate with a filter:** try `sharp-bilinear`, a lower `HqxScale`,
-  or `Filter=none`.
+  `WaitForVBlank=0`, `RenderScale=1` or `Filter=none`.
 
 ## Building
 
@@ -229,8 +234,10 @@ The script also assembles the release package in `build\release\`: the DLL
 - The proxy forwards all DirectDraw calls to the system's `ddraw.dll` and
   patches only the supported Road Rash executable, in memory.
 - When a race starts, the display is set to the native resolution while the
-  game renders into a wider 480-line buffer, which is scaled to the screen on
-  every frame. Two game routines are redirected while racing: the HUD is
+  game renders into a wider 960-line (or 480-line) buffer, which is scaled to
+  the screen on every frame. For 960 lines, the game's own rasterizer gets
+  larger edge tables and converts its 3D coordinates at twice the scale; the
+  sky and the HUD exist as 480-line art and are enlarged into the frame. Two game routines are redirected while racing: the HUD is
   drawn centered, and the sky panorama is tiled across the whole width. Both
   are restored when returning to the menu.
 - With a filter, the display runs at 32 bits per pixel. The game keeps
