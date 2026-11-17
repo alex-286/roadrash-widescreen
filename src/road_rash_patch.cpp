@@ -196,6 +196,8 @@ static DWORD g_flipLogCount = 0;
 static DWORD g_displayModeLogCount = 0;
 static BOOL g_nativeDisplayModesLogged = FALSE;
 static BOOL g_waitForVerticalBlank = TRUE;
+// DirectPresent=1: filters write straight into the primary surface.
+static BOOL g_directPresent = FALSE;
 
 // Experimental (RenderScale=2): the world is drawn at twice the 480-line
 // resolution into a back buffer of twice the size. The sky and the HUD still
@@ -746,6 +748,8 @@ static void ReadVirtualWidthSetting()
     {
         g_waitForVerticalBlank = GetPrivateProfileIntA(
             "Display", "WaitForVBlank", 1, path) != 0;
+        g_directPresent = GetPrivateProfileIntA(
+            "Display", "DirectPresent", 0, path) != 0;
         g_filterSetting = ReadFilterSetting(path);
         g_activeFilter = g_filterSetting;
         g_showFps = GetPrivateProfileIntA(
@@ -2537,13 +2541,26 @@ static void RecordFrameTiming(DWORD slot, const FrameTiming* timing)
 
 // Converts the 8-bit virtual frame to 32 bits through the game palette,
 // applies the active filter, and stretches the result onto the primary.
+//
+// With DirectPresent=1, a filter whose output has the display size writes
+// straight into the locked primary after the vertical blank, which saves
+// copying the frame from system memory to the graphics card (8 ms per
+// frame at 1920x1080 on a Windows 98 PC). Filtering top to bottom faster
+// than the display refreshes stays ahead of the beam, so it does not tear.
+// Scanlines read the frame back, which is slow from video memory, so they
+// keep the staging surface.
 static HRESULT PresentFilteredFrame(LPVOID primary, FrameTiming* timing)
 {
     BYTE palette[1024];
     BYTE backDescription[kDdsurfaceDescSize];
-    BYTE stagingDescription[kDdsurfaceDescSize];
+    BYTE outputDescription[kDdsurfaceDescSize];
     LPVOID* backVtable = GetVtable(g_virtualBack);
-    LPVOID* stagingVtable = GetVtable(g_staging);
+    LPVOID output = g_staging;
+    DWORD outputLockFlags = kDdlockWait | kDdlockWriteOnly;
+    BOOL direct = FALSE;
+    BOOL paletteValid;
+    LARGE_INTEGER waitBegin;
+    LARGE_INTEGER waitEnd;
     DWORD filter = g_activeFilter;
     DWORD outputWidth;
     DWORD outputHeight;
@@ -2557,7 +2574,8 @@ static HRESULT PresentFilteredFrame(LPVOID primary, FrameTiming* timing)
         PrepareFilter(kFilterNearest);
     }
 
-    if (ReadGamePalette(palette))
+    paletteValid = ReadGamePalette(palette);
+    if (paletteValid)
     {
         DWORD index;
 
@@ -2576,6 +2594,17 @@ static HRESULT PresentFilteredFrame(LPVOID primary, FrameTiming* timing)
     }
 
     GetFilterOutputSize(filter, &outputWidth, &outputHeight);
+    if (g_directPresent &&
+        outputWidth == g_realDisplayWidth &&
+        outputHeight == g_realDisplayHeight &&
+        (g_scanlineStrength == 0 || filter == kFilterNearest))
+    {
+        direct = TRUE;
+        output = primary;
+        QueryPerformanceCounter(&waitBegin);
+        WaitBeforePresent();
+        QueryPerformanceCounter(&waitEnd);
+    }
 
     AttachGamePaletteToBackBuffer();
     ZeroDescription(backDescription);
@@ -2585,25 +2614,78 @@ static HRESULT PresentFilteredFrame(LPVOID primary, FrameTiming* timing)
             g_virtualBack, NULL, backDescription, kDdlockWait, NULL);
     if (SUCCEEDED(result))
     {
-        ZeroDescription(stagingDescription);
-        *DescriptionDword(stagingDescription, 0) = kDdsurfaceDescSize;
+        ZeroDescription(outputDescription);
+        *DescriptionDword(outputDescription, 0) = kDdsurfaceDescSize;
         result = reinterpret_cast<SurfaceLockFn>(
-            stagingVtable[kSurfaceLockVtableIndex])(
-                g_staging,
+            GetVtable(output)[kSurfaceLockVtableIndex])(
+                output,
                 NULL,
-                stagingDescription,
-                kDdlockWait | kDdlockWriteOnly,
+                outputDescription,
+                outputLockFlags,
                 NULL);
+        if (FAILED(result) && direct)
+        {
+            static DWORD directFailures = 0;
+
+            // This frame goes through the staging surface instead.
+            if (directFailures < 4)
+            {
+                ++directFailures;
+                LogHRESULTResult(
+                    "DirectPresent: Lock on the primary failed=0x",
+                    sizeof("DirectPresent: Lock on the primary failed=0x") - 1,
+                    result);
+            }
+
+            direct = FALSE;
+            output = g_staging;
+            ZeroDescription(outputDescription);
+            *DescriptionDword(outputDescription, 0) = kDdsurfaceDescSize;
+            result = reinterpret_cast<SurfaceLockFn>(
+                GetVtable(output)[kSurfaceLockVtableIndex])(
+                    output,
+                    NULL,
+                    outputDescription,
+                    outputLockFlags,
+                    NULL);
+        }
         if (SUCCEEDED(result))
         {
             const BYTE* sourcePixels = *reinterpret_cast<BYTE**>(
                 backDescription + kDdsurfaceDescSurfaceOffset);
             LONG sourcePitch = *reinterpret_cast<LONG*>(
                 backDescription + kDdsurfaceDescPitchOffset);
-            BYTE* stagingPixels = *reinterpret_cast<BYTE**>(
-                stagingDescription + kDdsurfaceDescSurfaceOffset);
-            LONG stagingPitch = *reinterpret_cast<LONG*>(
-                stagingDescription + kDdsurfaceDescPitchOffset);
+            BYTE* outputPixels = *reinterpret_cast<BYTE**>(
+                outputDescription + kDdsurfaceDescSurfaceOffset);
+            LONG outputPitch = *reinterpret_cast<LONG*>(
+                outputDescription + kDdsurfaceDescPitchOffset);
+
+            // Writing into the visible screen, an overlay drawn after the
+            // filter would be missing for most of the frame and flicker. It
+            // goes into the game's frame instead (which the game redraws
+            // completely every frame) and is filtered with it.
+            if (direct && (g_showFps || g_showFilter))
+            {
+                DWORD white = 255;
+                DWORD black = 0;
+
+                if (paletteValid)
+                {
+                    FpsOverlayPickColors(palette, &white, &black);
+                }
+
+                FpsOverlayDraw(
+                    const_cast<BYTE*>(sourcePixels),
+                    sourcePitch,
+                    GetFrameWidth(),
+                    GetFrameHeight(),
+                    1,
+                    g_renderScale,
+                    white,
+                    black,
+                    g_showFps,
+                    g_showFilter ? kFilterNames[filter] : NULL);
+            }
 
             switch (filter)
             {
@@ -2614,8 +2696,8 @@ static HRESULT PresentFilteredFrame(LPVOID primary, FrameTiming* timing)
                 // size, or straight into the staging surface when the
                 // present stretches it.
                 BOOL finalScale = UsesFinalScale(filter);
-                BYTE* target = stagingPixels;
-                LONG targetPitch = stagingPitch;
+                BYTE* target = outputPixels;
+                LONG targetPitch = outputPitch;
                 DWORD width;
                 DWORD height;
 
@@ -2631,8 +2713,8 @@ static HRESULT PresentFilteredFrame(LPVOID primary, FrameTiming* timing)
                             &g_finalScale,
                             XbrRow,
                             NULL,
-                            stagingPixels,
-                            stagingPitch);
+                            outputPixels,
+                            outputPitch);
                     }
 
                     break;
@@ -2666,8 +2748,8 @@ static HRESULT PresentFilteredFrame(LPVOID primary, FrameTiming* timing)
                         &g_finalScale,
                         target,
                         targetPitch,
-                        stagingPixels,
-                        stagingPitch);
+                        outputPixels,
+                        outputPitch);
                 }
 
                 break;
@@ -2677,8 +2759,8 @@ static HRESULT PresentFilteredFrame(LPVOID primary, FrameTiming* timing)
                     sourcePixels,
                     sourcePitch,
                     g_paletteRgb,
-                    stagingPixels,
-                    stagingPitch);
+                    outputPixels,
+                    outputPitch);
                 break;
             case kFilterBicubic:
                 ResamplerScaleIndexed(
@@ -2686,8 +2768,8 @@ static HRESULT PresentFilteredFrame(LPVOID primary, FrameTiming* timing)
                     sourcePixels,
                     sourcePitch,
                     g_paletteRgb,
-                    stagingPixels,
-                    stagingPitch);
+                    outputPixels,
+                    outputPitch);
                 break;
             default:
                 if (NearestIsReady())
@@ -2696,13 +2778,13 @@ static HRESULT PresentFilteredFrame(LPVOID primary, FrameTiming* timing)
                         sourcePixels,
                         sourcePitch,
                         g_paletteRgb,
-                        stagingPixels,
-                        stagingPitch);
+                        outputPixels,
+                        outputPitch);
                 }
                 else
                 {
                     ConvertFrame(
-                        sourcePixels, sourcePitch, stagingPixels, stagingPitch);
+                        sourcePixels, sourcePitch, outputPixels, outputPitch);
                 }
                 break;
             }
@@ -2711,18 +2793,18 @@ static HRESULT PresentFilteredFrame(LPVOID primary, FrameTiming* timing)
             if (filter != kFilterNearest)
             {
                 ScanlinesApply(
-                    stagingPixels,
-                    stagingPitch,
+                    outputPixels,
+                    outputPitch,
                     outputWidth,
                     outputHeight,
                     kOriginalDisplayHeight,
                     g_scanlineStrength);
             }
-            if (g_showFps || g_showFilter)
+            if (!direct && (g_showFps || g_showFilter))
             {
                 FpsOverlayDraw(
-                    stagingPixels,
-                    stagingPitch,
+                    outputPixels,
+                    outputPitch,
                     outputWidth,
                     outputHeight,
                     4,
@@ -2734,7 +2816,7 @@ static HRESULT PresentFilteredFrame(LPVOID primary, FrameTiming* timing)
             }
 
             reinterpret_cast<SurfaceUnlockFn>(
-                stagingVtable[kSurfaceUnlockVtableIndex])(g_staging, NULL);
+                GetVtable(output)[kSurfaceUnlockVtableIndex])(output, NULL);
         }
 
         reinterpret_cast<SurfaceUnlockFn>(
@@ -2748,6 +2830,21 @@ static HRESULT PresentFilteredFrame(LPVOID primary, FrameTiming* timing)
             "Frame conversion skipped; Lock failed=0x",
             sizeof("Frame conversion skipped; Lock failed=0x") - 1,
             result);
+    }
+
+    if (direct)
+    {
+        LARGE_INTEGER done;
+
+        // Everything but the wait counts as conversion; nothing is left
+        // to present.
+        QueryPerformanceCounter(&done);
+        timing->converted.QuadPart = timing->start.QuadPart +
+            (done.QuadPart - timing->start.QuadPart) -
+            (waitEnd.QuadPart - waitBegin.QuadPart);
+        timing->waited = done;
+        timing->presented = done;
+        return result;
     }
 
     source.left = 0;
@@ -2804,10 +2901,10 @@ static void DrawOverlayOnBackBuffer()
     FpsOverlayDraw(
         *reinterpret_cast<BYTE**>(description + kDdsurfaceDescSurfaceOffset),
         *reinterpret_cast<LONG*>(description + kDdsurfaceDescPitchOffset),
-        kVirtualDisplayWidth,
-        kOriginalDisplayHeight,
+        GetFrameWidth(),
+        GetFrameHeight(),
         1,
-        1,
+        g_renderScale,
         white,
         black,
         g_showFps,

@@ -17,10 +17,16 @@ struct ScaleJob
     LONG destinationPitch;
 };
 
+static const DWORD kMaxParts = 8;
+
 static DWORD g_destinationWidth = 0;
 static DWORD g_destinationHeight = 0;
 static DWORD* g_columns = NULL;
 static DWORD* g_rows = NULL;
+// One converted row per worker part. Output rows are copied from it, never
+// from the destination, which may be video memory (slow to read).
+static DWORD* g_rowBuffers[kMaxParts];
+static DWORD g_partCount = 0;
 
 static void* Allocate(DWORD bytes)
 {
@@ -61,38 +67,49 @@ static DWORD* BuildAxis(DWORD source, DWORD destination)
 static void ScaleTask(DWORD part, DWORD parts, void* context)
 {
     const ScaleJob* job = reinterpret_cast<const ScaleJob*>(context);
-    DWORD first = g_destinationHeight * part / parts;
-    DWORD last = g_destinationHeight * (part + 1) / parts;
+    DWORD first;
+    DWORD last;
     DWORD row;
+    DWORD* buffer;
+    LONG converted = -1;
 
+    if (part >= g_partCount)
+    {
+        return;
+    }
+
+    if (parts > g_partCount)
+    {
+        parts = g_partCount;
+    }
+
+    first = g_destinationHeight * part / parts;
+    last = g_destinationHeight * (part + 1) / parts;
+    buffer = g_rowBuffers[part];
     for (row = first; row < last; ++row)
     {
-        DWORD* output = reinterpret_cast<DWORD*>(
-            job->destination + static_cast<LONG>(row) * job->destinationPitch);
-        const BYTE* line;
-        const DWORD* columns;
-        const DWORD* rgb;
-        DWORD column;
-
-        // A row from the same source row as the previous one is a copy.
-        if (row > first && g_rows[row] == g_rows[row - 1])
+        // Consecutive rows from the same source row reuse the buffer.
+        if (static_cast<LONG>(g_rows[row]) != converted)
         {
-            __movsd(
-                reinterpret_cast<unsigned long*>(output),
-                reinterpret_cast<const unsigned long*>(
-                    job->destination +
-                        static_cast<LONG>(row - 1) * job->destinationPitch),
-                g_destinationWidth);
-            continue;
+            const BYTE* line = job->source +
+                static_cast<LONG>(g_rows[row]) * job->sourcePitch;
+            const DWORD* columns = g_columns;
+            const DWORD* rgb = job->rgb;
+            DWORD column;
+
+            for (column = 0; column < g_destinationWidth; ++column)
+            {
+                buffer[column] = rgb[line[columns[column]]];
+            }
+
+            converted = static_cast<LONG>(g_rows[row]);
         }
 
-        line = job->source + static_cast<LONG>(g_rows[row]) * job->sourcePitch;
-        columns = g_columns;
-        rgb = job->rgb;
-        for (column = 0; column < g_destinationWidth; ++column)
-        {
-            output[column] = rgb[line[columns[column]]];
-        }
+        __movsd(
+            reinterpret_cast<unsigned long*>(
+                job->destination + static_cast<LONG>(row) * job->destinationPitch),
+            reinterpret_cast<const unsigned long*>(buffer),
+            g_destinationWidth);
     }
 }
 
@@ -102,6 +119,9 @@ BOOL NearestInitialize(
     DWORD destinationWidth,
     DWORD destinationHeight)
 {
+    DWORD count;
+    DWORD index;
+
     NearestShutdown();
     if (sourceWidth == 0 || sourceHeight == 0 ||
         destinationWidth == 0 || destinationHeight == 0)
@@ -117,6 +137,25 @@ BOOL NearestInitialize(
         return FALSE;
     }
 
+    count = WorkerPoolSize();
+    if (count > kMaxParts)
+    {
+        count = kMaxParts;
+    }
+
+    for (index = 0; index < count; ++index)
+    {
+        g_rowBuffers[index] = reinterpret_cast<DWORD*>(
+            Allocate(destinationWidth * sizeof(DWORD)));
+        if (g_rowBuffers[index] == NULL)
+        {
+            NearestShutdown();
+            return FALSE;
+        }
+    }
+
+    g_partCount = count;
+
     g_destinationWidth = destinationWidth;
     g_destinationHeight = destinationHeight;
     return TRUE;
@@ -124,6 +163,15 @@ BOOL NearestInitialize(
 
 void NearestShutdown()
 {
+    DWORD index;
+
+    for (index = 0; index < kMaxParts; ++index)
+    {
+        Free(g_rowBuffers[index]);
+        g_rowBuffers[index] = NULL;
+    }
+
+    g_partCount = 0;
     Free(g_columns);
     Free(g_rows);
     g_columns = NULL;
