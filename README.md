@@ -27,6 +27,8 @@ Top: `hqx` with `Scanlines=35`; bottom: `nearest`.</sub>
 - **Twice the resolution:** the race world is drawn at 960 lines (1712x960
   at 16:9) by the game's own renderer, for sharper roads, scenery and
   riders, also on Windows 98.
+- **Longer view:** the road and scenery are drawn 48 segments ahead
+  instead of 32, as far as the 30th Anniversary Edition shows.
 - **Fixed HUD and sky:** the cockpit, gauges and messages stay centered, and
   the sky panorama fills the whole width.
 - **Display filters:** optional `nearest`, `hqx`, `xbr`, `sharp-bilinear` and
@@ -109,6 +111,7 @@ VirtualWidth=0   ; 0 (default) = fit the display's aspect ratio, or 640-1280
 WaitForVBlank=1  ; 1 (default) = wait for vertical blank, 0 = no wait
 Filter=none      ; none (default), nearest, hqx, xbr, sharp-bilinear, bicubic
 HqxScale=0       ; hqx/xbr factor: 0 (default) = auto, or 2, 3, 4 (hqx: up to 3)
+DrawDistance=48  ; road segments drawn ahead: 48 (default) or down to 32 (original)
 DirectPresent=1  ; 1 (default) = filters write into the screen, 0 = copy each frame
 Scanlines=0      ; 0 (default) = off, or 1-100 = scanline darkening in percent
 ShowFps=0        ; 0 (default) = off, 1 = show the frame rate during races
@@ -128,6 +131,7 @@ MidiVolumeGuard=1 ; 1 (default) = music volume 0 no longer mutes the game, 0 = o
 | `WaitForVBlank` | Prevents tearing, but limits the frame rate to the monitor's refresh rate. |
 | `Filter` | The display filter, see [Filters](#filters). `none` keeps the game's original 8-bit display mode. |
 | `HqxScale` | Scale factor of the pixel-art filters `hqx` and `xbr` (2, 3 or 4; `hqx` stops at 3); their result is then scaled smoothly to the screen. The automatic choice is the smallest factor that reaches the screen height: 2 up to 960 lines, 3 up to 1440 lines (so at 1080p the 3x result is reduced: supersampling), 4 above, e.g. for 4K. A lower factor is faster. |
+| `DrawDistance` | How many road segments ahead the game draws, 48 by default. The original draws 32, although it loads 80 ahead; up to 48 shows the road and scenery further into the distance (48 is also what the 30th Anniversary Edition draws). Riders, cars and pedestrians still appear at the original distance. The road arrays, the crest thresholds and the depth table are enlarged in memory for it. |
 | `DirectPresent` | Only for the filters other than `none`. With `1`, a filter whose output has the screen size writes straight into the screen surface after the vertical blank, instead of into system memory that is then copied to the graphics card. That copy took 8 ms per frame at 1920x1080 on a Windows 98 PC. While `Scanlines` are on (which read the frame back), frames are still copied, except with `nearest`. If the screen surface cannot be locked, the frame is copied as with `0`. |
 | `Scanlines` | Strength of the scanline effect; 30 to 50 is a good start. |
 | `ShowFps`, `ShowFilter` | On-screen display in the top-left corner, for example `60 FPS  BICUBIC`. |

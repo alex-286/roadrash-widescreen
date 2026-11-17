@@ -5,6 +5,7 @@
 #include "game_fixes.h"
 #include "render_scale.h"
 #include "cpu_features.h"
+#include "draw_distance.h"
 #include "hqx_upscaler.h"
 #include "fps_overlay.h"
 #include "worker_pool.h"
@@ -3507,10 +3508,16 @@ BOOL InstallRoadRashWidescreenHook(LPVOID directDraw)
 
         {
             CHAR settingsPath[MAX_PATH];
+            BOOL settingsFound = GetSettingsPath(settingsPath);
 
-            ApplyGameFixes(
+            ApplyGameFixes(base, settingsFound ? settingsPath : NULL);
+            DrawDistanceInstall(
                 base,
-                GetSettingsPath(settingsPath) ? settingsPath : NULL);
+                settingsFound ?
+                    GetPrivateProfileIntA(
+                        "Display", "DrawDistance", kMaxDrawSegments,
+                        settingsPath) :
+                    kMaxDrawSegments);
         }
 
         if (g_renderScale == 2 && !RenderScaleInstall(base))
