@@ -3,8 +3,13 @@
 
 #include <windows.h>
 #include <unknwn.h>
+#include <intrin.h>
 
 #include "road_rash_patch.h"
+
+// Windows 95's kernel32 has no InterlockedCompareExchange (only Windows 98
+// and NT 4 do); the intrinsic is a plain lock cmpxchg and needs no import.
+#pragma intrinsic(_InterlockedCompareExchange)
 
 typedef HRESULT (WINAPI *DirectDrawCreateFn)(GUID*, LPVOID*, IUnknown*);
 typedef HRESULT (WINAPI *DirectDrawCreateExFn)(GUID*, LPVOID*, REFIID, IUnknown*);
@@ -20,7 +25,7 @@ static CHAR g_systemPath[MAX_PATH];
 
 static HMODULE LoadSystemDdraw()
 {
-    while (InterlockedCompareExchange(&g_loadLock, 1, 0) != 0)
+    while (_InterlockedCompareExchange(&g_loadLock, 1, 0) != 0)
     {
         Sleep(0);
     }

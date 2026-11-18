@@ -5,8 +5,8 @@
 #include "road_rash_patch.h"
 
 // Every fix checks the original bytes before it changes anything and logs
-// why it stays off when they differ. Addresses are RVAs in ROADRASH.EXE,
-// German 1.0A. Absolute addresses inside instructions are compared after
+// why it stays off when they differ. Addresses are RVAs in ROADRASH.EXE
+// 1.0A. Absolute addresses inside instructions are compared after
 // adding the actual module base, in case the executable was relocated.
 
 // Bike colours: in a race every bike is drawn from one template and

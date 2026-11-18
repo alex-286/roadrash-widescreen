@@ -3,4 +3,3 @@
 dist/*.txt text eol=crlf
 dist/*.ini text eol=crlf
 LICENSE text eol=crlf
-THIRD_PARTY_NOTICES.md text eol=crlf

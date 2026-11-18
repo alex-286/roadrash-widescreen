@@ -10,14 +10,13 @@ game. It changes nothing on disk: delete the file and the game is back to
 normal. On Windows 95/98/ME, a small tool changes one import name in the game
 so that it loads the patch (see [Installation](#installation)).
 
-![Road Rash in 2560x1440 widescreen with the hqx filter](docs/screenshots/coast-hqx.png)
-
 | | |
 |---|---|
 | ![Mountain road with rivals and traffic](docs/screenshots/mountains.png) | ![City race](docs/screenshots/city.png) |
 
-<sub>Screenshots taken with F12 at 2560x1440 (16:9) and reduced to half size.
-Top: `hqx` with `Scanlines=35`; bottom: `nearest`.</sub>
+<sub>Screenshots taken with F12 at 2560x1440 (16:9) and reduced to half size,
+with `nearest`, the original 480 lines (`RenderScale=1`) and draw
+distance.</sub>
 
 ## Features
 
@@ -33,34 +32,46 @@ Top: `hqx` with `Scanlines=35`; bottom: `nearest`.</sub>
   of the track's sky, so the road no longer pops in at the far end.
 - **Fixed HUD and sky:** the cockpit, gauges and messages stay centered, and
   the sky panorama fills the whole width.
-- **Display filters:** optional `nearest`, `hqx`, `xbr`, `sharp-bilinear` and
-  `bicubic` filters, switchable during a race with **F11**.
+- **Menus at the native resolution:** the screen no longer switches to
+  640x480 for the menus. The menu fills the screen height in the middle,
+  surrounded by a blurred copy of the menu picture, and the videos are
+  enlarged by a whole factor.
+- **Display filters:** optional `nearest`, `sharp-bilinear` and `bicubic`
+  filters, switchable during a race with **F11**.
 - **Scanlines:** an optional CRT-style scanline effect on top of any filter.
 - **No tearing:** waits for the vertical blank before each frame (can be
   turned off).
 - **FPS and filter display:** optional on-screen frame rate and filter name.
-- **Game fixes:** the Rat and Super bikes race in their own colors, objects
-  move smoothly in 1-pixel steps, and a music volume of 0 no longer mutes the
-  whole game on newer Windows. Each fix can be turned off.
+- **Game fixes:** the Rat and Super bikes race in their own colors; objects
+  move smoothly in 1-pixel steps, and riders and cars in the distance no
+  longer move in jumps; the rider's shadow stays under the bike when
+  punching; three hovering buildings stand on the ground; a music volume of 0
+  no longer mutes the whole game on newer Windows. Each fix can be turned
+  off.
+- **Race music on any MIDI output:** if the races stay silent because the
+  MIDI mapper leads to the wrong output, `MusicDevice` picks another one.
 - **Screenshots:** **F12** saves exactly what is on screen, at full
   resolution with the filter applied.
 - **Multi-core:** filters spread their work across up to 8 CPU cores.
 - **Safe:** only the supported game version is patched; anything else is left
-  untouched. Menus run exactly as before.
+  untouched. On Windows 9x, every DirectDraw hook is removed when the game
+  ends, because DirectDraw is shared by all programs there.
 - **Lightweight and retro-friendly:** a small DLL without runtime
-  dependencies, built for Windows 98 up to Windows 11.
+  dependencies, built for Windows 95 up to Windows 11.
 
 ## Requirements
 
-- **Road Rash for Windows 95, German version 1.0A.** The patch recognizes the
-  executable by its build signature; other language versions or releases are
-  not patched (the game then runs as usual). Support for more versions may
-  follow.
+- **Road Rash for Windows 95, version 1.0A**: the `ROADRASH.EXE` of
+  23 August 1996, 541,184 bytes (SHA-256 `73d7f974…60f18a2`).
 - The game option **High Resolution** (640x480) must be enabled.
-- Windows 98 or newer. The patch is tested on Windows 98 SE and Windows 11.
+- Windows 95 or newer. The patch is tested on Windows 98 SE and Windows 11.
+  It uses only functions that Windows 95 already has, so it should also run
+  on Windows 95, ME and the versions from XP to 10, but these are untested.
 - The display filters need a 32-bit display mode at your resolution and
   benefit from a multi-core CPU. Without filters, the game's original 8-bit
   display mode is used.
+- The menus at the native resolution need a 16-bit display mode at that
+  resolution; without it, the menus run at 640x480 as in the original.
 
 ## Installation
 
@@ -111,8 +122,7 @@ DisplayWidth=0   ; 0 (default) = desktop width, or a width in pixels
 DisplayHeight=0  ; 0 (default) = desktop height, or a height in pixels
 VirtualWidth=0   ; 0 (default) = fit the display's aspect ratio, or 640-1280
 WaitForVBlank=1  ; 1 (default) = wait for vertical blank, 0 = no wait
-Filter=none      ; none (default), nearest, hqx, xbr, sharp-bilinear, bicubic
-HqxScale=0       ; hqx/xbr factor: 0 (default) = auto, or 2, 3, 4 (hqx: up to 3)
+Filter=none      ; none (default), nearest, sharp-bilinear, bicubic
 DrawDistance=48  ; road segments drawn ahead: 48 (default) or down to 32 (original)
 DistanceFade=16  ; farthest segments that fade into a haze: 16 (default), 1-16, 0 = off
 DirectPresent=1  ; 1 (default) = filters write into the screen, 0 = copy each frame
@@ -139,13 +149,12 @@ GroundBuildings=1 ; 1 (default) = three hovering buildings stand on the ground, 
 | `VirtualWidth` | The width the game renders at (multiple of 8). By default it matches your display's aspect ratio; other values change the aspect ratio. |
 | `WaitForVBlank` | Prevents tearing, but limits the frame rate to the monitor's refresh rate. |
 | `Filter` | The display filter, see [Filters](#filters). `none` keeps the game's original 8-bit display mode. |
-| `HqxScale` | Scale factor of the pixel-art filters `hqx` and `xbr` (2, 3 or 4; `hqx` stops at 3); their result is then scaled smoothly to the screen. The automatic choice is the smallest factor that reaches the screen height: 2 up to 960 lines, 3 up to 1440 lines (so at 1080p the 3x result is reduced: supersampling), 4 above, e.g. for 4K. A lower factor is faster. |
 | `DrawDistance` | How many road segments ahead the game draws, 48 by default. The original draws 32, although it loads 80 ahead; up to 48 shows the road further into the distance (48 is also what the 30th Anniversary Edition draws). Trees, buildings and signs beside the road, riders, cars and pedestrians still appear at the original distance of 33 segments: the game loads their pictures only that far ahead, and drawing them further out showed wrong buildings and could crash the game. The road arrays, the crest thresholds and the depth table are enlarged in memory for it. |
 | `DistanceFade` | How many of the farthest road segments fade into a haze (16 by default), so new segments appear out of it instead of popping in whole. The haze grows toward the far end to 3/4 and takes its color from the track's sky panorama; the game's 256-color palette is remapped for it, so the steps may show slight color shifts. 0 turns it off. |
 | `DirectPresent` | Only for the filters other than `none`. With `1`, a filter whose output has the screen size writes straight into the screen surface after the vertical blank, instead of into system memory that is then copied to the graphics card. That copy took 8 ms per frame at 1920x1080 on a Windows 98 PC. While `Scanlines` are on (which read the frame back), frames are still copied, except with `nearest`. If the screen surface cannot be locked, the frame is copied as with `0`. |
 | `Scanlines` | Strength of the scanline effect; 30 to 50 is a good start. |
 | `ShowFps`, `ShowFilter` | On-screen display in the top-left corner, for example `60 FPS  BICUBIC`. |
-| `RenderScale` | `2` (default) makes the game's own rasterizer draw the race world at twice the resolution (960 lines, 1712x960 at 16:9), so roads, scenery and riders are sharper; the sky and the cockpit are enlarged from their 480-line art. It works with `none`, `nearest`, `sharp-bilinear` and `bicubic`. `hqx` and `xbr` are made for the original 480-line pixel grid, so with `2` they fall back to `sharp-bilinear` and F11 skips them; set `RenderScale=1` to use them. On a Windows 98 PC with a Pentium Dual-Core E5800 at 1920x1080, `none` runs at 59 fps (5.4 ms of game time per frame); with `WaitForVBlank=0`, `nearest` reaches 59 fps, `sharp-bilinear` 44 and `bicubic` 28. |
+| `RenderScale` | `2` (default) makes the game's own rasterizer draw the race world at twice the resolution (960 lines, 1712x960 at 16:9), so roads, scenery and riders are sharper; the sky and the cockpit are enlarged from their 480-line art. `1` keeps the original 480 lines, for very slow PCs. On a Windows 98 PC with a Pentium Dual-Core E5800 at 1920x1080, `none` runs at 59 fps (5.4 ms of game time per frame); with `WaitForVBlank=0`, `nearest` reaches 59 fps, `sharp-bilinear` 44 and `bicubic` 28. |
 | `NativeMenus` | The game's menus are a Windows interface of 640x480: a main window with the buttons as windows of their own, dialogs and a video window. Windows 98 cannot enlarge such windows, so with `1` the screen stays at the resolution of the races (in 16-bit color), the menu fills the screen height in the middle (2.25x at 1920x1080, 3x at 2560x1440; with a factor that is not a whole number, some rows and columns of pixels are one screen pixel wider than others, and the mouse, the windows and the drawing all use the same mapping), and the videos are enlarged by the largest whole factor of their own size that fits (320x192 videos: 5x at 1920x1080, 7x at 2560x1440), on black. Everything visible in the menus is drawn by copying rectangles into the screen, so the patch enlarges those copies; the game's main window covers the whole screen as in the original, its invisible button windows are enlarged the same way, and the positions the game reads (window rectangles, the mouse, paint areas) come back in its 640x480 coordinates. Windows dialogs (the save dialog, message boxes) keep their size and are centred. With `0`, the screen switches to 640x480 for the menus as in the original game. |
 | `MenuBackground` | Only with `NativeMenus=1`: what fills the screen around the menu. With `1`, each new menu screen is averaged into a grid of 32x24 colors, which is stretched smoothly over the screen and darkened: the menu picture, enlarged and heavily blurred, made at runtime from the game's own picture. It is drawn only when the game shows a whole new menu screen, not for every small change. With `0` the area stays black. Videos always play on black. |
 | `FixBikeColors` | The original game swaps the race colors of the Rat and Super bikes (the shop shows them correctly). The fix swaps the two groups of color tables back. |
@@ -165,35 +174,26 @@ is always enlarged. A filter decides how:
 |---|---|---|
 | `none` | Original look, the game's 8-bit display mode. | Maximum compatibility, slow PCs. |
 | `nearest` | Sharp, blocky pixels. | The authentic pixel look. |
-| `hqx` | Smooths edges between flat colors (hq2x/hq3x). | Pixel-art style. |
-| `xbr` | Like hqx, with rounder outlines and cleaner diagonals. | Pixel-art style. |
 | `sharp-bilinear` | Crisp pixels of even size, also at non-integer scales such as 1080p. | A clean pixel look on any resolution. |
 | `bicubic` | Smooth, photo-like enlargement; also softens the game's blocky near sprites. | A soft, modern look. |
 
-The cockpit at 2560x1440, unscaled crops (with `Scanlines=35`, which
-`nearest` does not show):
+The cockpit at 2560x1440 with `RenderScale=1`, unscaled crops (with
+`Scanlines=35`, which `nearest` does not show):
 
 | Filter | Result |
 |---|---|
 | `nearest` | ![Cockpit with the nearest filter](docs/screenshots/cockpit-nearest.png) |
-| `hqx` | ![Cockpit with the hqx filter](docs/screenshots/cockpit-hqx.png) |
-| `xbr` | ![Cockpit with the xbr filter](docs/screenshots/cockpit-xbr.png) |
 | `sharp-bilinear` | ![Cockpit with the sharp-bilinear filter](docs/screenshots/cockpit-sharp-bilinear.png) |
 | `bicubic` | ![Cockpit with the bicubic filter](docs/screenshots/cockpit-bicubic.png) |
 
 With any filter except `none`, press **F11** during a race to cycle through
-`nearest`, `hqx`, `xbr`, `sharp-bilinear` and `bicubic`; the choice is kept
-for later races. Switching to or from `none` requires restarting the game.
+`nearest`, `sharp-bilinear` and `bicubic`; the choice is kept for later
+races. Switching to or from `none` requires restarting the game.
 `Scanlines` apply to every filter except `nearest`.
-
-`hqx` and `xbr` enlarge by a whole factor (2x to 4x); their result is then
-scaled to the exact screen size with area averaging. That avoids doubled
-rows and columns at non-integer sizes such as 1080p or 4K, and at 1080p the
-3x result is reduced, which gives a supersampled, particularly clean picture.
 
 On a modern CPU every filter takes only a few milliseconds per frame. On a
 single-core CPU such as a Pentium 4, `sharp-bilinear` is the fastest choice;
-`bicubic` and `xbr` are only practical at low resolutions there.
+`bicubic` is only practical at low resolutions there.
 
 ## Hotkeys
 
@@ -217,8 +217,13 @@ Please attach it when reporting a problem.
   log for the recognized game version.
 - **No filter, although one is set:** the 32-bit display mode is not available
   at your resolution; the log says so and the game runs in 8-bit mode.
-- **Low frame rate with a filter:** try `sharp-bilinear`, a lower `HqxScale`,
-  `WaitForVBlank=0`, `RenderScale=1` or `Filter=none`.
+- **Low frame rate with a filter:** try `sharp-bilinear`, `WaitForVBlank=0`,
+  `RenderScale=1` or `Filter=none`.
+- **No music in races, but music in the menus:** the race music is played on
+  the MIDI mapper. The log lists every MIDI output with its number at the
+  first race; set `MusicDevice` to the number of the one you want.
+- **The game crashes:** the log records the address and the registers of
+  the crash. Please attach it.
 
 ## Building
 
@@ -226,28 +231,27 @@ Requirements:
 
 - Microsoft Visual Studio 2005 (Visual C++ 8)
 - Microsoft Platform SDK (expected at `C:\Program Files\Microsoft Platform SDK`)
-- Git, to fetch the [hqx](https://github.com/brunexgeek/hqx) submodule
 
 ```bat
-git clone --recursive <repository-url>
+git clone <repository-url>
 cd roadrash-widescreen
 build.cmd
 ```
 
-In an existing clone, run `git submodule update --init` first. In VS Code,
-**Terminal > Run Build Task** (Ctrl+Shift+B) runs the same script. If Visual
+In VS Code, **Terminal > Run Build Task** (Ctrl+Shift+B) runs the same script. If Visual
 Studio 2005 or the Platform SDK is installed elsewhere, set `VS80_ROOT` or
 `PLATFORM_SDK_ROOT` to its folder before building.
 
 The result is `build\ddraw.dll`: a 32-bit x86 DLL without C runtime
 dependencies, linked for Windows subsystem 4.0 so that it also loads on
-Windows 98. It also builds `build\RRWSPatch.exe`, the Windows 9x setup tool
+Windows 95 and 98. It also builds `build\RRWSPatch.exe`, the Windows 9x setup tool
 (likewise without C runtime).
 
 The script also assembles the release package in `build\release\`: the DLL
-(as `ddraw.dll` and as `RRWS.dll`), `RRWSPatch.exe`, the player documentation and default settings from [`dist/`](dist/)
-(`README.txt`, `RoadRashWidescreen.ini`), and the license texts as
-`LICENSE.txt` and `THIRD_PARTY_NOTICES.txt`. Zip that folder for a release.
+(as `ddraw.dll` and as `RRWS.dll`), `RRWSPatch.exe`, the player
+documentation and default settings from [`dist/`](dist/) (`README.txt`,
+`RoadRashWidescreen.ini`), and the license as `LICENSE.txt`. Zip that folder
+for a release.
 
 ## How it works
 
@@ -263,16 +267,51 @@ The script also assembles the release package in `build\release\`: the DLL
 - With a filter, the display runs at 32 bits per pixel. The game keeps
   rendering 8-bit frames, which are converted through the game palette,
   filtered and then presented.
+- The menus are Windows windows of 640x480 whose pictures are copied into
+  the screen. With `NativeMenus=1` the patch enlarges those copies and maps
+  window positions, the mouse and paint areas between the 640x480
+  coordinates and the screen.
 
 ## Known limitations
 
-- Only the German version 1.0A is supported so far.
+- The 30th Anniversary Edition of Road Rash is not supported.
 - On Windows 95/98/ME, `ROADRASH.EXE` must be changed with `RRWSPatch.exe`
   (one import name), because a `ddraw.dll` next to the game is not loaded.
 - With `WaitForVBlank=0`, tearing is possible.
+- Windows dialogs in the menus (saving, message boxes) keep their original
+  size.
 - The 720x480 fallback mode uses no filter and shows no on-screen display.
 - The patch does not chain through other DirectDraw wrappers such as
   DDrawCompat or dgVoodoo2.
+
+## Credits
+
+- **Road Rash** (Windows 95) &copy; 1996 Electronic Arts. *Electronic Arts
+  presents a Buzz Puppet Production in association with Papyrus Design
+  Group, Inc.* Road Rash PC is based on Road Rash 3DO, &copy; Electronic Arts
+  1991-94. Road Rash is a trademark of Electronic Arts. All credit for the
+  game, its design, art, sound and the original program goes to its
+  creators. This patch only changes how the game is shown on today's
+  screens.
+
+The following Road Rash projects showed what is possible and where to look.
+Their ideas and findings guided this patch. No code was taken from them;
+every change was worked out again in the 1996 CD version's `ROADRASH.EXE`.
+
+| Project | What this patch owes to it |
+|---|---|
+| [RoadRash30th-HD](https://github.com/OBLPlife/RoadRash30th-HD) by OBLPlife | Native resolution with a wider view instead of a stretched picture, and rendering the race at a higher resolution (`RenderScale`). |
+| [RoadRash30-MultiFix](https://github.com/magoowa/RoadRash30-MultiFix) by OBLPlife and magoowa | The `ddraw.dll` proxy approach, and the fixes for the bike colors, the muted sound at music volume 0, the punch shadow, the hovering buildings and the far objects updated only every few ticks. |
+| [RoadRashFFNNOPatch](https://github.com/FFNNO/RoadRashFFNNOPatch) by FFNNO | Sprites without the snapping to even pixels, and a longer view that fades into the sky. |
+| [Open Rash](https://github.com/Replica-/open-rash) and [Open Rash Next](https://github.com/Replica-/open-rash-next) by Replica- | Menus that fill a wide screen, and engine facts such as the 33-segment limit up to which the game loads scenery pictures. |
+| [road-rash](https://github.com/arkits/road-rash) by arkits | Reverse-engineering notes on the same `ROADRASH.EXE` build, a valuable map of the engine. |
+
+The game was analyzed with [Ghidra](https://ghidra-sre.org/).
+
+This is a non-commercial fan project. It is not affiliated with, endorsed by
+or connected to Electronic Arts, the companies above or the authors of the
+projects above. It contains no game files and requires an original copy of
+the game.
 
 ## License
 
@@ -285,11 +324,6 @@ version. It is distributed in the hope that it will be useful, but WITHOUT ANY
 WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
 PARTICULAR PURPOSE. See `LICENSE` for the full text.
 
-The [hqx](https://github.com/brunexgeek/hqx) library by Bruno Ribeiro is
-licensed under the Apache License 2.0 and compiled into `ddraw.dll`; the xBR
-filter implements an algorithm by Hyllian. See `THIRD_PARTY_NOTICES.md`,
-which must accompany any distribution of `ddraw.dll`.
-
-Road Rash is a trademark of Electronic Arts. This project is not affiliated
-with or endorsed by Electronic Arts, contains no game files, and requires an
-original copy of the game.
+The license covers only this patch. It grants no rights to *Road Rash*
+itself, its data, music, videos or trademarks, which remain the property of
+their owners.

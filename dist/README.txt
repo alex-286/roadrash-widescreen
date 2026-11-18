@@ -33,16 +33,18 @@ RRWSPatch.exe             Windows 95/98/ME only: sets up ROADRASH.EXE to
 RoadRashWidescreen.ini    Optional settings (resolution, filters, ...).
 README.txt                This file.
 LICENSE.txt               The license of the patch (GNU GPL v3).
-THIRD_PARTY_NOTICES.txt   Licenses of the third-party code used.
 
 
 Requirements
 ------------
 
-- Road Rash for Windows 95, German version 1.0A. Other versions are not
+- Road Rash for Windows 95, version 1.0A: ROADRASH.EXE of 23 August 1996,
+  541,184 bytes. This executable serves all of the game's languages
+  (English, German, French, Spanish, Italian). Other executables are not
   patched; the game then runs as usual.
 - The game option "High Resolution" (640x480) must be enabled.
-- Windows 98 or newer.
+- Windows 95 or newer. Tested on Windows 98 SE and Windows 11; Windows 95,
+  ME and the versions from XP to 10 should work but are untested.
 
 
 Installation
@@ -130,8 +132,31 @@ problem.
   for the recognized game version.
 - A filter is set but not used: the 32-bit display mode is not available at
   your resolution; the log says so and the game runs in 8-bit mode.
-- Low frame rate with a filter: try Filter=sharp-bilinear, HqxScale=2,
+- Low frame rate with a filter: try Filter=sharp-bilinear,
   WaitForVBlank=0, RenderScale=1 or Filter=none.
+- No music in races, but music in the menus: the log lists every MIDI
+  output with its number at the first race; set MusicDevice in the [Fixes]
+  section to the number of the one you want.
+- The game crashes: the log records where. Please attach it.
+
+
+Credits
+-------
+
+Road Rash (Windows 95) (c) 1996 Electronic Arts. Electronic Arts presents a
+Buzz Puppet Production in association with Papyrus Design Group, Inc.
+Road Rash PC is based on Road Rash 3DO, (c) Electronic Arts 1991-94. All
+credit for the game, its design, art, sound and the original program goes
+to its creators.
+
+Ideas and findings of these Road Rash projects guided the patch (no code
+was taken from them):
+- RoadRash30th-HD by OBLPlife, RoadRash30-MultiFix by OBLPlife and magoowa
+- RoadRashFFNNOPatch by FFNNO
+- Open Rash and Open Rash Next by Replica-
+- road-rash by arkits
+Their links and what each one contributed are listed in the README on the
+project page.
 
 
 License
@@ -141,7 +166,6 @@ Copyright (C) 2026 Alexander Schmidt
 
 This program is free software under the GNU General Public License,
 version 3 or later; see LICENSE.txt. It comes WITHOUT ANY WARRANTY.
-Third-party code: see THIRD_PARTY_NOTICES.txt.
 
 Road Rash is a trademark of Electronic Arts. This project is not affiliated
 with or endorsed by Electronic Arts, contains no game files, and requires an

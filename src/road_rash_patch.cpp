@@ -8,13 +8,11 @@
 #include "draw_distance.h"
 #include "distance_fade.h"
 #include "native_menus.h"
-#include "hqx_upscaler.h"
 #include "fps_overlay.h"
 #include "worker_pool.h"
 #include "sharp_bilinear.h"
 #include "nearest.h"
 #include "resampler.h"
-#include "xbr.h"
 #include "scanlines.h"
 #include "screenshot.h"
 
@@ -238,8 +236,6 @@ enum FrameFilter
 {
     kFilterNone,
     kFilterNearest,
-    kFilterHqx,
-    kFilterXbr,
     kFilterSharpBilinear,
     kFilterBicubic,
     kFilterCount
@@ -249,8 +245,6 @@ static const CHAR* const kFilterNames[kFilterCount] =
 {
     "none",
     "nearest",
-    "hqx",
-    "xbr",
     "sharp-bilinear",
     "bicubic"
 };
@@ -261,21 +255,12 @@ static DWORD g_filterSetting = kFilterNone;
 static DWORD g_activeFilter = kFilterNone;
 static BOOL g_presenterDisplayActive = FALSE;
 static BOOL g_filterUnavailable[kFilterCount];
-// The pixel-art scale factor (HqxScale): 2-4, or 0 for automatic.
-static const DWORD kMaxPixelArtScale = 4;
-static DWORD g_hqxScaleSetting = 0;
 // Scanline darkening in percent; 0 is off.
 static DWORD g_scanlineStrength = 0;
-static DWORD g_hqxScale = 2;
 // The game palette as X8R8G8B8, refreshed every presented frame.
 static DWORD g_paletteRgb[256];
-// The bicubic filter, and the smooth final scaling of the hqx and xbr
-// output (an area resampler) from its whole-factor size to the display
-// size. If the final scaling cannot start, the present stretches instead.
+// The bicubic filter.
 static Resampler g_bicubic;
-static Resampler g_finalScale;
-static DWORD* g_pixelArtFrame = NULL;
-static BOOL g_finalScaleFailed = FALSE;
 // Set when nearest cannot scale to the display size itself; the present
 // then stretches the converted frame.
 static BOOL g_nearestFailed = FALSE;
@@ -660,7 +645,7 @@ static BOOL MatchesBytes(
 }
 
 // Reads Filter= (a filter name; anything after it, such as a ; comment, is
-// ignored). Without it, the older Hqx=1 selects hqx.
+// ignored).
 static DWORD ReadFilterSetting(const CHAR* path)
 {
     CHAR value[64];
@@ -686,8 +671,7 @@ static DWORD ReadFilterSetting(const CHAR* path)
     value[start + length] = '\0';
     if (length == 0)
     {
-        return GetPrivateProfileIntA("Display", "Hqx", 0, path) != 0 ?
-            kFilterHqx : kFilterNone;
+        return kFilterNone;
     }
 
     for (filter = 0; filter < kFilterCount; ++filter)
@@ -767,11 +751,6 @@ static void ReadVirtualWidthSetting()
         if (g_scanlineStrength > 100)
         {
             g_scanlineStrength = 100;
-        }
-        width = GetPrivateProfileIntA("Display", "HqxScale", 0, path);
-        if (width >= 2 && width <= kMaxPixelArtScale)
-        {
-            g_hqxScaleSetting = width;
         }
 
         width = GetPrivateProfileIntA("Display", "DisplayWidth", 0, path);
@@ -886,7 +865,7 @@ static DWORD FindSupportedGameBase()
         ntHeaders->OptionalHeader.SizeOfImage != kExpectedImageSize)
     {
         static const CHAR prefix[] =
-            "The executable is not the supported Road Rash German 1.0A "
+            "The executable is not the supported Road Rash 1.0A "
             "(timestamp ";
         CHAR message[192];
         DWORD length = sizeof(prefix) - 1;
@@ -935,8 +914,8 @@ static DWORD FindSupportedGameBase()
             sizeof(hudMessageJump)))
     {
         LogMessage(
-            "The executable headers match Road Rash German 1.0A, but its code differs (patched or modified exe). Widescreen stays off.\r\n",
-            sizeof("The executable headers match Road Rash German 1.0A, but its code differs (patched or modified exe). Widescreen stays off.\r\n") - 1);
+            "The executable headers match Road Rash 1.0A, but its code differs (patched or modified exe). Widescreen stays off.\r\n",
+            sizeof("The executable headers match Road Rash 1.0A, but its code differs (patched or modified exe). Widescreen stays off.\r\n") - 1);
         return 0;
     }
 
@@ -1556,25 +1535,10 @@ static HRESULT SetVirtualDisplayMode(
             caller);
         if (SUCCEEDED(result) && ProbePresenterDisplay(directDraw))
         {
-            // Automatic: the smallest factor whose output reaches the
-            // display height, so the final scaling never has to enlarge
-            // much (at 1080 lines, 3x output is reduced: supersampling).
-            g_hqxScale = g_hqxScaleSetting;
-            if (g_hqxScale == 0)
-            {
-                g_hqxScale = kMaxPixelArtScale;
-                while (g_hqxScale > 2 &&
-                       kOriginalDisplayHeight * (g_hqxScale - 1) >= height)
-                {
-                    --g_hqxScale;
-                }
-            }
-
             g_presenterDisplayActive = TRUE;
-            LogHRESULTResult(
-                "32-bit presenter enabled; pixel-art scale=0x",
-                sizeof("32-bit presenter enabled; pixel-art scale=0x") - 1,
-                g_hqxScale);
+            LogMessage(
+                "32-bit presenter enabled.\r\n",
+                sizeof("32-bit presenter enabled.\r\n") - 1);
             return result;
         }
 
@@ -1586,50 +1550,9 @@ static HRESULT SetVirtualDisplayMode(
     return CallOriginalSetDisplayMode(directDraw, width, height, 8, caller);
 }
 
-// The pixel-art filters (hqx, xbr) scale by a whole factor: HqxScale, except
-// that hqx stops at 3x (the hqx library has no hq4x).
-static DWORD GetPixelArtScale(DWORD filter)
-{
-    return filter == kFilterHqx && g_hqxScale > 3 ? 3 : g_hqxScale;
-}
-
-// A pixel-art filter's output size before the final scaling.
-static void GetPixelArtSize(DWORD filter, DWORD* width, DWORD* height)
-{
-    *width = kVirtualDisplayWidth * GetPixelArtScale(filter);
-    *height = kOriginalDisplayHeight * GetPixelArtScale(filter);
-}
-
-// Whether a pixel-art filter's output is scaled smoothly to the display
-// size, as opposed to stretched by the present.
-static BOOL UsesFinalScale(DWORD filter)
-{
-    DWORD width;
-    DWORD height;
-
-    GetPixelArtSize(filter, &width, &height);
-    return !g_finalScaleFailed &&
-        (width != g_realDisplayWidth || height != g_realDisplayHeight);
-}
-
 // The size of a filter's output in the staging surface.
 static void GetFilterOutputSize(DWORD filter, DWORD* width, DWORD* height)
 {
-    if (filter == kFilterHqx || filter == kFilterXbr)
-    {
-        if (UsesFinalScale(filter))
-        {
-            *width = g_realDisplayWidth;
-            *height = g_realDisplayHeight;
-        }
-        else
-        {
-            GetPixelArtSize(filter, width, height);
-        }
-
-        return;
-    }
-
     // Filters that scale to the display size are presented 1:1.
     if (filter == kFilterSharpBilinear || filter == kFilterBicubic ||
         (filter == kFilterNearest && NearestIsReady()))
@@ -1731,18 +1654,6 @@ static HRESULT CreatePresenterResources(LPVOID directDraw)
     stagingWidth = GetFrameWidth() > stagingWidth ? GetFrameWidth() : stagingWidth;
     stagingHeight = GetFrameHeight() > stagingHeight ? GetFrameHeight() : stagingHeight;
 
-    // Room for the unscaled pixel-art output too, in case the final scaling
-    // cannot start.
-    if (!g_filterUnavailable[kFilterXbr])
-    {
-        DWORD width;
-        DWORD height;
-
-        GetPixelArtSize(kFilterXbr, &width, &height);
-        stagingWidth = width > stagingWidth ? width : stagingWidth;
-        stagingHeight = height > stagingHeight ? height : stagingHeight;
-    }
-
     BuildOffscreenDescription(description, stagingWidth, stagingHeight);
     SetSystemMemoryCaps(description);
     result = g_hookState.originalCreateSurface(
@@ -1804,118 +1715,17 @@ static HRESULT CreatePresenterResources(LPVOID directDraw)
 
 static void ReleasePresenterResources()
 {
-    HqxUpscalerShutdown();
-    XbrShutdown();
     SharpBilinearShutdown();
     NearestShutdown();
     g_nearestFailed = FALSE;
     ResamplerShutdown(&g_bicubic);
-    ResamplerShutdown(&g_finalScale);
-    if (g_pixelArtFrame != NULL)
-    {
-        VirtualFree(g_pixelArtFrame, 0, MEM_RELEASE);
-        g_pixelArtFrame = NULL;
-    }
-
-    g_finalScaleFailed = FALSE;
     WorkerPoolStop();
-}
-
-// Prepares the smooth final scaling of a pixel-art filter's output. The
-// resampler is rebuilt when F11 switches to a filter with a different
-// factor (hqx at 3x, xbr at 4x); the frame buffer is sized for the largest.
-// If it cannot start, the present stretches the output instead.
-static void PrepareFinalScale(DWORD filter)
-{
-    DWORD width;
-    DWORD height;
-    BOOL frameReady;
-
-    GetPixelArtSize(filter, &width, &height);
-    if (!UsesFinalScale(filter))
-    {
-        return;
-    }
-
-    // hqx writes its whole output before the final scaling; xbr hands its
-    // rows to the final scaling as they are made and needs no frame buffer.
-    if (filter == kFilterHqx && g_pixelArtFrame == NULL)
-    {
-        g_pixelArtFrame = reinterpret_cast<DWORD*>(VirtualAlloc(
-            NULL,
-            kVirtualDisplayWidth * g_hqxScale *
-                kOriginalDisplayHeight * g_hqxScale * sizeof(DWORD),
-            MEM_COMMIT | MEM_RESERVE,
-            PAGE_READWRITE));
-    }
-
-    frameReady = filter != kFilterHqx || g_pixelArtFrame != NULL;
-    if (frameReady &&
-        ResamplerIsReady(&g_finalScale) &&
-        g_finalScale.sourceWidth == width &&
-        g_finalScale.sourceHeight == height)
-    {
-        return;
-    }
-
-    if (frameReady &&
-        ResamplerInitialize(
-            &g_finalScale,
-            kResamplerArea,
-            width,
-            height,
-            g_realDisplayWidth,
-            g_realDisplayHeight))
-    {
-        return;
-    }
-
-    if (g_pixelArtFrame != NULL)
-    {
-        VirtualFree(g_pixelArtFrame, 0, MEM_RELEASE);
-        g_pixelArtFrame = NULL;
-    }
-
-    g_finalScaleFailed = TRUE;
-    LogMessage(
-        "Smooth final scaling unavailable; the pixel-art output is stretched.\r\n",
-        sizeof("Smooth final scaling unavailable; the pixel-art output is stretched.\r\n") - 1);
 }
 
 // Prepares the filter's buffers on first use. A filter that cannot start is
 // skipped from then on, and the frame falls back to nearest.
 static BOOL PrepareFilter(DWORD filter)
 {
-    if (filter == kFilterHqx && !HqxUpscalerIsReady())
-    {
-        if (!HqxUpscalerInitialize(
-                kVirtualDisplayWidth,
-                kOriginalDisplayHeight,
-                GetPixelArtScale(kFilterHqx)))
-        {
-            LogMessage(
-                "hqx buffer allocation failed; filter disabled.\r\n",
-                sizeof("hqx buffer allocation failed; filter disabled.\r\n") - 1);
-            g_filterUnavailable[kFilterHqx] = TRUE;
-            return FALSE;
-        }
-    }
-
-    if (filter == kFilterXbr && !XbrIsReady())
-    {
-        if (!XbrInitialize(
-                kVirtualDisplayWidth,
-                kOriginalDisplayHeight,
-                g_hqxScale))
-        {
-            LogMessage(
-                "xBR initialization failed; filter disabled.\r\n",
-                sizeof("xBR initialization failed; filter disabled.\r\n") - 1);
-            g_filterUnavailable[kFilterXbr] = TRUE;
-            return FALSE;
-        }
-    }
-
     if (filter == kFilterSharpBilinear && !SharpBilinearIsReady())
     {
         if (!SharpBilinearInitialize(
@@ -1947,16 +1757,10 @@ static BOOL PrepareFilter(DWORD filter)
         }
     }
 
-    if (filter == kFilterHqx || filter == kFilterXbr)
-    {
-        PrepareFinalScale(filter);
-    }
-
     if (filter == kFilterBicubic && !ResamplerIsReady(&g_bicubic))
     {
         if (!ResamplerInitialize(
                 &g_bicubic,
-                kResamplerBicubic,
                 GetFrameWidth(),
                 GetFrameHeight(),
                 g_realDisplayWidth,
@@ -2590,11 +2394,6 @@ static HRESULT PresentFilteredFrame(LPVOID primary, FrameTiming* timing)
                 (static_cast<DWORD>(palette[index * 4 + 1]) << 8) |
                 static_cast<DWORD>(palette[index * 4 + 2]);
         }
-
-        if (filter == kFilterHqx)
-        {
-            HqxUpscalerSetPalette(palette);
-        }
     }
 
     GetFilterOutputSize(filter, &outputWidth, &outputHeight);
@@ -2693,71 +2492,6 @@ static HRESULT PresentFilteredFrame(LPVOID primary, FrameTiming* timing)
 
             switch (filter)
             {
-            case kFilterHqx:
-            case kFilterXbr:
-            {
-                // Scale by the whole factor, then smoothly to the display
-                // size, or straight into the staging surface when the
-                // present stretches it.
-                BOOL finalScale = UsesFinalScale(filter);
-                BYTE* target = outputPixels;
-                LONG targetPitch = outputPitch;
-                DWORD width;
-                DWORD height;
-
-                // xbr makes its rows as the final scaling reads them, so
-                // the large scaled frame never goes through memory (it
-                // would not fit in a Pentium 4's cache).
-                if (filter == kFilterXbr && finalScale)
-                {
-                    if (XbrPrepareFrame(
-                            sourcePixels, sourcePitch, g_paletteRgb))
-                    {
-                        ResamplerScaleRgbRows(
-                            &g_finalScale,
-                            XbrRow,
-                            NULL,
-                            outputPixels,
-                            outputPitch);
-                    }
-
-                    break;
-                }
-
-                GetPixelArtSize(filter, &width, &height);
-                if (finalScale)
-                {
-                    target = reinterpret_cast<BYTE*>(g_pixelArtFrame);
-                    targetPitch = static_cast<LONG>(width * sizeof(DWORD));
-                }
-
-                if (filter == kFilterHqx)
-                {
-                    HqxUpscalerScale(
-                        sourcePixels, sourcePitch, target, targetPitch);
-                }
-                else
-                {
-                    XbrScale(
-                        sourcePixels,
-                        sourcePitch,
-                        g_paletteRgb,
-                        target,
-                        targetPitch);
-                }
-
-                if (finalScale)
-                {
-                    ResamplerScaleRgb(
-                        &g_finalScale,
-                        target,
-                        targetPitch,
-                        outputPixels,
-                        outputPitch);
-                }
-
-                break;
-            }
             case kFilterSharpBilinear:
                 SharpBilinearScale(
                     sourcePixels,
@@ -3571,8 +3305,8 @@ BOOL InstallRoadRashWidescreenHook(LPVOID directDraw)
         InstallCrashLog();
         ReadVirtualWidthSetting();
         LogMessage(
-            "Recognized the supported Road Rash German 1.0A executable.\r\n",
-            sizeof("Recognized the supported Road Rash German 1.0A executable.\r\n") - 1);
+            "Recognized the supported Road Rash 1.0A executable.\r\n",
+            sizeof("Recognized the supported Road Rash 1.0A executable.\r\n") - 1);
 
         {
             CHAR settingsPath[MAX_PATH];
@@ -3607,22 +3341,6 @@ BOOL InstallRoadRashWidescreenHook(LPVOID directDraw)
         if (g_renderScale == 2 && !RenderScaleInstall(base))
         {
             g_renderScale = 1;
-        }
-
-        // hqx and xbr enlarge pixel art on its original 480-line grid,
-        // which a 960-line frame no longer has.
-        if (g_renderScale == 2)
-        {
-            g_filterUnavailable[kFilterHqx] = TRUE;
-            g_filterUnavailable[kFilterXbr] = TRUE;
-            if (g_filterSetting == kFilterHqx || g_filterSetting == kFilterXbr)
-            {
-                g_filterSetting = kFilterSharpBilinear;
-                g_activeFilter = kFilterSharpBilinear;
-                LogMessage(
-                    "RenderScale=2: hqx and xbr are not available; using sharp-bilinear.\r\n",
-                    sizeof("RenderScale=2: hqx and xbr are not available; using sharp-bilinear.\r\n") - 1);
-            }
         }
     }
 

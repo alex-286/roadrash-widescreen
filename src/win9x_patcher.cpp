@@ -176,7 +176,7 @@ static ImportState FindDirectDrawImport(
     if (nt->FileHeader.TimeDateStamp != kExpectedTimestamp)
     {
         *problem =
-            "This ROADRASH.EXE is not the supported Road Rash German "
+            "This ROADRASH.EXE is not the supported Road Rash "
             "version 1.0A. It was not changed.";
         return kImportUnknown;
     }

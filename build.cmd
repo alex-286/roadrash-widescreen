@@ -34,13 +34,6 @@ if not exist "%PLATFORM_SDK_ROOT%\Include\Windows.h" (
     exit /b 1
 )
 
-set "HQX=%ROOT%\vendor\hqx"
-if not exist "%HQX%\source\HQ2x.cc" (
-    echo The hqx submodule is missing. Run:
-    echo   git submodule update --init
-    exit /b 1
-)
-
 if not exist "%BUILD%\." mkdir "%BUILD%"
 if errorlevel 1 (
     echo Could not create the build directory: %BUILD%
@@ -130,12 +123,6 @@ if errorlevel 1 (
     exit /b 1
 )
 
-cl.exe /nologo /Zl /GS- /O2 /W3 /DWIN32 /D_WINDOWS /D_USRDLL /D_MBCS /Fo"%BUILD%\xbr.obj" /c "%ROOT%\src\xbr.cpp"
-if errorlevel 1 (
-    echo xBR compilation failed.
-    exit /b 1
-)
-
 cl.exe /nologo /Zl /GS- /O2 /W3 /DWIN32 /D_WINDOWS /D_USRDLL /D_MBCS /Fo"%BUILD%\resampler.obj" /c "%ROOT%\src\resampler.cpp"
 if errorlevel 1 (
     echo Resampler compilation failed.
@@ -154,30 +141,7 @@ if errorlevel 1 (
     exit /b 1
 )
 
-rem The hqx sources are compiled unchanged. src\hqx_compat supplies the
-rem <stdint.h> that Visual C++ 2005 lacks and an empty <iostream>, and
-rem src\hqx_upscaler.cpp replaces vendor\hqx\source\HQx.cc.
-set "HQX_FLAGS=/nologo /Zl /GS- /GR- /O2 /W3 /wd4146 /DWIN32 /D_WINDOWS /D_USRDLL /D_MBCS /I"%ROOT%\src\hqx_compat" /I"%HQX%\include""
-
-cl.exe %HQX_FLAGS% /Fo"%BUILD%\hqx_upscaler.obj" /c "%ROOT%\src\hqx_upscaler.cpp"
-if errorlevel 1 (
-    echo hqx upscaler compilation failed.
-    exit /b 1
-)
-
-cl.exe %HQX_FLAGS% /Fo"%BUILD%\HQ2x.obj" /c /Tp"%HQX%\source\HQ2x.cc"
-if errorlevel 1 (
-    echo hq2x compilation failed.
-    exit /b 1
-)
-
-cl.exe %HQX_FLAGS% /Fo"%BUILD%\HQ3x.obj" /c /Tp"%HQX%\source\HQ3x.cc"
-if errorlevel 1 (
-    echo hq3x compilation failed.
-    exit /b 1
-)
-
-link.exe /nologo /NODEFAULTLIB /DLL /MACHINE:I386 /SUBSYSTEM:WINDOWS,4.0 /ENTRY:DllMain@12 /DEF:"%ROOT%\src\ddraw.def" /OUT:"%BUILD%\ddraw.dll" "%BUILD%\ddraw_proxy.obj" "%BUILD%\road_rash_patch.obj" "%BUILD%\game_fixes.obj" "%BUILD%\render_scale.obj" "%BUILD%\cpu_features.obj" "%BUILD%\nearest.obj" "%BUILD%\draw_distance.obj" "%BUILD%\distance_fade.obj" "%BUILD%\native_menus.obj" "%BUILD%\fps_overlay.obj" "%BUILD%\worker_pool.obj" "%BUILD%\sharp_bilinear.obj" "%BUILD%\resampler.obj" "%BUILD%\xbr.obj" "%BUILD%\scanlines.obj" "%BUILD%\screenshot.obj" "%BUILD%\hqx_upscaler.obj" "%BUILD%\HQ2x.obj" "%BUILD%\HQ3x.obj" kernel32.lib user32.lib gdi32.lib
+link.exe /nologo /NODEFAULTLIB /DLL /MACHINE:I386 /SUBSYSTEM:WINDOWS,4.0 /ENTRY:DllMain@12 /DEF:"%ROOT%\src\ddraw.def" /OUT:"%BUILD%\ddraw.dll" "%BUILD%\ddraw_proxy.obj" "%BUILD%\road_rash_patch.obj" "%BUILD%\game_fixes.obj" "%BUILD%\render_scale.obj" "%BUILD%\cpu_features.obj" "%BUILD%\nearest.obj" "%BUILD%\draw_distance.obj" "%BUILD%\distance_fade.obj" "%BUILD%\native_menus.obj" "%BUILD%\fps_overlay.obj" "%BUILD%\worker_pool.obj" "%BUILD%\sharp_bilinear.obj" "%BUILD%\resampler.obj" "%BUILD%\scanlines.obj" "%BUILD%\screenshot.obj" kernel32.lib user32.lib gdi32.lib
 if errorlevel 1 (
     echo DLL linking failed.
     exit /b 1
@@ -209,7 +173,7 @@ if errorlevel 1 (
 echo Created: %BUILD%\RRWSPatch.exe
 
 rem Assemble the release package: the DLL plus the files from dist\ and the
-rem license texts, renamed to .txt so they open in Notepad.
+rem license text, renamed to .txt so it opens in Notepad.
 set "RELEASE=%BUILD%\release"
 if exist "%RELEASE%\." rmdir /s /q "%RELEASE%"
 mkdir "%RELEASE%"
@@ -223,8 +187,7 @@ copy /y "%BUILD%\ddraw.dll" "%RELEASE%\RRWS.dll" >nul && ^
 copy /y "%BUILD%\RRWSPatch.exe" "%RELEASE%\RRWSPatch.exe" >nul && ^
 copy /y "%ROOT%\dist\RoadRashWidescreen.ini" "%RELEASE%\RoadRashWidescreen.ini" >nul && ^
 copy /y "%ROOT%\dist\README.txt" "%RELEASE%\README.txt" >nul && ^
-copy /y "%ROOT%\LICENSE" "%RELEASE%\LICENSE.txt" >nul && ^
-copy /y "%ROOT%\THIRD_PARTY_NOTICES.md" "%RELEASE%\THIRD_PARTY_NOTICES.txt" >nul
+copy /y "%ROOT%\LICENSE" "%RELEASE%\LICENSE.txt" >nul
 if errorlevel 1 (
     echo Could not assemble the release package.
     exit /b 1
