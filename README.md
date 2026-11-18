@@ -10,13 +10,17 @@ game. It changes nothing on disk: delete the file and the game is back to
 normal. On Windows 95/98/ME, a small tool changes one import name in the game
 so that it loads the patch (see [Installation](#installation)).
 
+![Napa Valley at 2560x1440: the road drawn 48 segments ahead](docs/screenshots/napa-valley.png)
+
 | | |
 |---|---|
-| ![Mountain road with rivals and traffic](docs/screenshots/mountains.png) | ![City race](docs/screenshots/city.png) |
+| ![City race with rivals close up](docs/screenshots/city.png) | ![Pacific Highway with the cliffs and the sea](docs/screenshots/pacific-coast.png) |
+| ![Der Panzer Klub menu at the native resolution](docs/screenshots/menu-club.png) | ![Rider page in the menus](docs/screenshots/menu-rider.png) |
 
-<sub>Screenshots taken with F12 at 2560x1440 (16:9) and reduced to half size,
-with `nearest`, the original 480 lines (`RenderScale=1`) and draw
-distance.</sub>
+<sub>Screenshots taken with F12 at 2560x1440 (16:9) with the default
+settings and reduced to half size. Races: `Filter=none`, a few rows cut off
+at the top. Menus: the whole screen, with the blurred menu picture around
+the menu.</sub>
 
 ## Features
 
@@ -52,7 +56,7 @@ distance.</sub>
 - **Race music on any MIDI output:** if the races stay silent because the
   MIDI mapper leads to the wrong output, `MusicDevice` picks another one.
 - **Screenshots:** **F12** saves exactly what is on screen, at full
-  resolution with the filter applied.
+  resolution with the filter applied, in races and in the menus.
 - **Multi-core:** filters spread their work across up to 8 CPU cores.
 - **Safe:** only the supported game version is patched; anything else is left
   untouched. On Windows 9x, every DirectDraw hook is removed when the game
@@ -178,8 +182,7 @@ is always enlarged. A filter decides how:
 | `sharp-bilinear` | Crisp pixels of even size, also at non-integer scales such as 1080p. | A clean pixel look on any resolution. |
 | `bicubic` | Smooth, photo-like enlargement; also softens the game's blocky near sprites. | A soft, modern look. |
 
-The cockpit at 2560x1440 with `RenderScale=1`, unscaled crops (with
-`Scanlines=35`, which `nearest` does not show):
+The cockpit at 2560x1440 with the default `RenderScale=2`, unscaled crops:
 
 | Filter | Result |
 |---|---|
@@ -201,7 +204,7 @@ single-core CPU such as a Pentium 4, `sharp-bilinear` is the fastest choice;
 | Key | Action |
 |---|---|
 | **F11** | Cycle through the display filters (during a race, with a filter enabled). |
-| **F12** | Save a screenshot of the screen as `RoadRashScreen001.bmp`, `002`, ... in the game folder. It shows exactly what is displayed, including filter, scanlines and on-screen display. The game's unscaled frame (1712x960 at 16:9 with `RenderScale=2`) is also saved as `RoadRashFrame.bmp` (replaced each time). |
+| **F12** | Save a screenshot of the screen as `RoadRashScreen001.bmp`, `002`, ... in the game folder. In a race it shows exactly what is displayed, including filter, scanlines and on-screen display, and the game's unscaled frame (1712x960 at 16:9 with `RenderScale=2`) is also saved as `RoadRashFrame.bmp` (replaced each time). In the menus (with `NativeMenus=1`) it shows the whole screen without the mouse pointer. |
 
 ## Troubleshooting
 

@@ -3,6 +3,7 @@
 
 #include "native_menus.h"
 #include "road_rash_patch.h"
+#include "screenshot.h"
 
 #include <intrin.h>
 
@@ -121,6 +122,7 @@ static LONG g_screenWidth = 0;
 static LONG g_screenHeight = 0;
 static LPVOID g_clearedPrimary = NULL;
 static HHOOK g_cbtHook = NULL;
+static HHOOK g_keyboardHook = NULL;
 static BYTE* g_lockCopy = NULL;
 static BOOL g_lockCopyActive = FALSE;
 
@@ -977,6 +979,121 @@ static DWORD WINAPI HookedMciSendCommand(
     return g_originalMciSendCommand(device, message, flags, parameters);
 }
 
+// F12 in the menus: the screen as shown (without the mouse pointer, which
+// Windows draws on top) as RoadRashScreen001.bmp, 002, ... like F12 in a
+// race. The screen is 16-bit, so its pixels are widened to 8 bits per
+// channel first.
+static void SaveMenuScreenshot()
+{
+    LPVOID primary = *reinterpret_cast<LPVOID*>(GameVa(kMenuPrimaryVa));
+    BYTE description[kDescriptionSize];
+    PixelLayout layout;
+    CHAR savedName[MAX_PATH];
+    CHAR message[MAX_PATH + 48];
+    DWORD* frame;
+    const BYTE* pixels;
+    LONG pitch;
+    LONG width;
+    LONG height;
+    LONG row;
+    BOOL saved = FALSE;
+
+    if (primary == NULL || g_originalLock == NULL || g_originalUnlock == NULL)
+    {
+        return;
+    }
+
+    __stosb(description, 0, kDescriptionSize);
+    *reinterpret_cast<DWORD*>(description) = kDescriptionSize;
+    if (FAILED(g_originalLock(primary, NULL, description, kLockWait, NULL)))
+    {
+        LogMenus("Menu screenshot: the screen could not be locked.");
+        return;
+    }
+
+    width = *reinterpret_cast<LONG*>(description + kDescriptionWidth);
+    height = *reinterpret_cast<LONG*>(description + kDescriptionHeight);
+    pitch = *reinterpret_cast<LONG*>(description + kDescriptionPitch);
+    pixels = *reinterpret_cast<BYTE**>(description + kDescriptionSurface);
+    frame = NULL;
+    if (ReadPixelLayout(description, &layout) && width > 0 && height > 0 &&
+        width <= kMaxScreenWidth)
+    {
+        frame = reinterpret_cast<DWORD*>(VirtualAlloc(
+            NULL, static_cast<DWORD>(width * height) * sizeof(DWORD),
+            MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+    }
+
+    if (frame != NULL)
+    {
+        for (row = 0; row < height; ++row)
+        {
+            const BYTE* source = pixels + row * pitch;
+            DWORD* target = frame + row * width;
+            LONG column;
+
+            for (column = 0; column < width; ++column)
+            {
+                DWORD value = ReadPixel(source + column * layout.bytes, layout.bytes);
+                DWORD color = 0;
+                DWORD channel;
+
+                for (channel = 0; channel < 3; ++channel)
+                {
+                    DWORD level = ((value >> layout.shift[channel]) &
+                        layout.mask[channel]) * 255 /
+                        static_cast<DWORD>(layout.maximum[channel]);
+
+                    color |= level << (16 - channel * 8);
+                }
+
+                target[column] = color;
+            }
+        }
+    }
+
+    g_originalUnlock(primary, NULL);
+    if (frame == NULL)
+    {
+        LogMenus("Menu screenshot: unsupported screen format or not enough memory.");
+        return;
+    }
+
+    saved = ScreenshotWriteBmp(
+        "RoadRashScreen",
+        TRUE,
+        reinterpret_cast<const BYTE*>(frame),
+        width * static_cast<LONG>(sizeof(DWORD)),
+        static_cast<DWORD>(width),
+        static_cast<DWORD>(height),
+        32,
+        NULL,
+        savedName);
+    VirtualFree(frame, 0, MEM_RELEASE);
+    if (saved)
+    {
+        wsprintfA(message, "Menu screenshot: saved %s (%ldx%ld).", savedName, width, height);
+        LogMenus(message);
+    }
+    else
+    {
+        LogMenus("Menu screenshot: the file could not be written.");
+    }
+}
+
+// Bit 30 of lParam: the key was already down (auto-repeat); bit 31: it is
+// being released.
+static LRESULT CALLBACK MenuKeyboardHook(int code, WPARAM wParam, LPARAM lParam)
+{
+    if (code == HC_ACTION && g_menusActive && wParam == VK_F12 &&
+        (lParam & 0xC0000000) == 0)
+    {
+        SaveMenuScreenshot();
+    }
+
+    return CallNextHookEx(g_keyboardHook, code, wParam, lParam);
+}
+
 // New windows: RashRoot's children and the video window are enlarged with
 // the menu; other top-level windows that fit into the 640x480 screen the
 // game was made for (its dialogs; not message boxes, which Windows centres
@@ -1379,6 +1496,12 @@ void NativeMenusShutdown(BOOL sharedSystem)
         g_cbtHook = NULL;
     }
 
+    if (g_keyboardHook != NULL)
+    {
+        UnhookWindowsHookEx(g_keyboardHook);
+        g_keyboardHook = NULL;
+    }
+
     g_menusActive = FALSE;
     if (!sharedSystem)
     {
@@ -1514,6 +1637,13 @@ void NativeMenusEnter(DWORD width, DWORD height)
     {
         g_cbtHook = SetWindowsHookExA(
             WH_CBT, MenuCbtHook, NULL,
+            GetWindowThreadProcessId(root, NULL));
+    }
+
+    if (g_keyboardHook == NULL)
+    {
+        g_keyboardHook = SetWindowsHookExA(
+            WH_KEYBOARD, MenuKeyboardHook, NULL,
             GetWindowThreadProcessId(root, NULL));
     }
 

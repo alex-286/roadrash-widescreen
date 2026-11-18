@@ -107,14 +107,15 @@ turned off in the [Fixes] section of RoadRashWidescreen.ini.
   instead of hovering above it.
 
 
-Hotkeys during a race
----------------------
+Hotkeys
+-------
 
-F11   Cycle through the display filters (only if a filter other than
-      "none" is set in RoadRashWidescreen.ini).
+F11   During a race: cycle through the display filters (only if a filter
+      other than "none" is set in RoadRashWidescreen.ini).
 F12   Save a screenshot as RoadRashScreen001.bmp, RoadRashScreen002.bmp,
-      ... in the game folder. It shows exactly what is on screen. The
-      game's unscaled frame is also saved as RoadRashFrame.bmp.
+      ... in the game folder, in races and in the menus. It shows exactly
+      what is on screen. In a race, the game's unscaled frame is also
+      saved as RoadRashFrame.bmp.
 
 
 Troubleshooting
