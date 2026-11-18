@@ -6,6 +6,7 @@
 #include "render_scale.h"
 #include "cpu_features.h"
 #include "draw_distance.h"
+#include "distance_fade.h"
 #include "hqx_upscaler.h"
 #include "fps_overlay.h"
 #include "worker_pool.h"
@@ -3518,6 +3519,13 @@ BOOL InstallRoadRashWidescreenHook(LPVOID directDraw)
                         "Display", "DrawDistance", kMaxDrawSegments,
                         settingsPath) :
                     kMaxDrawSegments);
+            DistanceFadeInstall(
+                base,
+                settingsFound ?
+                    GetPrivateProfileIntA(
+                        "Display", "DistanceFade", kDefaultFadeSegments,
+                        settingsPath) :
+                    kDefaultFadeSegments);
         }
 
         if (g_renderScale == 2 && !RenderScaleInstall(base))

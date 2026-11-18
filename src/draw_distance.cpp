@@ -402,3 +402,18 @@ BOOL DrawDistanceInstall(DWORD gameBase, DWORD segments)
 
     return TRUE;
 }
+
+BYTE* DrawDistanceSlices(DWORD gameBase)
+{
+    if (g_slices != NULL)
+    {
+        return g_slices;
+    }
+
+    return reinterpret_cast<BYTE*>(gameBase - kImageBase + kSlicesVa);
+}
+
+DWORD DrawDistanceSegments()
+{
+    return g_segments;
+}

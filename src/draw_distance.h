@@ -19,4 +19,9 @@ static const DWORD kMaxDrawSegments = 48;
 // differs from the original game.
 BOOL DrawDistanceInstall(DWORD gameBase, DWORD segments);
 
+// The slice array the game draws from and the number of segments it draws:
+// the moved array after a successful install, the game's own otherwise.
+BYTE* DrawDistanceSlices(DWORD gameBase);
+DWORD DrawDistanceSegments();
+
 #endif
