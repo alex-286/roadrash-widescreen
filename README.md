@@ -126,6 +126,8 @@ FixBikeColors=1   ; 1 (default) = Rat and Super bikes in their own colors, 0 = o
 SmoothSprites=1   ; 1 (default) = objects move in 1-pixel steps in HiRes, 0 = original
 MidiVolumeGuard=1 ; 1 (default) = music volume 0 no longer mutes the game, 0 = original
 FullRateObjects=1 ; 1 (default) = riders and cars in view update every tick, 0 = original
+FixPunchShadow=1  ; 1 (default) = the shadow stays under the bike when punching, 0 = original
+GroundBuildings=1 ; 1 (default) = three hovering buildings stand on the ground, 0 = original
 ```
 
 | Setting | Description |
@@ -145,6 +147,8 @@ FullRateObjects=1 ; 1 (default) = riders and cars in view update every tick, 0 =
 | `SmoothSprites` | In High Resolution mode the game keeps every corner of buildings, riders and cars on an even pixel, so they move in 2-pixel steps (about 4.5 screen pixels at 1080p). The fix uses the full 640x480 precision. |
 | `MidiVolumeGuard` | The game sets its music volume with `midiOutSetVolume`. Since Windows Vista, that call changes the volume of the whole game in the Windows volume mixer, and Windows keeps it, so a music volume of 0 also silenced all sound effects. With the fix, a song at volume 0 is not started at all, as when music is muted. Other volumes are passed on unchanged. |
 | `FullRateObjects` | The game updates each rider, car, pedestrian and cop at an interval that grows with its distance from the camera: every game tick close by, up to every 8th tick about 30 segments ahead. Their position still follows the elapsed time, so in the distance they move in visible jumps. With the fix, every one of them within the drawn range (4 segments behind to 33 ahead) is updated on every tick; the ones further away keep the original interval. |
+| `FixPunchShadow` | The rider's shadow frames (`DATA\BIKERS\HISHADOW.DAT`, `LOSHADOW.DAT`) are drawn centred on their box. In frame 176, the first frame of the punch, two stray pixels in the top corner make the box 118x168 (59x84) while the shadow is only the 13 (6) rows at its bottom, so the shadow jumps away from the bike. The fix cuts the loaded frame to the shadow itself (64x13, 32x6); the file is not changed. |
+| `GroundBuildings` | The pictures of the red barn (`BARN12`), the brown shop with the sign (`RUSTICA2`) and the white house (`HOUSEB2`) in `FAMILIES.RSC` end in empty rows, and the game places them as if the picture reached the bottom of the texture, so they hover. The fix draws them 2, 3 and 10 rows of their picture lower, found by the texture name; only the drawing changes. |
 
 ## Filters
 

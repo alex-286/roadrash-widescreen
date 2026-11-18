@@ -66,6 +66,60 @@ static const LONG kFullRateAhead = 0x2100;
 
 static DWORD g_cameraPositionVa = 0;
 
+// Punch shadow: FUN_00443610 (called once per HiRes setup, from 0x4101AA)
+// loads the rider's shadow frames (DATA\BIKERS\HISHADOW.DAT, LOSHADOW.DAT
+// in low resolution) into a table of 326 entries at 0x49BFE0: pixel
+// pointer, width byte, height byte. Every frame is drawn centred on its
+// box. Frame 176, the first frame of the punch, has two stray pixels in the
+// top corner of a 118x168 box (59x84 in low resolution), while the shadow
+// itself is the band of 13 (6) rows at the bottom, so the shadow jumps far
+// away from the bike. After loading, the entry points at a copy of the
+// shadow alone.
+static const DWORD kShadowLoaderCallRva = 0x000101AA;
+static const DWORD kShadowLoaderRva = 0x00043610;
+static const DWORD kShadowTableRva = 0x0009BFE0;
+static const DWORD kPunchShadowFrame = 176;
+static const DWORD kMaxStrayPixels = 8;
+static const DWORD kMaxShadowBytes = 2048;
+
+typedef int (__cdecl *ShadowLoaderFn)();
+
+static BYTE g_punchShadow[kMaxShadowBytes];
+
+// Floating buildings: the pictures of the red barn (BARN12), the brown shop
+// with the sign (RUSTICA2) and the white house (HOUSEB2) in FAMILIES.RSC end
+// in empty rows (2, 5 and 10), and the game places them as if their
+// picture reached the bottom of the texture, so they hover above the
+// ground. Every quad is turned into pixels by FUN_0040FFC0 (called at
+// 0x40FF5A and 0x40FF87); a quad whose texture (quad + 8, a texture header
+// with the name at + 0x10) is one of these is drawn that many rows lower,
+// scaled to its height on screen. Only the drawing changes.
+static const DWORD kQuadToPixelsRva = 0x0000FFC0;
+static const DWORD kQuadToPixelsCalls[] = { 0x0000FF5A, 0x0000FF87 };
+static const DWORD kTextureMagic = 0x00BC614E;
+
+struct FloatingBuilding
+{
+    CHAR name[8];
+    LONG rows;
+};
+
+// The shop is lowered by 3 of its 5 empty rows, which looks best (it has a
+// porch at its bottom edge).
+static const FloatingBuilding kFloatingBuildings[] =
+{
+    { { 'B', 'A', 'R', 'N', '1', '2', 0, 0 }, 2 },
+    { { 'R', 'U', 'S', 'T', 'I', 'C', 'A', '2' }, 3 },
+    { { 'H', 'O', 'U', 'S', 'E', 'B', '2', 0 }, 10 }
+};
+
+static const DWORD kFloatingBuildingCount =
+    sizeof(kFloatingBuildings) / sizeof(kFloatingBuildings[0]);
+
+typedef void (__fastcall *QuadToPixelsFn)(BYTE* node, BYTE* quad);
+
+static BOOL g_buildingLogged[kFloatingBuildingCount];
+
 static DWORD g_fixesBase = 0;
 
 static void LogFix(const CHAR* text)
@@ -315,6 +369,314 @@ static void FullRateObjects()
     LogFix("Full-rate objects: riders and cars in view move every game tick.");
 }
 
+static BOOL RowHasPixels(const BYTE* row, LONG width)
+{
+    LONG x;
+
+    for (x = 0; x < width; ++x)
+    {
+        if (row[x] != 0)
+        {
+            return TRUE;
+        }
+    }
+
+    return FALSE;
+}
+
+static void CutPunchShadow()
+{
+    BYTE* entry = reinterpret_cast<BYTE*>(
+        g_fixesBase + kShadowTableRva) + kPunchShadowFrame * 8;
+    const BYTE* pixels = *reinterpret_cast<BYTE**>(entry);
+    LONG width = entry[4];
+    LONG height = entry[5];
+    LONG top = -1;
+    LONG bottom = -1;
+    LONG left = width;
+    LONG right = -1;
+    LONG newWidth;
+    LONG newHeight;
+    DWORD stray = 0;
+    LONG x;
+    LONG y;
+    CHAR message[128];
+
+    if (pixels == NULL || pixels == g_punchShadow ||
+        !((width == 118 && height == 168) || (width == 59 && height == 84)))
+    {
+        return;
+    }
+
+    // The shadow: the lowest band of rows in use, without a gap.
+    for (y = height - 1; y >= 0; --y)
+    {
+        if (RowHasPixels(pixels + y * width, width))
+        {
+            if (bottom < 0)
+            {
+                bottom = y;
+            }
+
+            top = y;
+        }
+        else if (bottom >= 0)
+        {
+            break;
+        }
+    }
+
+    if (bottom < 0)
+    {
+        return;
+    }
+
+    for (y = 0; y < height; ++y)
+    {
+        for (x = 0; x < width; ++x)
+        {
+            if (pixels[y * width + x] == 0)
+            {
+                continue;
+            }
+
+            if (y < top)
+            {
+                ++stray;
+            }
+            else
+            {
+                if (x < left)
+                {
+                    left = x;
+                }
+
+                if (x > right)
+                {
+                    right = x;
+                }
+            }
+        }
+    }
+
+    newWidth = right - left + 1;
+    newHeight = bottom - top + 1;
+    if (stray == 0 || stray > kMaxStrayPixels || newHeight < 4 ||
+        static_cast<DWORD>(newWidth * newHeight) > kMaxShadowBytes)
+    {
+        LogFix("Punch shadow stays as it is: frame 176 is not as expected.");
+        return;
+    }
+
+    for (y = 0; y < newHeight; ++y)
+    {
+        for (x = 0; x < newWidth; ++x)
+        {
+            g_punchShadow[y * newWidth + x] =
+                pixels[(top + y) * width + left + x];
+        }
+    }
+
+    *reinterpret_cast<BYTE**>(entry) = g_punchShadow;
+    entry[4] = static_cast<BYTE>(newWidth);
+    entry[5] = static_cast<BYTE>(newHeight);
+
+    wsprintfA(
+        message,
+        "Punch shadow: frame 176 cut from %ldx%ld to %ldx%ld (%lu stray pixels).",
+        width,
+        height,
+        newWidth,
+        newHeight,
+        stray);
+    LogFix(message);
+}
+
+static int __cdecl HookedShadowLoader()
+{
+    int result = reinterpret_cast<ShadowLoaderFn>(
+        g_fixesBase + kShadowLoaderRva)();
+
+    if (result != 0)
+    {
+        CutPunchShadow();
+    }
+
+    return result;
+}
+
+static void FixPunchShadow()
+{
+    BYTE call[5] = { 0xE8 };
+    DWORD callEnd = g_fixesBase + kShadowLoaderCallRva + sizeof(call);
+
+    StoreDword(call + 1, g_fixesBase + kShadowLoaderRva - callEnd);
+    if (!MatchesGameBytes(kShadowLoaderCallRva, call, sizeof(call)))
+    {
+        LogFix("Punch shadow fix stays off: unexpected code in the HiRes setup.");
+        return;
+    }
+
+    StoreDword(
+        call + 1,
+        reinterpret_cast<DWORD>(HookedShadowLoader) - callEnd);
+    if (!WriteGameBytes(kShadowLoaderCallRva, call, sizeof(call)))
+    {
+        LogFix("Punch shadow fix stays off: the HiRes setup could not be changed.");
+        return;
+    }
+
+    // In case the shadows were already loaded.
+    CutPunchShadow();
+    LogFix("Punch shadow fix: the first punch frame keeps its shadow under the bike.");
+}
+
+static const FloatingBuilding* FindFloatingBuilding(const BYTE* texture)
+{
+    const DWORD* name;
+    DWORD index;
+
+    if (texture == NULL ||
+        *reinterpret_cast<const DWORD*>(texture) != kTextureMagic)
+    {
+        return NULL;
+    }
+
+    name = reinterpret_cast<const DWORD*>(texture + 0x10);
+    for (index = 0; index < kFloatingBuildingCount; ++index)
+    {
+        const DWORD* wanted = reinterpret_cast<const DWORD*>(
+            kFloatingBuildings[index].name);
+
+        if (name[0] != wanted[0] || name[1] != wanted[1])
+        {
+            continue;
+        }
+
+        if (!g_buildingLogged[index])
+        {
+            CHAR shown[9];
+            CHAR message[96];
+            DWORD c;
+
+            g_buildingLogged[index] = TRUE;
+            for (c = 0; c < 8; ++c)
+            {
+                shown[c] = kFloatingBuildings[index].name[c];
+            }
+
+            shown[8] = 0;
+            wsprintfA(
+                message,
+                "Floating buildings: %s is drawn %ld rows lower.",
+                shown,
+                kFloatingBuildings[index].rows);
+            LogFix(message);
+        }
+
+        return &kFloatingBuildings[index];
+    }
+
+    return NULL;
+}
+
+// quad + 0x44..0x60: four corners x, y (16.16, y grows downward); quad + 8:
+// its texture. The texture's rows y0 + 1 to y1 - 1 (shorts at + 6 and + 10)
+// span the quad from its top to its bottom (FUN_0044D300).
+static void __fastcall HookedQuadToPixels(BYTE* node, BYTE* quad)
+{
+    QuadToPixelsFn original = reinterpret_cast<QuadToPixelsFn>(
+        g_fixesBase + kQuadToPixelsRva);
+    const BYTE* texture = *reinterpret_cast<BYTE**>(quad + 8);
+    const FloatingBuilding* building = FindFloatingBuilding(texture);
+    LONG* corners = reinterpret_cast<LONG*>(quad + 0x44);
+    LONG saved[4];
+    LONG top;
+    LONG bottom;
+    LONG span;
+    LONG shift;
+    DWORD index;
+
+    if (building == NULL)
+    {
+        original(node, quad);
+        return;
+    }
+
+    span = *reinterpret_cast<const SHORT*>(texture + 10) -
+        *reinterpret_cast<const SHORT*>(texture + 6) - 2;
+    top = corners[1];
+    bottom = corners[1];
+    for (index = 0; index < 4; ++index)
+    {
+        LONG y = corners[index * 2 + 1];
+
+        saved[index] = y;
+        if (y < top)
+        {
+            top = y;
+        }
+
+        if (y > bottom)
+        {
+            bottom = y;
+        }
+    }
+
+    if (span <= 0 || bottom <= top)
+    {
+        original(node, quad);
+        return;
+    }
+
+    shift = MulDiv(bottom - top, building->rows, span);
+    for (index = 0; index < 4; ++index)
+    {
+        corners[index * 2 + 1] += shift;
+    }
+
+    original(node, quad);
+
+    for (index = 0; index < 4; ++index)
+    {
+        corners[index * 2 + 1] = saved[index];
+    }
+}
+
+static void LowerFloatingBuildings()
+{
+    BYTE calls[2][5];
+    DWORD site;
+
+    for (site = 0; site < 2; ++site)
+    {
+        DWORD callEnd = g_fixesBase + kQuadToPixelsCalls[site] + 5;
+
+        calls[site][0] = 0xE8;
+        StoreDword(calls[site] + 1, g_fixesBase + kQuadToPixelsRva - callEnd);
+        if (!MatchesGameBytes(kQuadToPixelsCalls[site], calls[site], 5))
+        {
+            LogFix("Floating buildings stay as they are: unexpected code in the quad list.");
+            return;
+        }
+
+        StoreDword(
+            calls[site] + 1,
+            reinterpret_cast<DWORD>(HookedQuadToPixels) - callEnd);
+    }
+
+    for (site = 0; site < 2; ++site)
+    {
+        if (!WriteGameBytes(kQuadToPixelsCalls[site], calls[site], 5))
+        {
+            LogFix("Floating buildings stay as they are: the quad list could not be changed.");
+            return;
+        }
+    }
+
+    LogFix("Floating buildings: the red barn, the brown shop and the white house stand on the ground.");
+}
+
 void ApplyGameFixes(DWORD gameBase, const CHAR* iniPath)
 {
     static BOOL applied = FALSE;
@@ -349,5 +711,17 @@ void ApplyGameFixes(DWORD gameBase, const CHAR* iniPath)
         GetPrivateProfileIntA("Fixes", "FullRateObjects", 1, iniPath) != 0)
     {
         FullRateObjects();
+    }
+
+    if (iniPath == NULL ||
+        GetPrivateProfileIntA("Fixes", "FixPunchShadow", 1, iniPath) != 0)
+    {
+        FixPunchShadow();
+    }
+
+    if (iniPath == NULL ||
+        GetPrivateProfileIntA("Fixes", "GroundBuildings", 1, iniPath) != 0)
+    {
+        LowerFloatingBuildings();
     }
 }

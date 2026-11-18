@@ -94,6 +94,9 @@ turned off in the [Fixes] section of RoadRashWidescreen.ini.
   sound of the game.
 - Riders and cars in the distance move smoothly instead of in jumps: the
   game updated them only every few game ticks.
+- The rider's shadow stays under the bike in the first frame of a punch.
+- The red barn, the brown shop and the white house stand on the ground
+  instead of hovering above it.
 
 
 Hotkeys during a race
