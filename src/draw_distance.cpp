@@ -128,22 +128,34 @@ static const TargetedSite kSites[] =
 
 static const DWORD kSiteCount = sizeof(kSites) / sizeof(kSites[0]);
 
-// Scenery beyond the original distance. The sprites beside the road come
-// from four family slots (0x49E550, looked up by FUN_0044AC00 and its
-// siblings), which the loader thread (FUN_0044ABA0) refills with the next
-// family when the course needs it. Each segment's row cache entry (key =
-// its course piece) is filled from those slots by FUN_00444630 when the
-// segment first appears at the far end, and is kept while the key matches;
-// FUN_0044B630 also fills it while drawing. The original's 32 segments
-// never reach a slot that is about to change. Further out, an entry can be
-// filled from a slot that still holds the previous family, shows the wrong
-// sprites, and points into freed memory once the slot is reloaded (the
-// crash at 0x44B6AD). So beyond 33 segments (depth 0x2100, the limit Open
-// Rash uses for the same reason) an entry is emptied and given a negative
-// key, which FUN_00444630 never fills, and the segment's scenery and
-// objects (FUN_00438610) are not drawn; what comes from the course itself
-// still is. Once the segment is within 33 segments, its entry gets a key
-// that matches no piece, and the game fills it as in the original.
+// Scenery beyond the original distance. The pictures beside the road come
+// from four family slots (0x49E550); a picture id selects the slot by its
+// top two bits (FUN_0044AC00 and its siblings), whatever family the slot
+// holds. The course lists load events (position, slot, family); the walker
+// 80 segments ahead (0x49EE30) queues each one when it gets near
+// (FUN_00452310), and the loader thread (FUN_0044ABA0) replaces the slot.
+// Each segment's row cache entry (key = its course position) is filled
+// from the slots by FUN_00444630 when the segment appears at the far end
+// (the walls and rock faces beside the road: FUN_0040B8E0, FUN_0040CCB0,
+// FUN_0040CCF0), and kept while the key matches; FUN_0044B630 fills the
+// objects' pictures (trees, buildings) while drawing. The original's 32
+// segments never reach a slot whose family is not loaded yet. Further out,
+// a slot can still hold the previous family: the entry then shows wrong
+// pictures and points into freed memory once the slot is reloaded (the
+// crash at 0x44B6AD).
+//
+// So beyond 33 segments (depth 0x2100, the limit Open Rash uses for the
+// same reason) an entry is filled only while every slot it uses is idle,
+// fully loaded, has no reload queued and no load event still pending at or
+// before the segment: then the slot holds the family the segment needs.
+// Otherwise the entry is emptied and given a negative key, which
+// FUN_00444630 never fills. A far entry is emptied again as soon as one of
+// its slots is locked or changes, before the next frame is drawn (the main
+// thread locks a slot before the loader thread frees it). Objects beyond 33
+// segments (FUN_00438610) are not drawn at all: the game registers them
+// only that far. Once a segment is within 33 segments, an emptied entry
+// gets a key that matches no position, and the game fills it as in the
+// original.
 static const DWORD kSectionSetupRva = 0x00044630;
 static const DWORD kSectionSetupCalls[] =
 {
@@ -161,6 +173,48 @@ static const LONG kNearDepth = 0x2100;
 static const LONG kFarKey = static_cast<LONG>(0x80000002);
 static const LONG kRefillKey = 0x7FFFFFFE;
 static const DWORD kEntryDwords = kCacheEntrySize / sizeof(DWORD);
+
+// The family slots: the family each holds (negative while it loads), their
+// locks (set during a lookup and during a whole reload) and their number.
+static const DWORD kSlotCount = 4;
+static const DWORD kSlotFamilyVa = 0x004B7F10;
+static const DWORD kSlotLockVa = 0x0049E630;
+static const DWORD kSlotsInUseVa = 0x004755F8;
+// Queued loads (FUN_0044B120): 8 entries of family, slot, mode; mode 3
+// replaces the slot's family.
+static const DWORD kLoadQueueVa = 0x0049E5D0;
+static const DWORD kLoadQueueWriteVa = 0x004755F0;
+static const DWORD kLoadQueueReadVa = 0x004755F4;
+static const DWORD kLoadQueueLength = 8;
+static const DWORD kLoadModeReplace = 3;
+// The walker 80 segments ahead: its course position, the active branch,
+// the branch mode (2 = both branches of a split), and per branch the load
+// events (table, position in the section, index of the next event, forward
+// flag at +0x10). Table: +8 event count, +0x18 events of 12 bytes
+// (position in segments, state, slot, family).
+static const DWORD kFrontWalkerVa = 0x0049EE30;
+static const DWORD kWalkerActiveBranch = 1;
+static const DWORD kWalkerBranchMode = 7;
+static const DWORD kWalkerBothBranches = 2;
+static const DWORD kBranchOffset = 0x28;
+static const DWORD kBranchSize = 0x1F4;
+static const DWORD kBranchEventsOffset = 0x70;
+static const DWORD kEventSize = 0xC;
+static const DWORD kEventsFirstOffset = 0x18;
+static const LONG kMaxEvents = 0x1000;
+static const DWORD kSegmentUnit = 0x100;
+
+// A far entry filled from the slots: its key, the slots it used and the
+// families they held.
+struct FarFill
+{
+    BOOL valid;
+    LONG key;
+    DWORD slots;
+    LONG family[kSlotCount];
+};
+
+static FarFill g_farFills[2 * (kMaxDrawSegments + 2)];
 
 typedef void (__fastcall *SectionSetupFn)(BYTE* section, BYTE* record, LONG* projection);
 typedef void (__fastcall *SliceObjectsFn)(LONG* record, int from, int to);
@@ -287,6 +341,7 @@ static void __cdecl HookedSetup()
     for (index = 0; index < 2 * slices; ++index)
     {
         *reinterpret_cast<DWORD*>(g_cache1 + index * kCacheEntrySize) = 0;
+        g_farFills[index].valid = FALSE;
     }
 
     // Each slice points at its two inline rows, and twice at itself.
@@ -315,36 +370,303 @@ static void __cdecl HookedSetup()
     g_thresholds[g_segments + 1] = g_thresholds[g_segments];
 }
 
-// projection[4]: the segment's depth; record + 0xFC: its row cache entry.
+template <typename T>
+static T GameValue(DWORD va)
+{
+    return *reinterpret_cast<const T*>(GameVa(va));
+}
+
+// The slots whose pictures FUN_00444630 puts into a segment's entry, by
+// the segment's type (+0x3C): picture ids at +0x148 and +0x149 (type 0
+// skips 0xFF), and for type 3 also at +0x39.
+static DWORD SectionSlots(const BYTE* section)
+{
+    BYTE type = section[0x3C];
+    DWORD slots = 0;
+    DWORD side;
+
+    if (type != 0 && type != 1 && type != 3)
+    {
+        return 0;
+    }
+
+    for (side = 0; side < 2; ++side)
+    {
+        BYTE id = section[0x148 + side];
+
+        if (type != 0 || id != 0xFF)
+        {
+            slots |= 1UL << (id >> 6);
+        }
+    }
+
+    if (type == 3)
+    {
+        slots |= 1UL << (section[0x39] >> 6);
+    }
+
+    return slots;
+}
+
+static BOOL SlotInUse(DWORD slot)
+{
+    return static_cast<LONG>(slot) < GameValue<LONG>(kSlotsInUseVa);
+}
+
+static LONG SlotFamily(DWORD slot)
+{
+    return GameValue<LONG>(kSlotFamilyVa + slot * sizeof(LONG));
+}
+
+static BOOL SlotLocked(DWORD slot)
+{
+    return GameValue<DWORD>(kSlotLockVa + slot * sizeof(DWORD)) != 0;
+}
+
+static BOOL ReplaceQueued(DWORD slot)
+{
+    DWORD read = GameValue<DWORD>(kLoadQueueReadVa) % kLoadQueueLength;
+    DWORD write = GameValue<DWORD>(kLoadQueueWriteVa) % kLoadQueueLength;
+
+    while (read != write)
+    {
+        const DWORD* load = reinterpret_cast<const DWORD*>(
+            GameVa(kLoadQueueVa) + read * 3 * sizeof(DWORD));
+
+        if (load[1] == slot && load[2] == kLoadModeReplace)
+        {
+            return TRUE;
+        }
+
+        read = (read + 1) % kLoadQueueLength;
+    }
+
+    return FALSE;
+}
+
+// Whether the walker ahead still has a load event for the slot at or before
+// the course position `key`: the slot then does not hold that segment's
+// family yet. Conservative by one segment.
+static BOOL LoadPending(DWORD slot, LONG key)
+{
+    const BYTE* walker = reinterpret_cast<const BYTE*>(GameVa(kFrontWalkerVa));
+    const LONG* walkerDwords = reinterpret_cast<const LONG*>(walker);
+    LONG position = walkerDwords[0];
+    DWORD branch;
+
+    for (branch = 0; branch < 2; ++branch)
+    {
+        const BYTE* events;
+        const BYTE* table;
+        LONG sectionPosition;
+        LONG next;
+        LONG count;
+
+        if (static_cast<DWORD>(walkerDwords[kWalkerBranchMode]) != kWalkerBothBranches &&
+            static_cast<DWORD>(walkerDwords[kWalkerActiveBranch]) != branch)
+        {
+            continue;
+        }
+
+        events = walker + kBranchOffset + branch * kBranchSize + kBranchEventsOffset;
+        table = *reinterpret_cast<BYTE* const*>(events);
+        if (table == NULL || events[0x10] == 0)
+        {
+            continue;
+        }
+
+        sectionPosition = *reinterpret_cast<const LONG*>(events + 4);
+        next = *reinterpret_cast<const LONG*>(events + 8);
+        count = *reinterpret_cast<const LONG*>(table + 8);
+        if (next < 0 || count < 0 || count > kMaxEvents)
+        {
+            return TRUE;
+        }
+
+        for (; next < count; ++next)
+        {
+            const BYTE* event = table + kEventsFirstOffset + next * kEventSize;
+            LONG eventPosition = position - sectionPosition +
+                *reinterpret_cast<const LONG*>(event) * static_cast<LONG>(kSegmentUnit);
+
+            if (eventPosition - static_cast<LONG>(kSegmentUnit) > key)
+            {
+                break;
+            }
+
+            if (event[5] == slot)
+            {
+                return TRUE;
+            }
+        }
+    }
+
+    return FALSE;
+}
+
+// Whether a far segment's pictures can come from the slots now.
+static BOOL SlotsReady(DWORD slots, LONG key)
+{
+    DWORD slot;
+
+    for (slot = 0; slot < kSlotCount; ++slot)
+    {
+        if ((slots & (1UL << slot)) == 0 || !SlotInUse(slot))
+        {
+            continue;
+        }
+
+        if (SlotLocked(slot) || SlotFamily(slot) <= 0 ||
+            ReplaceQueued(slot) || LoadPending(slot, key))
+        {
+            return FALSE;
+        }
+    }
+
+    return TRUE;
+}
+
+// Whether a far entry filled earlier still points at the families it was
+// filled from.
+static BOOL FillStillValid(const FarFill* fill)
+{
+    DWORD slot;
+
+    for (slot = 0; slot < kSlotCount; ++slot)
+    {
+        if ((fill->slots & (1UL << slot)) == 0 || !SlotInUse(slot))
+        {
+            continue;
+        }
+
+        if (SlotLocked(slot) || SlotFamily(slot) != fill->family[slot] ||
+            ReplaceQueued(slot))
+        {
+            return FALSE;
+        }
+    }
+
+    return TRUE;
+}
+
+static void RecordFill(FarFill* fill, LONG key, DWORD slots)
+{
+    DWORD slot;
+
+    fill->valid = TRUE;
+    fill->key = key;
+    fill->slots = slots;
+    for (slot = 0; slot < kSlotCount; ++slot)
+    {
+        fill->family[slot] = SlotFamily(slot);
+    }
+}
+
+static void EmptyEntry(LONG* entry)
+{
+    if (entry[0] != kFarKey)
+    {
+        const LONG* empty = reinterpret_cast<const LONG*>(GameVa(kEmptyEntryVa));
+        DWORD index;
+
+        for (index = 0; index < kEntryDwords; ++index)
+        {
+            entry[index] = empty[index];
+        }
+
+        entry[0] = kFarKey;
+    }
+}
+
+// The bookkeeping of an entry in the moved caches, or NULL.
+static FarFill* FillOf(const LONG* entry)
+{
+    DWORD offset = reinterpret_cast<DWORD>(entry) - reinterpret_cast<DWORD>(g_cache1);
+    DWORD index = offset / kCacheEntrySize;
+
+    if (reinterpret_cast<const BYTE*>(entry) < g_cache1 ||
+        offset % kCacheEntrySize != 0 ||
+        index >= 2 * (g_segments + 2))
+    {
+        return NULL;
+    }
+
+    return &g_farFills[index];
+}
+
+// projection[4]: the segment's depth; record + 0xFC: its row cache entry;
+// record + 8: the segment, whose position (+8) is the entry's key.
 static void __fastcall HookedSectionSetup(
     BYTE* section,
     BYTE* record,
     LONG* projection)
 {
     LONG* entry = *reinterpret_cast<LONG**>(record + 0xFC);
+    LONG key = *reinterpret_cast<const LONG*>(*reinterpret_cast<BYTE**>(record + 8) + 8);
+    FarFill* fill = FillOf(entry);
+    BOOL recordFill = FALSE;
+    DWORD slots = 0;
 
     if (projection[4] > kNearDepth)
     {
-        if (entry[0] != kFarKey)
+        slots = SectionSlots(section);
+        if (fill == NULL)
         {
-            const LONG* empty = reinterpret_cast<const LONG*>(GameVa(kEmptyEntryVa));
-            DWORD index;
-
-            for (index = 0; index < kEntryDwords; ++index)
+            EmptyEntry(entry);
+        }
+        else if (entry[0] == key)
+        {
+            // Filled before: still from the same families? (An entry
+            // filled within 33 segments is checked like a new one.)
+            if (fill->valid && fill->key == key ?
+                    !FillStillValid(fill) :
+                    !SlotsReady(slots, key))
             {
-                entry[index] = empty[index];
+                fill->valid = FALSE;
+                EmptyEntry(entry);
+            }
+            else if (!fill->valid || fill->key != key)
+            {
+                RecordFill(fill, key, slots);
+            }
+        }
+        else if (SlotsReady(slots, key))
+        {
+            // The game fills an entry whose key does not match; a negative
+            // key it leaves alone.
+            if (entry[0] == kFarKey)
+            {
+                entry[0] = kRefillKey;
             }
 
-            entry[0] = kFarKey;
+            recordFill = TRUE;
+        }
+        else
+        {
+            fill->valid = FALSE;
+            EmptyEntry(entry);
         }
     }
-    else if (entry[0] == kFarKey)
+    else
     {
-        entry[0] = kRefillKey;
+        if (fill != NULL)
+        {
+            fill->valid = FALSE;
+        }
+
+        if (entry[0] == kFarKey)
+        {
+            entry[0] = kRefillKey;
+        }
     }
 
     reinterpret_cast<SectionSetupFn>(g_base + kSectionSetupRva)(
         section, record, projection);
+
+    if (recordFill && entry[0] == key)
+    {
+        RecordFill(fill, key, slots);
+    }
 }
 
 // record[6]: the segment's depth. A segment that is not drawn hands the
