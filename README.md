@@ -240,7 +240,7 @@ Requirements:
 - Microsoft Platform SDK (expected at `C:\Program Files\Microsoft Platform SDK`)
 
 ```bat
-git clone <repository-url>
+git clone https://github.com/alex-286/roadrash-widescreen.git
 cd roadrash-widescreen
 build.cmd
 ```

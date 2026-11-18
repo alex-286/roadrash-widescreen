@@ -4,6 +4,9 @@ Road Rash Widescreen Patch 1.0.0
 Native resolution, double resolution, a longer view and fixes for the
 original 1996 PC version of Road Rash, from Windows 95 to Windows 11.
 
+Project page, source code and new versions:
+https://github.com/alex-286/roadrash-widescreen
+
 A widescreen patch for the Windows 95 version of Road Rash. It runs the
 game at the native resolution of your monitor with a view that matches its
 aspect ratio, so you see more of the road instead of a stretched 4:3
@@ -160,7 +163,7 @@ was taken from them):
 - Open Rash and Open Rash Next by Replica-
 - road-rash by arkits
 Their links and what each one contributed are listed in the README on the
-project page.
+project page (see the top of this file).
 
 
 License
