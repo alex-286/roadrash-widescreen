@@ -92,6 +92,8 @@ turned off in the [Fixes] section of RoadRashWidescreen.ini.
   of in steps of 2 pixels.
 - On Windows Vista and newer, a music volume of 0 no longer mutes all other
   sound of the game.
+- Riders and cars in the distance move smoothly instead of in jumps: the
+  game updated them only every few game ticks.
 
 
 Hotkeys during a race

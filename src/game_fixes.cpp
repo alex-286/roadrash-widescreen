@@ -46,6 +46,26 @@ static const DWORD kMusicPlayingFlagRva = 0x000C4174;
 
 typedef DWORD (__fastcall *MusicStartFn)(DWORD, DWORD);
 
+// Object update rate: FUN_00438170 walks the world nodes (riders, cars,
+// pedestrians, cops) every game tick and updates each one through
+// FUN_00437E60 once its next-update tick [node + 0x0C] has come. That
+// function runs the node's think and move handlers with the time since its
+// last update ([node + 0x18]), then picks a new interval [node + 0x14] from
+// the distance to the camera: 1 tick close by, up to 8 for riders 30
+// segments ahead (0x1E for nodes off the road). Far riders and cars
+// therefore move in visible jumps. At 0x438108 it computes
+// next = [node + 0x14] + tick. Within the range where nodes are drawn
+// (FUN_00438450: up to camera + 0x2000), next becomes tick + 1, so they move
+// every tick; their movement still follows the elapsed time as before.
+// Nodes further away, behind the camera or off the road keep their
+// interval, and [node + 0x14] stays as the game computed it.
+static const DWORD kNextUpdateRva = 0x00038108;
+static const DWORD kCameraPositionRva = 0x000B6E5C;
+static const LONG kFullRateBehind = -0x400;
+static const LONG kFullRateAhead = 0x2100;
+
+static DWORD g_cameraPositionVa = 0;
+
 static DWORD g_fixesBase = 0;
 
 static void LogFix(const CHAR* text)
@@ -234,6 +254,67 @@ static void GuardMidiVolume()
     LogFix("MIDI volume guard: a music volume of 0 no longer mutes the game.");
 }
 
+// Replaces mov eax, [esi + 0x14] / mov cl, [esp + 0x10] / add eax, edi
+// with call + mov cl, [esp + 0x10]: esi is the node, edi the tick, and eax
+// returns the next-update tick. Flags are set again by the test that
+// follows; ecx and edx are kept.
+static __declspec(naked) void HookedNextUpdate()
+{
+    __asm
+    {
+        push ecx
+        push edx
+        mov eax, [esi + 0x14]
+        cmp eax, 1
+        jle done
+        cmp dword ptr [esi + 0x2C], 0
+        je done
+        mov edx, g_cameraPositionVa
+        mov ecx, [esi + 0x1C]
+        sub ecx, [edx]
+        cmp ecx, kFullRateBehind
+        jl done
+        cmp ecx, kFullRateAhead
+        jg done
+        mov eax, 1
+    done:
+        add eax, edi
+        pop edx
+        pop ecx
+        ret
+    }
+}
+
+static void FullRateObjects()
+{
+    static const BYTE expected[9] =
+    {
+        0x8B, 0x46, 0x14,       // mov eax, [esi + 0x14]
+        0x8A, 0x4C, 0x24, 0x10, // mov cl, [esp + 0x10]
+        0x03, 0xC7              // add eax, edi
+    };
+    BYTE patch[9] = { 0xE8, 0, 0, 0, 0, 0x8A, 0x4C, 0x24, 0x10 };
+    DWORD callEnd = g_fixesBase + kNextUpdateRva + 5;
+
+    if (!MatchesGameBytes(kNextUpdateRva, expected, sizeof(expected)))
+    {
+        LogFix("Full-rate objects stay off: unexpected code in the object update.");
+        return;
+    }
+
+    g_cameraPositionVa = g_fixesBase + kCameraPositionRva;
+    StoreDword(
+        patch + 1,
+        reinterpret_cast<DWORD>(HookedNextUpdate) - callEnd);
+    if (!WriteGameBytes(kNextUpdateRva, patch, sizeof(patch)))
+    {
+        LogFix("Full-rate objects stay off: the object update could not be changed.");
+        return;
+    }
+
+    LogFix("Full-rate objects: riders and cars in view move every game tick.");
+}
+
 void ApplyGameFixes(DWORD gameBase, const CHAR* iniPath)
 {
     static BOOL applied = FALSE;
@@ -262,5 +343,11 @@ void ApplyGameFixes(DWORD gameBase, const CHAR* iniPath)
         GetPrivateProfileIntA("Fixes", "MidiVolumeGuard", 1, iniPath) != 0)
     {
         GuardMidiVolume();
+    }
+
+    if (iniPath == NULL ||
+        GetPrivateProfileIntA("Fixes", "FullRateObjects", 1, iniPath) != 0)
+    {
+        FullRateObjects();
     }
 }
