@@ -258,10 +258,316 @@ static void SmoothSprites()
     LogFix("Smooth sprites: objects move in 1-pixel steps in HiRes.");
 }
 
+// Race music diagnostics. FUN_00433BB0 plays Audio\Music\GRUNGE<n>.MID
+// (SBKGRNG<n> with an AWE card, flag 0x46D900), RIFF "MIDS" files of
+// ready-made stream buffers, on the MIDI mapper: midiStreamOpen(device -1),
+// midiStreamProperty, midiOutPrepareHeader and midiStreamOut per buffer,
+// midiStreamRestart (FUN_00433E30), then midiOutSetVolume on the mapper.
+// Any failure leaves the race silent, with an error box that is hidden in
+// fullscreen. The results of these calls are logged (failures always,
+// within a limit), and so is each music start.
+static const DWORD kAweMusicFlagRva = 0x0006D900;
+static const DWORD kMaxMidiLogLines = 24;
+
+struct MidiImport
+{
+    DWORD iatVa;
+    const CHAR* name;
+};
+
+static const MidiImport kMidiImports[] =
+{
+    { 0x004CA978, "midiStreamOpen" },
+    { 0x004CA974, "midiStreamProperty" },
+    { 0x004CA970, "midiOutPrepareHeader" },
+    { 0x004CA96C, "midiStreamOut" },
+    { 0x004CA960, "midiStreamRestart" },
+    { 0x004CA968, "midiOutSetVolume" }
+};
+
+typedef MMRESULT (WINAPI *MidiStreamOpenFn)(
+    LPHMIDISTRM, LPUINT, DWORD, DWORD_PTR, DWORD_PTR, DWORD);
+typedef MMRESULT (WINAPI *MidiStreamPropertyFn)(HMIDISTRM, LPBYTE, DWORD);
+typedef MMRESULT (WINAPI *MidiHeaderFn)(HMIDIOUT, LPMIDIHDR, UINT);
+typedef MMRESULT (WINAPI *MidiStreamRestartFn)(HMIDISTRM);
+typedef MMRESULT (WINAPI *MidiOutSetVolumeFn)(HMIDIOUT, DWORD);
+
+static LPVOID g_midiOriginal[sizeof(kMidiImports) / sizeof(kMidiImports[0])];
+static DWORD g_midiLogLines = 0;
+static BOOL g_midiVolumeTolerant = FALSE;
+
+// [Fixes] MusicDevice: -1 = the MIDI mapper (as the game does), otherwise
+// the number of a MIDI output from the list in the log.
+static LONG g_musicDevice = -1;
+
+typedef UINT (WINAPI *MidiOutGetNumDevsFn)(void);
+typedef MMRESULT (WINAPI *MidiOutGetDevCapsFn)(UINT_PTR, LPMIDIOUTCAPSA, UINT);
+
+static const CHAR* MidiTechnologyName(WORD technology)
+{
+    switch (technology)
+    {
+    case MOD_MIDIPORT:
+        return "external MIDI port";
+    case MOD_SYNTH:
+        return "synthesizer";
+    case MOD_SQSYNTH:
+        return "square wave synthesizer";
+    case MOD_FMSYNTH:
+        return "FM synthesizer";
+    case MOD_MAPPER:
+        return "MIDI mapper";
+    case 6:
+        return "wavetable synthesizer";
+    case 7:
+        return "software synthesizer";
+    default:
+        return "other";
+    }
+}
+
+// The MIDI outputs Windows offers, once (the mapper plays on one of them,
+// as set in the Control Panel).
+static void LogMidiDevices()
+{
+    static BOOL logged = FALSE;
+    HMODULE winmm = GetModuleHandleA("winmm.dll");
+    MidiOutGetNumDevsFn getCount;
+    MidiOutGetDevCapsFn getCaps;
+    UINT count;
+    UINT index;
+
+    if (logged || winmm == NULL)
+    {
+        return;
+    }
+
+    logged = TRUE;
+    getCount = reinterpret_cast<MidiOutGetNumDevsFn>(
+        GetProcAddress(winmm, "midiOutGetNumDevs"));
+    getCaps = reinterpret_cast<MidiOutGetDevCapsFn>(
+        GetProcAddress(winmm, "midiOutGetDevCapsA"));
+    if (getCount == NULL || getCaps == NULL)
+    {
+        return;
+    }
+
+    count = getCount();
+    {
+        CHAR message[96];
+
+        wsprintfA(
+            message,
+            "Race music: %lu MIDI outputs; MusicDevice=%ld plays on %s.",
+            count,
+            g_musicDevice,
+            g_musicDevice < 0 ? "the MIDI mapper" : "that output");
+        LogFix(message);
+    }
+
+    for (index = 0; index < count && index < 16; ++index)
+    {
+        MIDIOUTCAPSA caps;
+        CHAR message[128];
+
+        if (getCaps(index, &caps, sizeof(caps)) != MMSYSERR_NOERROR)
+        {
+            continue;
+        }
+
+        caps.szPname[MAXPNAMELEN - 1] = 0;
+        wsprintfA(
+            message,
+            "  MIDI output %lu: %s (%s)",
+            index,
+            caps.szPname,
+            MidiTechnologyName(caps.wTechnology));
+        LogFix(message);
+    }
+}
+
+static void LogMidi(const CHAR* call, MMRESULT result)
+{
+    CHAR message[96];
+
+    if (g_midiLogLines >= kMaxMidiLogLines)
+    {
+        return;
+    }
+
+    ++g_midiLogLines;
+    wsprintfA(message, "Race music: %s returned %lu.", call, result);
+    LogFix(message);
+}
+
+static MMRESULT WINAPI HookedMidiStreamOpen(
+    LPHMIDISTRM stream,
+    LPUINT device,
+    DWORD count,
+    DWORD_PTR callback,
+    DWORD_PTR instance,
+    DWORD flags)
+{
+    UINT chosen;
+    MMRESULT result;
+
+    LogMidiDevices();
+    if (g_musicDevice >= 0 && device != NULL)
+    {
+        chosen = static_cast<UINT>(g_musicDevice);
+        result = reinterpret_cast<MidiStreamOpenFn>(g_midiOriginal[0])(
+            stream, &chosen, count, callback, instance, flags);
+        LogMidi("midiStreamOpen (the MusicDevice output)", result);
+        return result;
+    }
+
+    result = reinterpret_cast<MidiStreamOpenFn>(g_midiOriginal[0])(
+        stream, device, count, callback, instance, flags);
+    LogMidi("midiStreamOpen (MIDI mapper)", result);
+    return result;
+}
+
+static MMRESULT WINAPI HookedMidiStreamProperty(
+    HMIDISTRM stream,
+    LPBYTE data,
+    DWORD property)
+{
+    MMRESULT result = reinterpret_cast<MidiStreamPropertyFn>(g_midiOriginal[1])(
+        stream, data, property);
+
+    if (result != MMSYSERR_NOERROR)
+    {
+        LogMidi("midiStreamProperty", result);
+    }
+
+    return result;
+}
+
+static MMRESULT WINAPI HookedMidiOutPrepareHeader(
+    HMIDIOUT out,
+    LPMIDIHDR header,
+    UINT size)
+{
+    MMRESULT result = reinterpret_cast<MidiHeaderFn>(g_midiOriginal[2])(
+        out, header, size);
+
+    if (result != MMSYSERR_NOERROR)
+    {
+        LogMidi("midiOutPrepareHeader", result);
+    }
+
+    return result;
+}
+
+static MMRESULT WINAPI HookedMidiStreamOut(
+    HMIDISTRM stream,
+    LPMIDIHDR header,
+    UINT size)
+{
+    MMRESULT result = reinterpret_cast<MidiHeaderFn>(g_midiOriginal[3])(
+        reinterpret_cast<HMIDIOUT>(stream), header, size);
+
+    if (result != MMSYSERR_NOERROR)
+    {
+        LogMidi("midiStreamOut", result);
+    }
+
+    return result;
+}
+
+static MMRESULT WINAPI HookedMidiStreamRestart(HMIDISTRM stream)
+{
+    MMRESULT result = reinterpret_cast<MidiStreamRestartFn>(g_midiOriginal[4])(
+        stream);
+
+    if (result != MMSYSERR_NOERROR)
+    {
+        LogMidi("midiStreamRestart", result);
+    }
+
+    return result;
+}
+
+// With MidiVolumeGuard on, a MIDI driver that cannot set the volume
+// through the mapper no longer stops the music: the song keeps playing at
+// the driver's own volume.
+static MMRESULT WINAPI HookedMidiOutSetVolume(HMIDIOUT out, DWORD volume)
+{
+    MMRESULT result;
+
+    // The game sets the volume of the mapper (device -1); with MusicDevice
+    // it belongs to the chosen output.
+    if (g_musicDevice >= 0 && out == reinterpret_cast<HMIDIOUT>(-1))
+    {
+        out = reinterpret_cast<HMIDIOUT>(static_cast<UINT_PTR>(g_musicDevice));
+    }
+
+    result = reinterpret_cast<MidiOutSetVolumeFn>(g_midiOriginal[5])(
+        out, volume);
+
+    if (result != MMSYSERR_NOERROR)
+    {
+        LogMidi("midiOutSetVolume (MIDI mapper)", result);
+        if (g_midiVolumeTolerant)
+        {
+            LogMidi("the volume is left as it is and the music plays on", 0);
+            return MMSYSERR_NOERROR;
+        }
+    }
+
+    return result;
+}
+
+static void InstallMidiLogging()
+{
+    static const LPVOID hooks[] =
+    {
+        reinterpret_cast<LPVOID>(HookedMidiStreamOpen),
+        reinterpret_cast<LPVOID>(HookedMidiStreamProperty),
+        reinterpret_cast<LPVOID>(HookedMidiOutPrepareHeader),
+        reinterpret_cast<LPVOID>(HookedMidiStreamOut),
+        reinterpret_cast<LPVOID>(HookedMidiStreamRestart),
+        reinterpret_cast<LPVOID>(HookedMidiOutSetVolume)
+    };
+    HMODULE winmm = GetModuleHandleA("winmm.dll");
+    DWORD index;
+
+    // Check every import first, so nothing changes on a mismatch.
+    for (index = 0; index < sizeof(kMidiImports) / sizeof(kMidiImports[0]); ++index)
+    {
+        LPVOID* slot = reinterpret_cast<LPVOID*>(
+            g_fixesBase - 0x00400000 + kMidiImports[index].iatVa);
+        FARPROC expected = winmm != NULL ?
+            GetProcAddress(winmm, kMidiImports[index].name) : NULL;
+
+        if (expected == NULL || *slot != reinterpret_cast<LPVOID>(expected))
+        {
+            LogFix("Race music diagnostics stay off: the game's MIDI imports are not as expected.");
+            return;
+        }
+    }
+
+    for (index = 0; index < sizeof(kMidiImports) / sizeof(kMidiImports[0]); ++index)
+    {
+        LPVOID* slot = reinterpret_cast<LPVOID*>(
+            g_fixesBase - 0x00400000 + kMidiImports[index].iatVa);
+        DWORD oldProtection;
+        DWORD ignoredProtection;
+
+        if (VirtualProtect(slot, sizeof(LPVOID), PAGE_READWRITE, &oldProtection))
+        {
+            g_midiOriginal[index] = *slot;
+            *slot = hooks[index];
+            VirtualProtect(slot, sizeof(LPVOID), oldProtection, &ignoredProtection);
+        }
+    }
+}
+
 static DWORD __fastcall HookedMusicStart(DWORD song, DWORD track)
 {
     DWORD master = *reinterpret_cast<DWORD*>(g_fixesBase + kMasterVolumeRva);
     DWORD music = *reinterpret_cast<DWORD*>(g_fixesBase + kMusicVolumeRva);
+    DWORD result;
 
     // FUN_00433CB0: ((master * music / 100) * 255) / 100 per channel,
     // which is 0 exactly when master * music < 100.
@@ -280,8 +586,25 @@ static DWORD __fastcall HookedMusicStart(DWORD song, DWORD track)
         return 0;
     }
 
-    return reinterpret_cast<MusicStartFn>(
+    result = reinterpret_cast<MusicStartFn>(
         g_fixesBase + kMusicStartFunctionRva)(song, track);
+
+    if (g_midiLogLines < kMaxMidiLogLines)
+    {
+        CHAR message[128];
+
+        ++g_midiLogLines;
+        wsprintfA(
+            message,
+            "Race music: song %lu (%s) %s.",
+            track,
+            *reinterpret_cast<BYTE*>(g_fixesBase + kAweMusicFlagRva) != 0 ?
+                "AWE SoundFont version" : "General MIDI version",
+            result == 0 ? "started" : "failed to start");
+        LogFix(message);
+    }
+
+    return result;
 }
 
 static void GuardMidiVolume()
@@ -704,8 +1027,17 @@ void ApplyGameFixes(DWORD gameBase, const CHAR* iniPath)
     if (iniPath == NULL ||
         GetPrivateProfileIntA("Fixes", "MidiVolumeGuard", 1, iniPath) != 0)
     {
+        g_midiVolumeTolerant = TRUE;
         GuardMidiVolume();
     }
+
+    if (iniPath != NULL)
+    {
+        g_musicDevice = static_cast<LONG>(
+            GetPrivateProfileIntA("Fixes", "MusicDevice", -1, iniPath));
+    }
+
+    InstallMidiLogging();
 
     if (iniPath == NULL ||
         GetPrivateProfileIntA("Fixes", "FullRateObjects", 1, iniPath) != 0)
