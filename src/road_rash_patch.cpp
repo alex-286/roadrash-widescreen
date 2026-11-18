@@ -3876,6 +3876,76 @@ void InstallCrashLog()
     }
 }
 
+static void RestoreSlot(LPVOID* slot, LPVOID hook, LPVOID original)
+{
+    DWORD oldProtection;
+    DWORD ignoredProtection;
+
+    if (slot == NULL || original == NULL || *slot != hook ||
+        !VirtualProtect(slot, sizeof(LPVOID), PAGE_READWRITE, &oldProtection))
+    {
+        return;
+    }
+
+    *slot = original;
+    VirtualProtect(slot, sizeof(LPVOID), oldProtection, &ignoredProtection);
+}
+
+// Called from DllMain when the DLL is unloaded, before LogProxyDetach. On
+// Windows 95/98/ME, DDRAW.DLL and its vtables are shared by every process:
+// slots left pointing into this DLL lead into freed memory after the game
+// (DirectDraw's cleanup of the process, the next DirectDraw program), which
+// ended in a fatal exception 0E in KERNEL32. Every hooked slot gets its
+// original value back, unless something else changed it since. On Windows
+// NT each process has its own copy, which may already be released, so it
+// is left alone.
+void RemoveProxyHooks()
+{
+    BOOL sharedSystem = (GetVersion() & 0x80000000) != 0;
+
+    NativeMenusShutdown(sharedSystem);
+    if (!sharedSystem)
+    {
+        return;
+    }
+
+    if (g_hookState.vtable != NULL)
+    {
+        RestoreSlot(
+            &g_hookState.vtable[kCreateSurfaceVtableIndex],
+            reinterpret_cast<LPVOID>(HookedCreateSurface),
+            reinterpret_cast<LPVOID>(g_hookState.originalCreateSurface));
+        RestoreSlot(
+            &g_hookState.vtable[kSetDisplayModeVtableIndex],
+            reinterpret_cast<LPVOID>(HookedSetDisplayMode),
+            reinterpret_cast<LPVOID>(g_hookState.originalSetDisplayMode));
+    }
+
+    if (g_surfaceVtable != NULL)
+    {
+        RestoreSlot(
+            &g_surfaceVtable[kSurfaceReleaseVtableIndex],
+            reinterpret_cast<LPVOID>(HookedSurfaceRelease),
+            reinterpret_cast<LPVOID>(g_originalSurfaceRelease));
+        RestoreSlot(
+            &g_surfaceVtable[kSurfaceFlipVtableIndex],
+            reinterpret_cast<LPVOID>(HookedSurfaceFlip),
+            reinterpret_cast<LPVOID>(g_originalSurfaceFlip));
+        RestoreSlot(
+            &g_surfaceVtable[kSurfaceGetAttachedVtableIndex],
+            reinterpret_cast<LPVOID>(HookedSurfaceGetAttached),
+            reinterpret_cast<LPVOID>(g_originalSurfaceGetAttached));
+        RestoreSlot(
+            &g_surfaceVtable[kSurfaceGetFlipStatusVtableIndex],
+            reinterpret_cast<LPVOID>(HookedSurfaceGetFlipStatus),
+            reinterpret_cast<LPVOID>(g_originalSurfaceGetFlipStatus));
+        RestoreSlot(
+            &g_surfaceVtable[kSurfaceIsLostVtableIndex],
+            reinterpret_cast<LPVOID>(HookedSurfaceIsLost),
+            reinterpret_cast<LPVOID>(g_originalSurfaceIsLost));
+    }
+}
+
 // Called from DllMain when the game process ends normally (ExitProcess).
 void LogProxyDetach()
 {

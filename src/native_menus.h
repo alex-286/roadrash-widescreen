@@ -22,6 +22,10 @@ BOOL NativeMenusInstall(DWORD gameBase, BOOL background);
 void NativeMenusWatchSurface(LPVOID surface);
 void NativeMenusEnter(DWORD width, DWORD height);
 void NativeMenusLeave();
+
+// When the game ends: removes the window hook and, on Windows 95/98/ME
+// (sharedSystem), puts the shared DirectDraw vtable slots back.
+void NativeMenusShutdown(BOOL sharedSystem);
 BOOL NativeMenusActive();
 
 #endif

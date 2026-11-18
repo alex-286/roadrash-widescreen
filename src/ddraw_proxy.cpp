@@ -230,10 +230,16 @@ extern "C" BOOL WINAPI DllMain(
         LogProxyAttach(instance);
         InstallCrashLog();
     }
-    else if (reason == DLL_PROCESS_DETACH && reserved != NULL)
+    else if (reason == DLL_PROCESS_DETACH)
     {
+        // Shared DirectDraw vtables must not keep pointing into this DLL.
+        RemoveProxyHooks();
+
         // reserved != NULL: the process is ending, not the DLL unloaded.
-        LogProxyDetach();
+        if (reserved != NULL)
+        {
+            LogProxyDetach();
+        }
     }
     return TRUE;
 }

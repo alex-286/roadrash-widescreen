@@ -1331,6 +1331,18 @@ BOOL NativeMenusInstall(DWORD gameBase, BOOL background)
 // and newer rebuild the surface vtable when the display mode changes (as
 // the Flip hook in road_rash_patch.cpp notices too), so every new surface
 // is checked again.
+// Every vtable slot changed, with the value it had, for NativeMenusShutdown.
+struct PatchedSlot
+{
+    LPVOID* slot;
+    LPVOID hook;
+    LPVOID original;
+};
+
+static const DWORD kMaxPatchedSlots = 32;
+static PatchedSlot g_patchedSlots[kMaxPatchedSlots];
+static DWORD g_patchedSlotCount = 0;
+
 static void EnsureSlot(LPVOID* vtable, DWORD index, LPVOID hook, LPVOID* original)
 {
     LPVOID current = vtable[index];
@@ -1340,7 +1352,50 @@ static void EnsureSlot(LPVOID* vtable, DWORD index, LPVOID hook, LPVOID* origina
         return;
     }
 
-    PatchPointer(&vtable[index], hook, original);
+    if (PatchPointer(&vtable[index], hook, original) &&
+        g_patchedSlotCount < kMaxPatchedSlots)
+    {
+        g_patchedSlots[g_patchedSlotCount].slot = &vtable[index];
+        g_patchedSlots[g_patchedSlotCount].hook = hook;
+        g_patchedSlots[g_patchedSlotCount].original = current;
+        ++g_patchedSlotCount;
+    }
+}
+
+// When the game ends. On Windows 95/98/ME, DDRAW.DLL is shared by every
+// process, and so is its surface vtable: left pointing into this DLL, it
+// would lead into freed memory once the game is gone (DirectDraw's own
+// cleanup after the process, or the next DirectDraw program). The slots get
+// their original values back, unless something else changed them since.
+// On Windows NT every process has its own copy, which may already be gone,
+// so nothing is touched there. The CBT hook is removed in both cases.
+void NativeMenusShutdown(BOOL sharedSystem)
+{
+    DWORD index;
+
+    if (g_cbtHook != NULL)
+    {
+        UnhookWindowsHookEx(g_cbtHook);
+        g_cbtHook = NULL;
+    }
+
+    g_menusActive = FALSE;
+    if (!sharedSystem)
+    {
+        return;
+    }
+
+    for (index = 0; index < g_patchedSlotCount; ++index)
+    {
+        PatchedSlot* patched = &g_patchedSlots[index];
+
+        if (*patched->slot == patched->hook)
+        {
+            PatchPointer(patched->slot, patched->original, NULL);
+        }
+    }
+
+    g_patchedSlotCount = 0;
 }
 
 void NativeMenusWatchSurface(LPVOID surface)
