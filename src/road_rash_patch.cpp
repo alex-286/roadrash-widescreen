@@ -3502,6 +3502,7 @@ BOOL InstallRoadRashWidescreenHook(LPVOID directDraw)
         }
 
         g_gameBase = base;
+        InstallCrashLog();
         ReadVirtualWidthSetting();
         LogMessage(
             "Recognized the supported Road Rash German 1.0A executable.\r\n",
@@ -3674,6 +3675,147 @@ void LogProxyAttach(HMODULE proxy)
     length += sizeof(".\r\n") - 1;
     g_truncateLog = TRUE;
     LogMessage(message, length);
+}
+
+// Crash diagnostics: an exception that nothing in the game handles is
+// written to the log (code, address, module, registers, top of the stack)
+// before Windows deals with it as usual. The filter is set when the DLL is
+// loaded and again when the game creates DirectDraw, in case the game set
+// its own filter in between; the previous filter is called afterwards.
+static LPTOP_LEVEL_EXCEPTION_FILTER g_previousExceptionFilter = NULL;
+static BOOL g_exceptionLogged = FALSE;
+
+static void DescribeModule(DWORD address, CHAR* name, DWORD size, DWORD* base)
+{
+    MEMORY_BASIC_INFORMATION memory;
+    DWORD length;
+    const CHAR* file;
+    const CHAR* scan;
+
+    *base = 0;
+    lstrcpyA(name, "(no module)");
+    if (VirtualQuery(reinterpret_cast<LPCVOID>(address), &memory, sizeof(memory)) == 0 ||
+        memory.AllocationBase == NULL)
+    {
+        return;
+    }
+
+    length = GetModuleFileNameA(
+        reinterpret_cast<HMODULE>(memory.AllocationBase), name, size);
+    if (length == 0 || length >= size)
+    {
+        lstrcpyA(name, "(no module)");
+        return;
+    }
+
+    *base = reinterpret_cast<DWORD>(memory.AllocationBase);
+    file = name;
+    for (scan = name; *scan != 0; ++scan)
+    {
+        if (*scan == '\\' || *scan == '/')
+        {
+            file = scan + 1;
+        }
+    }
+
+    if (file != name)
+    {
+        lstrcpyA(name, file);
+    }
+}
+
+static LONG WINAPI LogUnhandledException(EXCEPTION_POINTERS* pointers)
+{
+    if (!g_exceptionLogged && pointers != NULL &&
+        pointers->ExceptionRecord != NULL && pointers->ContextRecord != NULL)
+    {
+        const EXCEPTION_RECORD* record = pointers->ExceptionRecord;
+        const CONTEXT* context = pointers->ContextRecord;
+        DWORD address = reinterpret_cast<DWORD>(record->ExceptionAddress);
+        CHAR module[MAX_PATH];
+        CHAR message[256];
+        DWORD base;
+        const DWORD* stack = reinterpret_cast<const DWORD*>(context->Esp);
+        DWORD index;
+
+        g_exceptionLogged = TRUE;
+        DescribeModule(address, module, sizeof(module), &base);
+        wsprintfA(
+            message,
+            "Crash: exception 0x%08lX at 0x%08lX (%s+0x%lX), race view %s.",
+            record->ExceptionCode,
+            address,
+            module,
+            address - base,
+            g_widescreenActive ? "active" : "off");
+        LogProxyMessage(message, NULL, 0);
+        if (record->ExceptionCode == EXCEPTION_ACCESS_VIOLATION &&
+            record->NumberParameters >= 2)
+        {
+            wsprintfA(
+                message,
+                "  %s address 0x%08lX.",
+                record->ExceptionInformation[0] != 0 ? "Writing" : "Reading",
+                record->ExceptionInformation[1]);
+            LogProxyMessage(message, NULL, 0);
+        }
+
+        wsprintfA(
+            message,
+            "  eax=%08lX ebx=%08lX ecx=%08lX edx=%08lX esi=%08lX edi=%08lX ebp=%08lX esp=%08lX",
+            context->Eax, context->Ebx, context->Ecx, context->Edx,
+            context->Esi, context->Edi, context->Ebp, context->Esp);
+        LogProxyMessage(message, NULL, 0);
+
+        if (!IsBadReadPtr(stack, 16 * sizeof(DWORD)))
+        {
+            for (index = 0; index < 16; index += 8)
+            {
+                wsprintfA(
+                    message,
+                    "  stack: %08lX %08lX %08lX %08lX %08lX %08lX %08lX %08lX",
+                    stack[index], stack[index + 1], stack[index + 2],
+                    stack[index + 3], stack[index + 4], stack[index + 5],
+                    stack[index + 6], stack[index + 7]);
+                LogProxyMessage(message, NULL, 0);
+            }
+        }
+    }
+
+    if (g_previousExceptionFilter != NULL)
+    {
+        return g_previousExceptionFilter(pointers);
+    }
+
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+void InstallCrashLog()
+{
+    LPTOP_LEVEL_EXCEPTION_FILTER previous =
+        SetUnhandledExceptionFilter(LogUnhandledException);
+
+    if (previous != LogUnhandledException)
+    {
+        g_previousExceptionFilter = previous;
+    }
+}
+
+// Called from DllMain when the game process ends normally (ExitProcess).
+void LogProxyDetach()
+{
+    if (g_widescreenActive)
+    {
+        LogMessage(
+            "The game ended during a race.\r\n",
+            sizeof("The game ended during a race.\r\n") - 1);
+    }
+    else
+    {
+        LogMessage(
+            "The game ended.\r\n",
+            sizeof("The game ended.\r\n") - 1);
+    }
 }
 
 // Logs text, an optional path and, when error is not 0, the Win32 error code.

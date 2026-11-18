@@ -228,6 +228,12 @@ extern "C" BOOL WINAPI DllMain(
     {
         g_proxyModule = instance;
         LogProxyAttach(instance);
+        InstallCrashLog();
+    }
+    else if (reason == DLL_PROCESS_DETACH && reserved != NULL)
+    {
+        // reserved != NULL: the process is ending, not the DLL unloaded.
+        LogProxyDetach();
     }
     return TRUE;
 }

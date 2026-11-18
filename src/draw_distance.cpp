@@ -8,8 +8,9 @@
 // called with 33 = segments + 1) and drawn from far to near by FUN_00443AF0,
 // which starts at slice 31 and steps back 31 times. The segments themselves
 // are streamed 80 ahead of the camera (FUN_004553xx: position + 0x5000), so
-// more could be drawn without loading more of the track. Beyond 48 (see
-// draw_distance.h), something else breaks the scenery beside the road.
+// more could be drawn without loading more of the track. The sprites beside
+// the road, however, are loaded for the original distance only, so beyond
+// 33 segments they are not drawn (see HookedSectionSetup).
 //
 // Riders, cars, pedestrians and other world nodes are still registered only
 // up to depth camera + 0x2000 (32 segments, at most 50; FUN_00438450), so
@@ -126,6 +127,43 @@ static const TargetedSite kSites[] =
 };
 
 static const DWORD kSiteCount = sizeof(kSites) / sizeof(kSites[0]);
+
+// Scenery beyond the original distance. The sprites beside the road come
+// from four family slots (0x49E550, looked up by FUN_0044AC00 and its
+// siblings), which the loader thread (FUN_0044ABA0) refills with the next
+// family when the course needs it. Each segment's row cache entry (key =
+// its course piece) is filled from those slots by FUN_00444630 when the
+// segment first appears at the far end, and is kept while the key matches;
+// FUN_0044B630 also fills it while drawing. The original's 32 segments
+// never reach a slot that is about to change. Further out, an entry can be
+// filled from a slot that still holds the previous family, shows the wrong
+// sprites, and points into freed memory once the slot is reloaded (the
+// crash at 0x44B6AD). So beyond 33 segments (depth 0x2100, the limit Open
+// Rash uses for the same reason) an entry is emptied and given a negative
+// key, which FUN_00444630 never fills, and the segment's scenery and
+// objects (FUN_00438610) are not drawn; what comes from the course itself
+// still is. Once the segment is within 33 segments, its entry gets a key
+// that matches no piece, and the game fills it as in the original.
+static const DWORD kSectionSetupRva = 0x00044630;
+static const DWORD kSectionSetupCalls[] =
+{
+    0x00043E99, 0x0004406B, 0x0004407B, 0x00044266, 0x00044276, 0x000444A0
+};
+static const DWORD kSliceObjectsRva = 0x00038610;
+static const DWORD kSliceObjectsCalls[] =
+{
+    0x00043B6D, 0x00043BC2, 0x00043BF2, 0x00043CA2
+};
+static const DWORD kEmptyEntryVa = 0x004C10D0;
+static const DWORD kObjectCursorVa = 0x004977BC;
+static const DWORD kObjectCursorNextVa = 0x004977C0;
+static const LONG kNearDepth = 0x2100;
+static const LONG kFarKey = static_cast<LONG>(0x80000002);
+static const LONG kRefillKey = 0x7FFFFFFE;
+static const DWORD kEntryDwords = kCacheEntrySize / sizeof(DWORD);
+
+typedef void (__fastcall *SectionSetupFn)(BYTE* section, BYTE* record, LONG* projection);
+typedef void (__fastcall *SliceObjectsFn)(LONG* record, int from, int to);
 
 typedef void (__cdecl *SetupFn)(void);
 
@@ -277,6 +315,69 @@ static void __cdecl HookedSetup()
     g_thresholds[g_segments + 1] = g_thresholds[g_segments];
 }
 
+// projection[4]: the segment's depth; record + 0xFC: its row cache entry.
+static void __fastcall HookedSectionSetup(
+    BYTE* section,
+    BYTE* record,
+    LONG* projection)
+{
+    LONG* entry = *reinterpret_cast<LONG**>(record + 0xFC);
+
+    if (projection[4] > kNearDepth)
+    {
+        if (entry[0] != kFarKey)
+        {
+            const LONG* empty = reinterpret_cast<const LONG*>(GameVa(kEmptyEntryVa));
+            DWORD index;
+
+            for (index = 0; index < kEntryDwords; ++index)
+            {
+                entry[index] = empty[index];
+            }
+
+            entry[0] = kFarKey;
+        }
+    }
+    else if (entry[0] == kFarKey)
+    {
+        entry[0] = kRefillKey;
+    }
+
+    reinterpret_cast<SectionSetupFn>(g_base + kSectionSetupRva)(
+        section, record, projection);
+}
+
+// record[6]: the segment's depth. A segment that is not drawn hands the
+// object cursor on unchanged, as one without objects does.
+static void __fastcall HookedSliceObjects(LONG* record, int from, int to)
+{
+    if (record[6] > kNearDepth)
+    {
+        *reinterpret_cast<LONG*>(GameVa(kObjectCursorNextVa)) =
+            *reinterpret_cast<LONG*>(GameVa(kObjectCursorVa));
+        return;
+    }
+
+    reinterpret_cast<SliceObjectsFn>(g_base + kSliceObjectsRva)(record, from, to);
+}
+
+static BOOL IsCallTo(DWORD rva, DWORD targetRva)
+{
+    const BYTE* code = reinterpret_cast<const BYTE*>(g_base + rva);
+
+    return code[0] == 0xE8 && ReadDword(code + 1) == targetRva - (rva + 5);
+}
+
+static void RedirectCall(DWORD rva, const void* hook)
+{
+    BYTE call[5];
+
+    call[0] = 0xE8;
+    *reinterpret_cast<DWORD*>(call + 1) =
+        reinterpret_cast<DWORD>(hook) - (g_base + rva + 5);
+    WriteCode(rva, call, sizeof(call));
+}
+
 static void* Allocate(DWORD bytes)
 {
     return VirtualAlloc(NULL, bytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
@@ -337,6 +438,24 @@ BOOL DrawDistanceInstall(DWORD gameBase, DWORD segments)
         return FALSE;
     }
 
+    for (index = 0; index < sizeof(kSectionSetupCalls) / sizeof(DWORD); ++index)
+    {
+        if (!IsCallTo(kSectionSetupCalls[index], kSectionSetupRva))
+        {
+            LogDistance("DrawDistance stays at 32: unexpected segment setup.");
+            return FALSE;
+        }
+    }
+
+    for (index = 0; index < sizeof(kSliceObjectsCalls) / sizeof(DWORD); ++index)
+    {
+        if (!IsCallTo(kSliceObjectsCalls[index], kSliceObjectsRva))
+        {
+            LogDistance("DrawDistance stays at 32: unexpected scenery drawing.");
+            return FALSE;
+        }
+    }
+
     // One block in the original layout: cache 1, cache 2, gap, slices.
     slices = segments + 2;
     cacheBytes = slices * kCacheEntrySize;
@@ -392,6 +511,16 @@ BOOL DrawDistanceInstall(DWORD gameBase, DWORD segments)
     *reinterpret_cast<DWORD*>(call + 1) = reinterpret_cast<DWORD>(HookedSetup) -
         (gameBase + kSetupCallRva + 5);
     WriteCode(kSetupCallRva, call, sizeof(call));
+
+    for (index = 0; index < sizeof(kSectionSetupCalls) / sizeof(DWORD); ++index)
+    {
+        RedirectCall(kSectionSetupCalls[index], HookedSectionSetup);
+    }
+
+    for (index = 0; index < sizeof(kSliceObjectsCalls) / sizeof(DWORD); ++index)
+    {
+        RedirectCall(kSliceObjectsCalls[index], HookedSliceObjects);
+    }
 
     {
         CHAR message[96];

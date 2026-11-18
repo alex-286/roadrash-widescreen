@@ -9,5 +9,7 @@
 BOOL InstallRoadRashWidescreenHook(LPVOID directDraw);
 void LogProxyAttach(HMODULE proxy);
 void LogProxyMessage(const CHAR* text, const CHAR* path, DWORD error);
+void LogProxyDetach();
+void InstallCrashLog();
 
 #endif
