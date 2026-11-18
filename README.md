@@ -182,13 +182,12 @@ is always enlarged. A filter decides how:
 | `sharp-bilinear` | Crisp pixels of even size, also at non-integer scales such as 1080p. | A clean pixel look on any resolution. |
 | `bicubic` | Smooth, photo-like enlargement; also softens the game's blocky near sprites. | A soft, modern look. |
 
-The cockpit at 2560x1440 with the default `RenderScale=2`, unscaled crops:
+The same frame at 2560x1440 with the default `RenderScale=2`: a 320x240
+crop of the rider, enlarged 2x by doubling the pixels:
 
-| Filter | Result |
-|---|---|
-| `nearest` | ![Cockpit with the nearest filter](docs/screenshots/cockpit-nearest.png) |
-| `sharp-bilinear` | ![Cockpit with the sharp-bilinear filter](docs/screenshots/cockpit-sharp-bilinear.png) |
-| `bicubic` | ![Cockpit with the bicubic filter](docs/screenshots/cockpit-bicubic.png) |
+| `nearest` | `sharp-bilinear` | `bicubic` |
+|---|---|---|
+| ![Rider with the nearest filter](docs/screenshots/filter-nearest.png) | ![Rider with the sharp-bilinear filter](docs/screenshots/filter-sharp-bilinear.png) | ![Rider with the bicubic filter](docs/screenshots/filter-bicubic.png) |
 
 With any filter except `none`, press **F11** during a race to cycle through
 `nearest`, `sharp-bilinear` and `bicubic`; the choice is kept for later
