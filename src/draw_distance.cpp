@@ -219,6 +219,19 @@ static FarFill g_farFills[2 * (kMaxDrawSegments + 2)];
 typedef void (__fastcall *SectionSetupFn)(BYTE* section, BYTE* record, LONG* projection);
 typedef void (__fastcall *SliceObjectsFn)(LONG* record, int from, int to);
 
+// The scenery of a segment: FUN_0044B980 draws the +0x3D objects whose
+// layer bit is in `layers` (FUN_00438610 draws 0xFF8 before the riders and
+// 0xFFFFF007 after them), FUN_0044B5F0 the object at +0x60.
+typedef void (__fastcall *SceneryFn)(LONG* record, DWORD layers, int from, int to);
+typedef void (__fastcall *SingleSceneryFn)(LONG* record, int from, int to);
+static const DWORD kSceneryRva = 0x0004B980;
+static const DWORD kSingleSceneryRva = 0x0004B5F0;
+static const DWORD kSceneryFirstLayers = 0x00000FF8;
+static const DWORD kSceneryOtherLayers = 0xFFFFF007;
+// Where FUN_00438610 calls them, checked at install.
+static const DWORD kSceneryCalls[] = { 0x0003864C, 0x000386D5, 0x00038764 };
+static const DWORD kSingleSceneryCalls[] = { 0x000386EA, 0x00038779 };
+
 typedef void (__cdecl *SetupFn)(void);
 
 static DWORD g_base = 0;
@@ -376,33 +389,44 @@ static T GameValue(DWORD va)
     return *reinterpret_cast<const T*>(GameVa(va));
 }
 
-// The slots whose pictures FUN_00444630 puts into a segment's entry, by
-// the segment's type (+0x3C): picture ids at +0x148 and +0x149 (type 0
-// skips 0xFF), and for type 3 also at +0x39.
+// The slots whose pictures go into a segment's entry: those FUN_00444630
+// fills by the segment's type (+0x3C: picture ids at +0x148 and +0x149,
+// type 0 skipping 0xFF, and for type 3 also at +0x39), and those of its
+// scenery, which FUN_0044B630 caches there while drawing: +0x3D objects of
+// 16 bytes from +0x40 (id in their first byte), and, when +0x60 is set,
+// the object at +0x60 (id at +0x63).
 static DWORD SectionSlots(const BYTE* section)
 {
     BYTE type = section[0x3C];
     DWORD slots = 0;
-    DWORD side;
+    DWORD index;
 
-    if (type != 0 && type != 1 && type != 3)
+    if (type == 0 || type == 1 || type == 3)
     {
-        return 0;
-    }
-
-    for (side = 0; side < 2; ++side)
-    {
-        BYTE id = section[0x148 + side];
-
-        if (type != 0 || id != 0xFF)
+        for (index = 0; index < 2; ++index)
         {
-            slots |= 1UL << (id >> 6);
+            BYTE id = section[0x148 + index];
+
+            if (type != 0 || id != 0xFF)
+            {
+                slots |= 1UL << (id >> 6);
+            }
+        }
+
+        if (type == 3)
+        {
+            slots |= 1UL << (section[0x39] >> 6);
         }
     }
 
-    if (type == 3)
+    for (index = 0; index < section[0x3D]; ++index)
     {
-        slots |= 1UL << (section[0x39] >> 6);
+        slots |= 1UL << (section[0x40 + index * 0x10] >> 6);
+    }
+
+    if (section[0x60] != 0)
+    {
+        slots |= 1UL << (section[0x63] >> 6);
     }
 
     return slots;
@@ -669,18 +693,54 @@ static void __fastcall HookedSectionSetup(
     }
 }
 
-// record[6]: the segment's depth. A segment that is not drawn hands the
-// object cursor on unchanged, as one without objects does.
+// record[6]: the segment's depth; record[2]: the segment (its position at
+// +8); record[3]: its course section; record[0x3F]: its row cache entry.
+// Beyond 33 segments FUN_00438610 is not called: the riders, cars and
+// pedestrians it draws from the visible list exist only up to 32 segments,
+// and the list's order does not hold out there. The object cursor is handed
+// on unchanged, as by a segment without objects. The segment's scenery
+// (trees, buildings, signs) is drawn as FUN_00438610 draws it when no
+// object is in the way, but only while the entry was filled from loaded
+// slots that still hold the same families (see HookedSectionSetup).
 static void __fastcall HookedSliceObjects(LONG* record, int from, int to)
 {
-    if (record[6] > kNearDepth)
+    const BYTE* section;
+    const LONG* entry;
+    const FarFill* fill;
+    LONG key;
+
+    if (record[6] <= kNearDepth)
     {
-        *reinterpret_cast<LONG*>(GameVa(kObjectCursorNextVa)) =
-            *reinterpret_cast<LONG*>(GameVa(kObjectCursorVa));
+        reinterpret_cast<SliceObjectsFn>(g_base + kSliceObjectsRva)(record, from, to);
         return;
     }
 
-    reinterpret_cast<SliceObjectsFn>(g_base + kSliceObjectsRva)(record, from, to);
+    *reinterpret_cast<LONG*>(GameVa(kObjectCursorNextVa)) =
+        *reinterpret_cast<LONG*>(GameVa(kObjectCursorVa));
+
+    section = reinterpret_cast<const BYTE*>(record[3]);
+    entry = reinterpret_cast<const LONG*>(record[0x3F]);
+    key = *reinterpret_cast<const LONG*>(record[2] + 8);
+    fill = FillOf(entry);
+    if (fill == NULL || !fill->valid || fill->key != key || entry[0] != key ||
+        (SectionSlots(section) & ~fill->slots) != 0 || !FillStillValid(fill))
+    {
+        return;
+    }
+
+    if (section[0x3D] != 0)
+    {
+        reinterpret_cast<SceneryFn>(g_base + kSceneryRva)(
+            record, kSceneryFirstLayers, from, to);
+        reinterpret_cast<SceneryFn>(g_base + kSceneryRva)(
+            record, kSceneryOtherLayers, from, to);
+    }
+
+    if (section[0x60] != 0)
+    {
+        reinterpret_cast<SingleSceneryFn>(g_base + kSingleSceneryRva)(
+            record, from, to);
+    }
 }
 
 static BOOL IsCallTo(DWORD rva, DWORD targetRva)
@@ -772,6 +832,24 @@ BOOL DrawDistanceInstall(DWORD gameBase, DWORD segments)
     for (index = 0; index < sizeof(kSliceObjectsCalls) / sizeof(DWORD); ++index)
     {
         if (!IsCallTo(kSliceObjectsCalls[index], kSliceObjectsRva))
+        {
+            LogDistance("DrawDistance stays at 32: unexpected scenery drawing.");
+            return FALSE;
+        }
+    }
+
+    for (index = 0; index < sizeof(kSceneryCalls) / sizeof(DWORD); ++index)
+    {
+        if (!IsCallTo(kSceneryCalls[index], kSceneryRva))
+        {
+            LogDistance("DrawDistance stays at 32: unexpected scenery drawing.");
+            return FALSE;
+        }
+    }
+
+    for (index = 0; index < sizeof(kSingleSceneryCalls) / sizeof(DWORD); ++index)
+    {
+        if (!IsCallTo(kSingleSceneryCalls[index], kSingleSceneryRva))
         {
             LogDistance("DrawDistance stays at 32: unexpected scenery drawing.");
             return FALSE;

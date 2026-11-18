@@ -33,9 +33,9 @@ the menu.</sub>
 - **Twice the resolution:** the race world is drawn at 960 lines (1712x960
   at 16:9) by the game's own renderer, for sharper roads, scenery and
   riders, also on Windows 98.
-- **Longer view:** the road and the walls and rock faces beside it are
-  drawn 48 segments ahead instead of the game's 32, as far as the 30th
-  Anniversary Edition shows.
+- **Longer view:** the road and its scenery (walls, rock faces, trees,
+  buildings, signs) are drawn 48 segments ahead instead of the game's 32, as
+  far as the 30th Anniversary Edition shows.
 - **Distance haze:** the farthest segments fade into a haze in the colors
   of the track's sky, so the road no longer pops in at the far end.
 - **Fixed HUD and sky:** the cockpit, gauges and messages stay centered, and
@@ -157,7 +157,7 @@ GroundBuildings=1 ; 1 (default) = three hovering buildings stand on the ground, 
 | `VirtualWidth` | The width the game renders at (multiple of 8). By default it matches your display's aspect ratio; other values change the aspect ratio. |
 | `WaitForVBlank` | Prevents tearing, but limits the frame rate to the monitor's refresh rate. |
 | `Filter` | The display filter, see [Filters](#filters). `none` keeps the game's original 8-bit display mode. |
-| `DrawDistance` | How many road segments ahead the game draws, 48 by default. The original draws 32, although it loads 80 ahead; up to 48 shows the road further into the distance (48 is also what the 30th Anniversary Edition draws). The walls and rock faces beside the road are drawn out to the full distance once the game has loaded their pictures, which it does for the original distance; until then, a far segment shows only the road. Trees, buildings and signs beside the road, riders, cars and pedestrians appear at the original distance of 33 segments, because the game handles them only that far ahead. The road arrays, the crest thresholds and the depth table are enlarged in memory for it. |
+| `DrawDistance` | How many road segments ahead the game draws, 48 by default. The original draws 32, although it loads 80 ahead; up to 48 shows the road further into the distance (48 is also what the 30th Anniversary Edition draws). The scenery beside the road (walls, rock faces, trees, buildings, signs) is drawn out to the full distance once the game has loaded its pictures, which it does for the original distance; until then, a far segment shows only the road. Riders, cars and pedestrians appear at the original distance of 32 segments, because the game handles them only that far ahead. The road arrays, the crest thresholds and the depth table are enlarged in memory for it. |
 | `DistanceFade` | How many of the farthest road segments fade into a haze (16 by default), so new segments appear out of it instead of popping in whole. The haze grows toward the far end to 3/4 and takes its color from the track's sky panorama; the game's 256-color palette is remapped for it, so the steps may show slight color shifts. 0 turns it off. |
 | `DirectPresent` | Only for the filters other than `none`. With `1`, a filter whose output has the screen size writes straight into the screen surface after the vertical blank, instead of into system memory that is then copied to the graphics card. That copy took 8 ms per frame at 1920x1080 on a Windows 98 PC. While `Scanlines` are on (which read the frame back), frames are still copied, except with `nearest`. If the screen surface cannot be locked, the frame is copied as with `0`. |
 | `Scanlines` | Strength of the scanline effect; 30 to 50 is a good start. |
