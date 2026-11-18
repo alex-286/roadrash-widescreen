@@ -7,6 +7,12 @@ aspect ratio, so you see more of the road instead of a stretched 4:3
 picture. Races are drawn at twice the original resolution (960 lines), and
 optional filters smooth the classic graphics on modern displays.
 
+The menus stay at the resolution of the races: they are enlarged to the
+screen height in the middle of the screen, and the videos by the largest
+whole factor that fits.
+NativeMenus=0 in RoadRashWidescreen.ini switches the screen to 640x480 for
+the menus, as the original game does.
+
 On Windows XP and newer, the patch changes nothing on disk: delete
 ddraw.dll and the game is back to normal. On Windows 95/98/ME, a small tool
 changes one name in ROADRASH.EXE so that the game loads the patch; it can

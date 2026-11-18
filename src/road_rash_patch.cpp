@@ -7,6 +7,7 @@
 #include "cpu_features.h"
 #include "draw_distance.h"
 #include "distance_fade.h"
+#include "native_menus.h"
 #include "hqx_upscaler.h"
 #include "fps_overlay.h"
 #include "worker_pool.h"
@@ -200,6 +201,8 @@ static BOOL g_nativeDisplayModesLogged = FALSE;
 static BOOL g_waitForVerticalBlank = TRUE;
 // DirectPresent=1 (default): filters write straight into the primary surface.
 static BOOL g_directPresent = TRUE;
+// [Display] NativeMenus: the menus stay in the native resolution.
+static BOOL g_nativeMenus = FALSE;
 
 // RenderScale=2 (default): the world is drawn at twice the 480-line
 // resolution into a back buffer of twice the size; the sky and the HUD are
@@ -3132,6 +3135,7 @@ static void InstallSurfaceHooks(LPVOID surface)
 
     if (surface == NULL || g_surfaceVtable != NULL)
     {
+        NativeMenusWatchSurface(surface);
         return;
     }
 
@@ -3190,6 +3194,7 @@ static void InstallSurfaceHooks(LPVOID surface)
     LogMessage(
         "Installed the in-place DirectDraw surface Release/Flip/GetAttachedSurface hooks.\r\n",
         sizeof("Installed the in-place DirectDraw surface Release/Flip/GetAttachedSurface hooks.\r\n") - 1);
+    NativeMenusWatchSurface(surface);
 }
 
 static HRESULT WINAPI HookedCreateSurface(
@@ -3291,6 +3296,55 @@ static HRESULT WINAPI HookedCreateSurface(
 }
 
 
+// The menus set 640x480x8 and then 640x480x16 (FUN_004485D0). With native
+// menus the first step is skipped and the second sets the native
+// resolution at 16 bits, with the menu in its middle (native_menus.cpp).
+// E_NOTIMPL: the native resolution is unavailable, use the original mode.
+static HRESULT SetNativeMenuMode(
+    LPVOID directDraw,
+    DWORD caller,
+    DWORD bitsPerPixel)
+{
+    DWORD attempt;
+
+    if (caller == g_gameBase + kMenuSetDisplayModeReturnRva)
+    {
+        return S_OK;
+    }
+
+    for (attempt = 0; attempt < 2; ++attempt)
+    {
+        DWORD width = attempt == 0 ? kTargetDisplayWidth : kSafeDisplayWidth;
+        DWORD height = attempt == 0 ? kTargetDisplayHeight : kSafeDisplayHeight;
+        HRESULT result;
+
+        if (attempt == 1 &&
+            width == kTargetDisplayWidth &&
+            height == kTargetDisplayHeight)
+        {
+            break;
+        }
+
+        result = CallOriginalSetDisplayMode(
+            directDraw,
+            width,
+            height,
+            bitsPerPixel,
+            caller);
+        if (SUCCEEDED(result))
+        {
+            NativeMenusEnter(width, height);
+            return result;
+        }
+    }
+
+    NativeMenusLeave();
+    LogMessage(
+        "Native menus: the display mode is unavailable; the menus use 640x480.\r\n",
+        sizeof("Native menus: the display mode is unavailable; the menus use 640x480.\r\n") - 1);
+    return E_NOTIMPL;
+}
+
 static HRESULT WINAPI HookedSetDisplayMode(
     LPVOID directDraw,
     DWORD width,
@@ -3326,6 +3380,17 @@ static HRESULT WINAPI HookedSetDisplayMode(
                 sizeof("Widescreen mode ended; restored the 640x480 game state.\r\n") - 1);
         }
 
+        if (g_nativeMenus)
+        {
+            HRESULT result = SetNativeMenuMode(directDraw, caller, bitsPerPixel);
+
+            if (result != E_NOTIMPL)
+            {
+                return result;
+            }
+        }
+
+        NativeMenusLeave();
         return CallOriginalSetDisplayMode(
             directDraw,
             width,
@@ -3342,6 +3407,7 @@ static HRESULT WINAPI HookedSetDisplayMode(
         HRESULT result;
         DWORD attempt;
 
+        NativeMenusLeave();
         if (g_widescreenActive)
         {
             RestoreOriginalGameState();
@@ -3527,6 +3593,15 @@ BOOL InstallRoadRashWidescreenHook(LPVOID directDraw)
                         "Display", "DistanceFade", kDefaultFadeSegments,
                         settingsPath) :
                     kDefaultFadeSegments);
+            g_nativeMenus =
+                (!settingsFound ||
+                 GetPrivateProfileIntA(
+                     "Display", "NativeMenus", 1, settingsPath) != 0) &&
+                NativeMenusInstall(
+                    base,
+                    !settingsFound ||
+                    GetPrivateProfileIntA(
+                        "Display", "MenuBackground", 1, settingsPath) != 0);
         }
 
         if (g_renderScale == 2 && !RenderScaleInstall(base))
