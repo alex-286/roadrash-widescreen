@@ -1,5 +1,8 @@
 # Road Rash Widescreen Patch
 
+**Native resolution, double resolution, a longer view and fixes for the
+original 1996 PC version of Road Rash, from Windows 95 to Windows 11.**
+
 A widescreen patch for the Windows 95 version of **Road Rash**. It runs the
 game at your monitor's native resolution with a view that matches its aspect
 ratio, so you see more of the road instead of a stretched 4:3 picture.
@@ -24,9 +27,9 @@ the menu.</sub>
 
 ## Features
 
-- **Native resolution, true widescreen:** the game renders a 480-line view as
-  wide as your display's aspect ratio (856x480 for 16:9, 1120x480 for 21:9),
-  which is scaled to the full screen. Uses the desktop resolution by default.
+- **Native resolution, true widescreen:** the game renders a view as wide as
+  your display's aspect ratio (1712x960 for 16:9, 2240x960 for 21:9), which
+  is scaled to the full screen. Uses the desktop resolution by default.
 - **Twice the resolution:** the race world is drawn at 960 lines (1712x960
   at 16:9) by the game's own renderer, for sharper roads, scenery and
   riders, also on Windows 98.
@@ -208,7 +211,8 @@ single-core CPU such as a Pentium 4, `sharp-bilinear` is the fastest choice;
 ## Troubleshooting
 
 The patch writes `RoadRashWidescreen.log` to the game folder each time the
-game starts. It shows whether the game version was recognized, which display
+game starts. Its first line names the patch version (for example
+`Road Rash Widescreen 1.0.0`). It shows whether the game version was recognized, which display
 mode and filter are used, and, per filter, how the time of a frame is spent.
 Please attach it when reporting a problem.
 
@@ -254,7 +258,8 @@ The script also assembles the release package in `build\release\`: the DLL
 (as `ddraw.dll` and as `RRWS.dll`), `RRWSPatch.exe`, the player
 documentation and default settings from [`dist/`](dist/) (`README.txt`,
 `RoadRashWidescreen.ini`), and the license as `LICENSE.txt`. Zip that folder
-for a release.
+for a release, named after the version in [`src/version.h`](src/version.h)
+(for example `RoadRashWidescreen-1.0.0.zip`).
 
 ## How it works
 

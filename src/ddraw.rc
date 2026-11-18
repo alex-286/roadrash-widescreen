@@ -1,0 +1,34 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Alexander Schmidt
+
+#include "version.h"
+
+// Version information, shown in the file properties (also on Windows 95).
+// Code page 1252 (0x4E4) so that Windows 9x reads the strings as well.
+1 VERSIONINFO
+FILEVERSION RRWS_VERSION_MAJOR, RRWS_VERSION_MINOR, RRWS_VERSION_PATCH, 0
+PRODUCTVERSION RRWS_VERSION_MAJOR, RRWS_VERSION_MINOR, RRWS_VERSION_PATCH, 0
+FILEFLAGSMASK 0x3F
+FILEFLAGS 0x0
+FILEOS 0x4
+FILETYPE 0x2
+FILESUBTYPE 0x0
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904E4"
+        BEGIN
+            VALUE "FileDescription", "Road Rash Widescreen Patch (DirectDraw proxy)"
+            VALUE "FileVersion", RRWS_VERSION_STRING
+            VALUE "InternalName", "ddraw"
+            VALUE "LegalCopyright", "Copyright (C) 2026 Alexander Schmidt, GPL-3.0-or-later"
+            VALUE "OriginalFilename", "ddraw.dll"
+            VALUE "ProductName", "Road Rash Widescreen Patch"
+            VALUE "ProductVersion", RRWS_VERSION_STRING
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1252
+    END
+END

@@ -15,6 +15,7 @@
 #include "resampler.h"
 #include "scanlines.h"
 #include "screenshot.h"
+#include "version.h"
 
 #include <intrin.h>
 
@@ -3426,7 +3427,8 @@ BOOL InstallRoadRashWidescreenHook(LPVOID directDraw)
 // a new log, which shows that Windows loaded this proxy at all.
 void LogProxyAttach(HMODULE proxy)
 {
-    static const CHAR prefix[] = "Road Rash widescreen DLL loaded from ";
+    static const CHAR prefix[] =
+        "Road Rash Widescreen " RRWS_VERSION_STRING " loaded from ";
     CHAR message[MAX_PATH + 128];
     DWORD length = sizeof(prefix) - 1;
     DWORD pathLength;

@@ -141,7 +141,13 @@ if errorlevel 1 (
     exit /b 1
 )
 
-link.exe /nologo /NODEFAULTLIB /DLL /MACHINE:I386 /SUBSYSTEM:WINDOWS,4.0 /ENTRY:DllMain@12 /DEF:"%ROOT%\src\ddraw.def" /OUT:"%BUILD%\ddraw.dll" "%BUILD%\ddraw_proxy.obj" "%BUILD%\road_rash_patch.obj" "%BUILD%\game_fixes.obj" "%BUILD%\render_scale.obj" "%BUILD%\cpu_features.obj" "%BUILD%\nearest.obj" "%BUILD%\draw_distance.obj" "%BUILD%\distance_fade.obj" "%BUILD%\native_menus.obj" "%BUILD%\fps_overlay.obj" "%BUILD%\worker_pool.obj" "%BUILD%\sharp_bilinear.obj" "%BUILD%\resampler.obj" "%BUILD%\scanlines.obj" "%BUILD%\screenshot.obj" kernel32.lib user32.lib gdi32.lib
+rc.exe /fo"%BUILD%\ddraw.res" "%ROOT%\src\ddraw.rc"
+if errorlevel 1 (
+    echo Version resource compilation failed.
+    exit /b 1
+)
+
+link.exe /nologo /NODEFAULTLIB /DLL /MACHINE:I386 /SUBSYSTEM:WINDOWS,4.0 /ENTRY:DllMain@12 /DEF:"%ROOT%\src\ddraw.def" /OUT:"%BUILD%\ddraw.dll" "%BUILD%\ddraw_proxy.obj" "%BUILD%\road_rash_patch.obj" "%BUILD%\game_fixes.obj" "%BUILD%\render_scale.obj" "%BUILD%\cpu_features.obj" "%BUILD%\nearest.obj" "%BUILD%\draw_distance.obj" "%BUILD%\distance_fade.obj" "%BUILD%\native_menus.obj" "%BUILD%\fps_overlay.obj" "%BUILD%\worker_pool.obj" "%BUILD%\sharp_bilinear.obj" "%BUILD%\resampler.obj" "%BUILD%\scanlines.obj" "%BUILD%\screenshot.obj" "%BUILD%\ddraw.res" kernel32.lib user32.lib gdi32.lib
 if errorlevel 1 (
     echo DLL linking failed.
     exit /b 1

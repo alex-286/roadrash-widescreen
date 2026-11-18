@@ -1,6 +1,37 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Alexander Schmidt
 
+#include "version.h"
+
 // Without a manifest, newer Windows treats an exe named "...Patch" as an
 // installer and asks for administrator rights. Windows 9x ignores it.
 1 24 "win9x_patcher.manifest"
+
+// Version information, shown in the file properties (also on Windows 95).
+1 VERSIONINFO
+FILEVERSION RRWS_VERSION_MAJOR, RRWS_VERSION_MINOR, RRWS_VERSION_PATCH, 0
+PRODUCTVERSION RRWS_VERSION_MAJOR, RRWS_VERSION_MINOR, RRWS_VERSION_PATCH, 0
+FILEFLAGSMASK 0x3F
+FILEFLAGS 0x0
+FILEOS 0x4
+FILETYPE 0x1
+FILESUBTYPE 0x0
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904E4"
+        BEGIN
+            VALUE "FileDescription", "Road Rash Widescreen Patch - Windows 9x setup"
+            VALUE "FileVersion", RRWS_VERSION_STRING
+            VALUE "InternalName", "RRWSPatch"
+            VALUE "LegalCopyright", "Copyright (C) 2026 Alexander Schmidt, GPL-3.0-or-later"
+            VALUE "OriginalFilename", "RRWSPatch.exe"
+            VALUE "ProductName", "Road Rash Widescreen Patch"
+            VALUE "ProductVersion", RRWS_VERSION_STRING
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1252
+    END
+END

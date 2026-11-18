@@ -12,8 +12,11 @@
 
 #include <windows.h>
 
+#include "version.h"
+
 static const DWORD kExpectedTimestamp = 0x321DCBE7;
-static const CHAR kTitle[] = "Road Rash Widescreen - Windows 9x setup";
+static const CHAR kTitle[] =
+    "Road Rash Widescreen " RRWS_VERSION_STRING " - Windows 9x setup";
 static const CHAR kOriginalName[] = "DDRAW.dll";
 static const CHAR kPatchedName[] = "RRWS.dll";
 static const CHAR kGameFile[] = "ROADRASH.EXE";
