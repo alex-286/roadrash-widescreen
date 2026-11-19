@@ -111,6 +111,7 @@ turned off in the [Fixes] section of RoadRashWidescreen.ini.
 - The rider's shadow stays under the bike in the first frame of a punch.
 - The red barn, the brown shop and the white house stand on the ground
   instead of hovering above it.
+- The distance in the cockpit no longer wraps to 0 after 25.5.
 
 
 Hotkeys

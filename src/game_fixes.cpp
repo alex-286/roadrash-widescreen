@@ -120,6 +120,23 @@ typedef void (__fastcall *QuadToPixelsFn)(BYTE* node, BYTE* quad);
 
 static BOOL g_buildingLogged[kFloatingBuildingCount];
 
+// Odometer: FUN_00446A40 computes the distance shown in the HUD in tenths
+// of a mile from the player's track position, ((position >> 8) - 50) / 33,
+// or in tenths of a kilometre with metric units, ((position >> 5) - 400) /
+// 165, and stores only the low byte (mov [0x49E115], al at 0x446A61 and
+// 0x446A75). The HUD reads it unsigned at 0x446DA1 (xor edx, edx /
+// mov dl, [0x49E115]) and prints value / 10 and value % 10, so the display
+// wraps to 0 after 25.5 (most courses in kilometres are longer) and shows
+// 25.x before the start line, where the value is negative. Nothing else
+// reads the byte. Both stores now keep the whole value in this DLL, and
+// the HUD reads it back limited to 0..9999.
+static const DWORD kOdometerByteRva = 0x0009E115;
+static const DWORD kOdometerStoreRvas[] = { 0x00046A61, 0x00046A75 };
+static const DWORD kOdometerReadRva = 0x00046DA1;
+static const LONG kOdometerMaximum = 9999;
+
+static LONG g_odometerTenths = 0;
+
 static DWORD g_fixesBase = 0;
 
 static void LogFix(const CHAR* text)
@@ -1000,6 +1017,84 @@ static void LowerFloatingBuildings()
     LogFix("Floating buildings: the red barn, the brown shop and the white house stand on the ground.");
 }
 
+// Replaces xor edx, edx / mov dl, [0x49E115] (8 bytes) with a call and 3
+// nops. Returns the distance in edx; only edx and the flags change, and the
+// code that follows sets no condition on the flags.
+static __declspec(naked) void HookedOdometerRead()
+{
+    __asm
+    {
+        mov edx, g_odometerTenths
+        test edx, edx
+        jge notNegative
+        xor edx, edx
+    notNegative:
+        cmp edx, kOdometerMaximum
+        jle done
+        mov edx, kOdometerMaximum
+    done:
+        ret
+    }
+}
+
+static void FixOdometer()
+{
+    BYTE stores[2][5];
+    BYTE expectedRead[8] = { 0x33, 0xD2, 0x8A, 0x15 };
+    BYTE read[8] = { 0xE8, 0, 0, 0, 0, 0x90, 0x90, 0x90 };
+    DWORD byteVa = g_fixesBase + kOdometerByteRva;
+    DWORD readEnd = g_fixesBase + kOdometerReadRva + 5;
+    DWORD site;
+
+    // mov [0x49E115], al
+    for (site = 0; site < 2; ++site)
+    {
+        stores[site][0] = 0xA2;
+        StoreDword(stores[site] + 1, byteVa);
+        if (!MatchesGameBytes(kOdometerStoreRvas[site], stores[site], 5))
+        {
+            LogFix("Odometer fix stays off: unexpected code where the distance is stored.");
+            return;
+        }
+
+        // mov [g_odometerTenths], eax
+        stores[site][0] = 0xA3;
+        StoreDword(
+            stores[site] + 1,
+            reinterpret_cast<DWORD>(&g_odometerTenths));
+    }
+
+    StoreDword(expectedRead + 4, byteVa);
+    if (!MatchesGameBytes(kOdometerReadRva, expectedRead, sizeof(expectedRead)))
+    {
+        LogFix("Odometer fix stays off: unexpected code in the HUD.");
+        return;
+    }
+
+    // The distance the game stored before the patch was installed.
+    g_odometerTenths = *reinterpret_cast<const BYTE*>(byteVa);
+
+    StoreDword(read + 1, reinterpret_cast<DWORD>(HookedOdometerRead) - readEnd);
+    if (!WriteGameBytes(kOdometerReadRva, read, sizeof(read)))
+    {
+        LogFix("Odometer fix stays off: the HUD could not be changed.");
+        return;
+    }
+
+    for (site = 0; site < 2; ++site)
+    {
+        if (!WriteGameBytes(kOdometerStoreRvas[site], stores[site], 5))
+        {
+            // Back to the game's own byte, so the HUD keeps working.
+            WriteGameBytes(kOdometerReadRva, expectedRead, sizeof(expectedRead));
+            LogFix("Odometer fix stays off: the distance store could not be changed.");
+            return;
+        }
+    }
+
+    LogFix("Odometer fix: the HUD distance no longer wraps to 0 after 25.5.");
+}
+
 void ApplyGameFixes(DWORD gameBase, const CHAR* iniPath)
 {
     static BOOL applied = FALSE;
@@ -1055,5 +1150,11 @@ void ApplyGameFixes(DWORD gameBase, const CHAR* iniPath)
         GetPrivateProfileIntA("Fixes", "GroundBuildings", 1, iniPath) != 0)
     {
         LowerFloatingBuildings();
+    }
+
+    if (iniPath == NULL ||
+        GetPrivateProfileIntA("Fixes", "FixOdometer", 1, iniPath) != 0)
+    {
+        FixOdometer();
     }
 }

@@ -53,9 +53,9 @@ the menu.</sub>
 - **Game fixes:** the Rat and Super bikes race in their own colors; objects
   move smoothly in 1-pixel steps, and riders and cars in the distance no
   longer move in jumps; the rider's shadow stays under the bike when
-  punching; three hovering buildings stand on the ground; a music volume of 0
-  no longer mutes the whole game on newer Windows. Each fix can be turned
-  off.
+  punching; three hovering buildings stand on the ground; the distance in the
+  cockpit no longer wraps to 0 after 25.5; a music volume of 0 no longer
+  mutes the whole game on newer Windows. Each fix can be turned off.
 - **Race music on any MIDI output:** if the races stay silent because the
   MIDI mapper leads to the wrong output, `MusicDevice` picks another one.
 - **Screenshots:** **F12** saves exactly what is on screen, at full
@@ -149,6 +149,7 @@ MusicDevice=-1    ; -1 (default) = race music on the MIDI mapper, or the number 
 FullRateObjects=1 ; 1 (default) = riders and cars in view update every tick, 0 = original
 FixPunchShadow=1  ; 1 (default) = the shadow stays under the bike when punching, 0 = original
 GroundBuildings=1 ; 1 (default) = three hovering buildings stand on the ground, 0 = original
+FixOdometer=1     ; 1 (default) = the distance no longer wraps to 0 after 25.5, 0 = original
 ```
 
 | Setting | Description |
@@ -172,6 +173,7 @@ GroundBuildings=1 ; 1 (default) = three hovering buildings stand on the ground, 
 | `FullRateObjects` | The game updates each rider, car, pedestrian and cop at an interval that grows with its distance from the camera: every game tick close by, up to every 8th tick about 30 segments ahead. Their position still follows the elapsed time, so in the distance they move in visible jumps. With the fix, every one of them within the drawn range (4 segments behind to 33 ahead) is updated on every tick; the ones further away keep the original interval. |
 | `FixPunchShadow` | The rider's shadow frames (`DATA\BIKERS\HISHADOW.DAT`, `LOSHADOW.DAT`) are drawn centred on their box. In frame 176, the first frame of the punch, two stray pixels in the top corner make the box 118x168 (59x84) while the shadow is only the 13 (6) rows at its bottom, so the shadow jumps away from the bike. The fix cuts the loaded frame to the shadow itself (64x13, 32x6); the file is not changed. |
 | `GroundBuildings` | The pictures of the red barn (`BARN12`), the brown shop with the sign (`RUSTICA2`) and the white house (`HOUSEB2`) in `FAMILIES.RSC` end in empty rows, and the game places them as if the picture reached the bottom of the texture, so they hover. The fix draws them 2, 3 and 10 rows of their picture lower, found by the texture name; only the drawing changes. |
+| `FixOdometer` | The game computes the distance in the cockpit in tenths of a mile (of a kilometer with metric units) but keeps only one byte of it, so the display wraps to 0 after 25.5, which most courses in kilometers pass, and shows 25.x before the start line. The fix keeps the whole value; the display starts at 0.0 and goes up to 999.9. |
 
 ## Filters
 
