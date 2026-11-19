@@ -112,6 +112,7 @@ turned off in the [Fixes] section of RoadRashWidescreen.ini.
 - The red barn, the brown shop and the white house stand on the ground
   instead of hovering above it.
 - The distance in the cockpit no longer wraps to 0 after 25.5.
+- The road and its edges move smoothly instead of jumping by a few pixels.
 
 
 Hotkeys

@@ -87,6 +87,12 @@ if errorlevel 1 (
     exit /b 1
 )
 
+cl.exe /nologo /Zl /GS- /O2 /W3 /DWIN32 /D_WINDOWS /D_USRDLL /D_MBCS /Fo"%BUILD%\smooth_road.obj" /c "%ROOT%\src\smooth_road.cpp"
+if errorlevel 1 (
+    echo Smooth road compilation failed.
+    exit /b 1
+)
+
 cl.exe /nologo /Zl /GS- /O2 /W3 /DWIN32 /D_WINDOWS /D_USRDLL /D_MBCS /Fo"%BUILD%\nearest.obj" /c "%ROOT%\src\nearest.cpp"
 if errorlevel 1 (
     echo Nearest filter compilation failed.
@@ -147,7 +153,7 @@ if errorlevel 1 (
     exit /b 1
 )
 
-link.exe /nologo /NODEFAULTLIB /DLL /MACHINE:I386 /SUBSYSTEM:WINDOWS,4.0 /ENTRY:DllMain@12 /DEF:"%ROOT%\src\ddraw.def" /OUT:"%BUILD%\ddraw.dll" "%BUILD%\ddraw_proxy.obj" "%BUILD%\road_rash_patch.obj" "%BUILD%\game_fixes.obj" "%BUILD%\render_scale.obj" "%BUILD%\cpu_features.obj" "%BUILD%\nearest.obj" "%BUILD%\draw_distance.obj" "%BUILD%\distance_fade.obj" "%BUILD%\native_menus.obj" "%BUILD%\fps_overlay.obj" "%BUILD%\worker_pool.obj" "%BUILD%\sharp_bilinear.obj" "%BUILD%\resampler.obj" "%BUILD%\scanlines.obj" "%BUILD%\screenshot.obj" "%BUILD%\ddraw.res" kernel32.lib user32.lib gdi32.lib
+link.exe /nologo /NODEFAULTLIB /DLL /MACHINE:I386 /SUBSYSTEM:WINDOWS,4.0 /ENTRY:DllMain@12 /DEF:"%ROOT%\src\ddraw.def" /OUT:"%BUILD%\ddraw.dll" "%BUILD%\ddraw_proxy.obj" "%BUILD%\road_rash_patch.obj" "%BUILD%\game_fixes.obj" "%BUILD%\render_scale.obj" "%BUILD%\cpu_features.obj" "%BUILD%\nearest.obj" "%BUILD%\draw_distance.obj" "%BUILD%\smooth_road.obj" "%BUILD%\distance_fade.obj" "%BUILD%\native_menus.obj" "%BUILD%\fps_overlay.obj" "%BUILD%\worker_pool.obj" "%BUILD%\sharp_bilinear.obj" "%BUILD%\resampler.obj" "%BUILD%\scanlines.obj" "%BUILD%\screenshot.obj" "%BUILD%\ddraw.res" kernel32.lib user32.lib gdi32.lib
 if errorlevel 1 (
     echo DLL linking failed.
     exit /b 1

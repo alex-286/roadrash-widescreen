@@ -6,6 +6,7 @@
 #include "render_scale.h"
 #include "cpu_features.h"
 #include "draw_distance.h"
+#include "smooth_road.h"
 #include "distance_fade.h"
 #include "native_menus.h"
 #include "fps_overlay.h"
@@ -3328,6 +3329,15 @@ BOOL InstallRoadRashWidescreenHook(LPVOID directDraw)
                         "Display", "DistanceFade", kDefaultFadeSegments,
                         settingsPath) :
                     kDefaultFadeSegments);
+
+            // After DrawDistance, whose road hook it calls in turn.
+            if (!settingsFound ||
+                GetPrivateProfileIntA(
+                    "Fixes", "SmoothRoad", 1, settingsPath) != 0)
+            {
+                SmoothRoadInstall(base);
+            }
+
             g_nativeMenus =
                 (!settingsFound ||
                  GetPrivateProfileIntA(
