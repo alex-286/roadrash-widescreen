@@ -101,6 +101,10 @@ Tested on Windows 11 with DDrawCompat 0.7.2. It turns itself off next to
 another ddraw.dll, so it goes into a subfolder: DDrawCompat\ddraw.dll with
 ChainDll=DDrawCompat\ddraw.dll.
 
+Tested on Windows 11 with cnc-ddraw 7.1.0.0 in a subfolder:
+cnc-ddraw\ddraw.dll, with its ddraw.ini next to it, and
+ChainDll=cnc-ddraw\ddraw.dll.
+
 Other wrappers are untested with the patch. If a wrapper changes the game's
 window functions, the menus stay at 640x480.
 

@@ -139,6 +139,10 @@ Tested on Windows 11 with [DDrawCompat](https://github.com/narzoul/DDrawCompat)
 0.7.2. It turns itself off next to another `ddraw.dll`, so it goes into a
 subfolder: `DDrawCompat\ddraw.dll` with `ChainDll=DDrawCompat\ddraw.dll`.
 
+Tested on Windows 11 with [cnc-ddraw](https://github.com/FunkyFr3sh/cnc-ddraw)
+7.1.0.0 in a subfolder: `cnc-ddraw\ddraw.dll`, with its `ddraw.ini` next
+to it, and `ChainDll=cnc-ddraw\ddraw.dll`.
+
 ## Configuration
 
 All settings are optional. `RoadRashWidescreen.ini` next to `ROADRASH.EXE`
@@ -320,7 +324,7 @@ for a release, named after the version in [`src/version.h`](src/version.h)
 - Windows dialogs in the menus (saving, message boxes) keep their original
   size.
 - The 720x480 fallback mode uses no filter and shows no on-screen display.
-- DirectDraw wrappers other than DDrawCompat (see
+- DirectDraw wrappers other than DDrawCompat and cnc-ddraw (see
   [Together with another DirectDraw wrapper](#together-with-another-directdraw-wrapper))
   are untested; the patch changes the DirectDraw objects that such a wrapper
   creates. If a wrapper changes the game's window functions, the menus stay
