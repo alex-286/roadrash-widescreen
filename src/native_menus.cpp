@@ -141,6 +141,7 @@ static SurfaceUnlockFn g_originalUnlock = NULL;
 
 static BOOL GetSurfaceSize(LPVOID surface, LONG* width, LONG* height);
 static void InvalidateBackground();
+static void ReassertImportHooks();
 
 static void LogMenus(const CHAR* text)
 {
@@ -372,7 +373,12 @@ static BOOL WINAPI HookedMoveWindow(
         }
     }
 
-    return g_originalMoveWindow(window, x, y, width, height, repaint);
+    {
+        BOOL result = g_originalMoveWindow(window, x, y, width, height, repaint);
+
+        ReassertImportHooks();
+        return result;
+    }
 }
 
 static BOOL WINAPI HookedInvalidateRect(HWND window, const RECT* rect, BOOL erase)
@@ -902,6 +908,8 @@ static DWORD WINAPI HookedMciSendCommand(
     DWORD flags,
     DWORD parameters)
 {
+    DWORD result;
+
     if (g_menusActive && message == kMciPut &&
         (flags & (kMciPutDestination | kMciRect)) ==
             (kMciPutDestination | kMciRect) &&
@@ -972,11 +980,18 @@ static DWORD WINAPI HookedMciSendCommand(
 
         copy[3] = static_cast<DWORD>(width);
         copy[4] = static_cast<DWORD>(height);
-        return g_originalMciSendCommand(
+        result = g_originalMciSendCommand(
             device, message, flags, reinterpret_cast<DWORD>(copy));
     }
+    else
+    {
+        // MCI_OPEN loads the video DLLs, after which a wrapper may hook
+        // the game's imports again.
+        result = g_originalMciSendCommand(device, message, flags, parameters);
+    }
 
-    return g_originalMciSendCommand(device, message, flags, parameters);
+    ReassertImportHooks();
+    return result;
 }
 
 // F12 in the menus: the screen as shown (without the mouse pointer, which
@@ -1200,6 +1215,7 @@ static HRESULT WINAPI HookedBltFast(
     RECT to;
     DWORD bltFlags = 0;
 
+    ReassertImportHooks();
     if (!IsMenuPrimary(surface))
     {
         return g_originalBltFast(surface, x, y, source, sourceRect, flags);
@@ -1374,37 +1390,77 @@ struct ImportHook
     LPVOID* original;
 };
 
-BOOL NativeMenusInstall(DWORD gameBase, BOOL background)
+static const ImportHook g_importHooks[] =
 {
-    static BOOL installed = FALSE;
-    const ImportHook hooks[] =
-    {
-        { kGetWindowRectIatVa, "user32.dll", "GetWindowRect",
-          reinterpret_cast<LPVOID>(HookedGetWindowRect),
-          reinterpret_cast<LPVOID*>(&g_originalGetWindowRect) },
-        { kGetCursorPosIatVa, "user32.dll", "GetCursorPos",
-          reinterpret_cast<LPVOID>(HookedGetCursorPos),
-          reinterpret_cast<LPVOID*>(&g_originalGetCursorPos) },
-        { kMoveWindowIatVa, "user32.dll", "MoveWindow",
-          reinterpret_cast<LPVOID>(HookedMoveWindow),
-          reinterpret_cast<LPVOID*>(&g_originalMoveWindow) },
-        { kInvalidateRectIatVa, "user32.dll", "InvalidateRect",
-          reinterpret_cast<LPVOID>(HookedInvalidateRect),
-          reinterpret_cast<LPVOID*>(&g_originalInvalidateRect) },
-        { kBeginPaintIatVa, "user32.dll", "BeginPaint",
-          reinterpret_cast<LPVOID>(HookedBeginPaint),
-          reinterpret_cast<LPVOID*>(&g_originalBeginPaint) },
-        { kGetUpdateRgnIatVa, "user32.dll", "GetUpdateRgn",
-          reinterpret_cast<LPVOID>(HookedGetUpdateRgn),
-          reinterpret_cast<LPVOID*>(&g_originalGetUpdateRgn) },
-        { kMciSendCommandIatVa, "winmm.dll", "mciSendCommandA",
-          reinterpret_cast<LPVOID>(HookedMciSendCommand),
-          reinterpret_cast<LPVOID*>(&g_originalMciSendCommand) }
-    };
-    const DWORD hookCount = sizeof(hooks) / sizeof(hooks[0]);
+    { kGetWindowRectIatVa, "user32.dll", "GetWindowRect",
+      reinterpret_cast<LPVOID>(HookedGetWindowRect),
+      reinterpret_cast<LPVOID*>(&g_originalGetWindowRect) },
+    { kGetCursorPosIatVa, "user32.dll", "GetCursorPos",
+      reinterpret_cast<LPVOID>(HookedGetCursorPos),
+      reinterpret_cast<LPVOID*>(&g_originalGetCursorPos) },
+    { kMoveWindowIatVa, "user32.dll", "MoveWindow",
+      reinterpret_cast<LPVOID>(HookedMoveWindow),
+      reinterpret_cast<LPVOID*>(&g_originalMoveWindow) },
+    { kInvalidateRectIatVa, "user32.dll", "InvalidateRect",
+      reinterpret_cast<LPVOID>(HookedInvalidateRect),
+      reinterpret_cast<LPVOID*>(&g_originalInvalidateRect) },
+    { kBeginPaintIatVa, "user32.dll", "BeginPaint",
+      reinterpret_cast<LPVOID>(HookedBeginPaint),
+      reinterpret_cast<LPVOID*>(&g_originalBeginPaint) },
+    { kGetUpdateRgnIatVa, "user32.dll", "GetUpdateRgn",
+      reinterpret_cast<LPVOID>(HookedGetUpdateRgn),
+      reinterpret_cast<LPVOID*>(&g_originalGetUpdateRgn) },
+    { kMciSendCommandIatVa, "winmm.dll", "mciSendCommandA",
+      reinterpret_cast<LPVOID>(HookedMciSendCommand),
+      reinterpret_cast<LPVOID*>(&g_originalMciSendCommand) }
+};
+
+static const DWORD kImportHookCount =
+    sizeof(g_importHooks) / sizeof(g_importHooks[0]);
+static BOOL g_importHooksInstalled = FALSE;
+
+// A DirectDraw wrapper behind ChainDll can write its own functions into the
+// same import slots after the hooks are in, again whenever a DLL is loaded
+// (cnc-ddraw does, also when the video DLLs load). The hook then goes back
+// in front, and the wrapper's function becomes the one it calls, so both
+// keep working. Without such a wrapper the slots never change. Called after
+// the hooks pass a call on, for every new surface and for the menu copies.
+static void ReassertImportHooks()
+{
+    static BOOL logged = FALSE;
     DWORD index;
 
-    if (installed)
+    if (!g_importHooksInstalled)
+    {
+        return;
+    }
+
+    for (index = 0; index < kImportHookCount; ++index)
+    {
+        const ImportHook* hook = &g_importHooks[index];
+        LPVOID* slot = reinterpret_cast<LPVOID*>(GameVa(hook->iatVa));
+        LPVOID current = *slot;
+
+        if (current == hook->hook || current == NULL)
+        {
+            continue;
+        }
+
+        if (PatchPointer(slot, hook->hook, hook->original) && !logged)
+        {
+            logged = TRUE;
+            LogMenus("Native menus: another DLL replaced the game's window imports; the menu hooks now run in front of it.");
+        }
+    }
+}
+
+BOOL NativeMenusInstall(DWORD gameBase, BOOL background)
+{
+    const ImportHook* hooks = g_importHooks;
+    const DWORD hookCount = kImportHookCount;
+    DWORD index;
+
+    if (g_importHooksInstalled)
     {
         return TRUE;
     }
@@ -1439,7 +1495,7 @@ BOOL NativeMenusInstall(DWORD gameBase, BOOL background)
             hooks[index].original);
     }
 
-    installed = TRUE;
+    g_importHooksInstalled = TRUE;
     LogMenus("Native menus: the menus are shown enlarged in the middle of the native display mode.");
     return TRUE;
 }
@@ -1530,6 +1586,7 @@ void NativeMenusWatchSurface(LPVOID surface)
         return;
     }
 
+    ReassertImportHooks();
     vtable = *reinterpret_cast<LPVOID**>(surface);
     if (vtable == NULL)
     {
