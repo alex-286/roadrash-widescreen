@@ -49,8 +49,8 @@ static BOOL IsPatchModule(HMODULE module)
 }
 
 // [Display] ChainDll=: another DirectDraw library (for example a wrapper
-// renamed to dd2d9.dll) that this ddraw.dll forwards to instead of the
-// system one. A name without a folder is looked up next to the game. Empty
+// renamed to wrapper.dll) that this ddraw.dll forwards to instead of the
+// system one. A relative path starts in the game's folder. Empty
 // (the default): the system DirectDraw library.
 static HMODULE LoadChainedDdraw()
 {
@@ -343,6 +343,139 @@ extern "C" HRESULT WINAPI DirectDrawEnumerateExW(
     }
     return procedure(callback, context, flags);
 }
+
+// The other exports of the Windows ddraw.dll. The game does not use them,
+// but Windows' own DLLs import them from the module named ddraw.dll, which
+// is this proxy: d3dim.dll and d3dim700.dll (Direct3D 1-7) need the thread
+// lock and the internal lock functions as soon as anything in the game's
+// process uses Direct3D. Each export is a jump stub that finds its target
+// on the first call: the same function in the library the proxy forwards
+// to (ChainDll or the system one), else in the system ddraw.dll. The stubs
+// jump instead of calling, so they work without knowing the parameters.
+#define RRWS_FORWARDED_EXPORTS(visit) \
+    visit(0, AcquireDDThreadLock) \
+    visit(1, CompleteCreateSysmemSurface) \
+    visit(2, D3DParseUnknownCommand) \
+    visit(3, DDGetAttachedSurfaceLcl) \
+    visit(4, DDInternalLock) \
+    visit(5, DDInternalUnlock) \
+    visit(6, DSoundHelp) \
+    visit(7, DirectDrawCreateClipper) \
+    visit(8, DllCanUnloadNow) \
+    visit(9, DllGetClassObject) \
+    visit(10, GetDDSurfaceLocal) \
+    visit(11, GetOLEThunkData) \
+    visit(12, GetSurfaceFromDC) \
+    visit(13, RegisterSpecialCase) \
+    visit(14, ReleaseDDThreadLock) \
+    visit(15, SetAppCompatData)
+
+static const DWORD kForwardedExportCount = 16;
+
+#define RRWS_FORWARDED_NAME(index, name) #name,
+static const CHAR* const kForwardedExportNames[kForwardedExportCount] =
+{
+    RRWS_FORWARDED_EXPORTS(RRWS_FORWARDED_NAME)
+};
+#undef RRWS_FORWARDED_NAME
+
+static FARPROC g_forwardedExports[kForwardedExportCount];
+static HMODULE g_windowsDdraw = NULL;
+
+// The system ddraw.dll, for a function the ChainDll library does not have.
+static HMODULE LoadWindowsDdraw()
+{
+    static CHAR path[MAX_PATH];
+    UINT length;
+    HMODULE module;
+
+    if (g_windowsDdraw != NULL)
+    {
+        return g_windowsDdraw;
+    }
+
+    length = GetSystemDirectoryA(path, MAX_PATH);
+    if (length == 0 || length + sizeof("\\ddraw.dll") > MAX_PATH)
+    {
+        return NULL;
+    }
+    if (path[length - 1] != '\\' && path[length - 1] != '/')
+    {
+        lstrcatA(path, "\\");
+    }
+    lstrcatA(path, "ddraw.dll");
+
+    module = LoadLibraryA(path);
+    if (module == g_proxyModule)
+    {
+        // Windows 9x matches loaded modules by name.
+        FreeLibrary(module);
+        module = NULL;
+    }
+    g_windowsDdraw = module;
+    return module;
+}
+
+// Called by the jump stubs: the address to jump to. 0 (the caller then
+// crashes into the crash log) only if no DirectDraw library has the
+// function, which the stub's caller could not have been loaded without.
+extern "C" FARPROC WINAPI ResolveForwardedExport(DWORD index)
+{
+    FARPROC target;
+    HMODULE module;
+
+    if (index >= kForwardedExportCount)
+    {
+        return NULL;
+    }
+
+    target = g_forwardedExports[index];
+    if (target != NULL)
+    {
+        return target;
+    }
+
+    module = LoadSystemDdraw();
+    if (module != NULL)
+    {
+        target = GetProcAddress(module, kForwardedExportNames[index]);
+    }
+
+    if (target == NULL)
+    {
+        module = LoadWindowsDdraw();
+        if (module != NULL)
+        {
+            target = GetProcAddress(module, kForwardedExportNames[index]);
+        }
+    }
+
+    if (target == NULL)
+    {
+        LogProxyMessage(
+            "No DirectDraw library has the function",
+            kForwardedExportNames[index], 0);
+    }
+
+    g_forwardedExports[index] = target;
+    return target;
+}
+
+// ecx and edx are kept for the target, eax holds its address.
+#define RRWS_FORWARDED_STUB(index, name) \
+    extern "C" __declspec(naked) void Forward##name() \
+    { \
+        __asm push ecx \
+        __asm push edx \
+        __asm push index \
+        __asm call ResolveForwardedExport \
+        __asm pop edx \
+        __asm pop ecx \
+        __asm jmp eax \
+    }
+
+RRWS_FORWARDED_EXPORTS(RRWS_FORWARDED_STUB)
+#undef RRWS_FORWARDED_STUB
 
 // TRUE when this DLL is ddraw.dll or RRWS.dll, the names under which the
 // game imports it directly; it then works as a plain proxy.
