@@ -120,33 +120,20 @@ files. The changed `ROADRASH.EXE` also works on newer Windows with `RRWS.dll`.
 
 ### Together with another DirectDraw wrapper
 
-A DirectDraw wrapper (for example dd2d9, for borderless fullscreen) is also a
-`ddraw.dll` in the game folder. On Windows XP and newer, the patch can run in
-front of it in two ways:
+A DirectDraw wrapper (for example for borderless fullscreen) is also a
+`ddraw.dll` in the game folder. On Windows XP and newer, the patch runs in
+front of it:
 
-- **ChainDll:** rename the wrapper (for example to `dd2d9.dll`), copy the
-  patch's `ddraw.dll` next to it and set `ChainDll=dd2d9.dll` in
-  `RoadRashWidescreen.ini`. The patch passes the game's DirectDraw calls on
-  to the wrapper.
-- **ASI loader:** keep the wrapper as `ddraw.dll`, rename the patch's
-  `ddraw.dll` to an `.asi` file (for example `RoadRashWidescreen.asi`) and
-  let an ASI loader such as Ultimate ASI Loader load it. The patch then
-  takes over the game's DirectDraw import and passes the calls on to the
-  `ddraw.dll` that the game loaded. The ini and the log stay next to
-  `ROADRASH.EXE`. Road Rash loads Ultimate ASI Loader only as `dsound.dll`:
-  the game does not use `dinput.dll`, and Windows takes `winmm.dll` and
-  `msacm32.dll` from its own folder.
+1. Rename the wrapper's `ddraw.dll` (for example to `wrapper.dll`) and keep
+   it in the game folder.
+2. Copy the patch's `ddraw.dll` next to it.
+3. Set `ChainDll=wrapper.dll` in the `[Display]` section of
+   `RoadRashWidescreen.ini`.
 
-The log names the library that receives the calls. Use only one of the two
-ways: a second copy of the patch notices the first and stays inactive.
-
-Tested on Windows 11 with dd2d9 1.8.6 (`display=borderless`) through
-`ChainDll`: the races run in widescreen at 960 lines, with and without a
-filter. The menus stay at 640x480, enlarged by dd2d9, because dd2d9 changes
-the game's window functions that `NativeMenus` needs. Ultimate ASI Loader
-as `dsound.dll` together with dd2d9 1.8.6 crashes the game at start, also
-without the patch, so use `ChainDll` for dd2d9. Without a wrapper, the patch
-as an `.asi` (Ultimate ASI Loader as `dsound.dll`) works like `ddraw.dll`.
+The patch then passes the game's DirectDraw calls on to the wrapper; the log
+says `Loaded the DirectDraw library named by ChainDll`. A wrapper that only
+works under the name `ddraw.dll` goes into a subfolder instead, for example
+`Wrapper\ddraw.dll` with `ChainDll=Wrapper\ddraw.dll`.
 
 ## Configuration
 
@@ -199,7 +186,7 @@ SmoothRoad=1      ; 1 (default) = the road and its edges move without jumps, 0 =
 | `RenderScale` | `2` (default) makes the game's own rasterizer draw the race world at twice the resolution (960 lines, 1712x960 at 16:9), so roads, scenery and riders are sharper; the sky and the cockpit are enlarged from their 480-line art. `1` keeps the original 480 lines, for very slow PCs. On a Windows 98 PC with a Pentium Dual-Core E5800 at 1920x1080, `none` runs at 59 fps (5.4 ms of game time per frame); with `WaitForVBlank=0`, `nearest` reaches 59 fps, `sharp-bilinear` 44 and `bicubic` 28. |
 | `NativeMenus` | The game's menus are a Windows interface of 640x480: a main window with the buttons as windows of their own, dialogs and a video window. Windows 98 cannot enlarge such windows, so with `1` the screen stays at the resolution of the races (in 16-bit color), the menu fills the screen height in the middle (2.25x at 1920x1080, 3x at 2560x1440; with a factor that is not a whole number, some rows and columns of pixels are one screen pixel wider than others, and the mouse, the windows and the drawing all use the same mapping), and the videos are enlarged by the largest whole factor of their own size that fits (320x192 videos: 5x at 1920x1080, 7x at 2560x1440), on black. Everything visible in the menus is drawn by copying rectangles into the screen, so the patch enlarges those copies; the game's main window covers the whole screen as in the original, its invisible button windows are enlarged the same way, and the positions the game reads (window rectangles, the mouse, paint areas) come back in its 640x480 coordinates. Windows dialogs (the save dialog, message boxes) keep their size and are centred. With `0`, the screen switches to 640x480 for the menus as in the original game. |
 | `MenuBackground` | Only with `NativeMenus=1`: what fills the screen around the menu. With `1`, each new menu screen is averaged into a grid of 32x24 colors, which is stretched smoothly over the screen and darkened: the menu picture, enlarged and heavily blurred, made at runtime from the game's own picture. It is drawn only when the game shows a whole new menu screen, not for every small change. With `0` the area stays black. Videos always play on black. |
-| `ChainDll` | Another DirectDraw library that the patch passes the game's DirectDraw calls on to, instead of the one of Windows, see [Together with another DirectDraw wrapper](#together-with-another-directdraw-wrapper). A name without a folder is looked up next to `ROADRASH.EXE`. If the library cannot be loaded, the patch uses the Windows one and says so in the log. |
+| `ChainDll` | Another DirectDraw library that the patch passes the game's DirectDraw calls on to, instead of the one of Windows, see [Together with another DirectDraw wrapper](#together-with-another-directdraw-wrapper). A relative path starts in the folder of `ROADRASH.EXE`. If the library cannot be loaded, the patch uses the Windows one and says so in the log. |
 | `FixBikeColors` | The original game swaps the race colors of the Rat and Super bikes (the shop shows them correctly). The fix swaps the two groups of color tables back. |
 | `SmoothSprites` | In High Resolution mode the game keeps every corner of buildings, riders and cars on an even pixel, so they move in 2-pixel steps (about 4.5 screen pixels at 1080p). The fix uses the full 640x480 precision. |
 | `MidiVolumeGuard` | The game sets its music volume with `midiOutSetVolume`. Since Windows Vista, that call changes the volume of the whole game in the Windows volume mixer, and Windows keeps it, so a music volume of 0 also silenced all sound effects. With the fix, a song at volume 0 is not started at all, as when music is muted. Other volumes are passed on unchanged. |
@@ -329,11 +316,11 @@ for a release, named after the version in [`src/version.h`](src/version.h)
 - Windows dialogs in the menus (saving, message boxes) keep their original
   size.
 - The 720x480 fallback mode uses no filter and shows no on-screen display.
-- Of the DirectDraw wrappers, only dd2d9 is tested with the patch (see
-  [Together with another DirectDraw wrapper](#together-with-another-directdraw-wrapper)),
-  and with it the menus stay at 640x480. Others, such as DDrawCompat or
-  dgVoodoo2, are untested; the patch changes the DirectDraw objects that
-  such a wrapper creates.
+- Other DirectDraw wrappers (see
+  [Together with another DirectDraw wrapper](#together-with-another-directdraw-wrapper))
+  are untested; the patch changes the DirectDraw objects that such a wrapper
+  creates. If a wrapper changes the game's window functions, the menus stay
+  at 640x480 (the log says `Native menus stay off`).
 
 ## Credits
 
