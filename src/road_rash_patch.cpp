@@ -21,6 +21,8 @@
 #include <intrin.h>
 
 #pragma intrinsic(_ReturnAddress)
+// Windows 95's kernel32 has no InterlockedCompareExchange.
+#pragma intrinsic(_InterlockedCompareExchange)
 
 typedef HRESULT (WINAPI *DirectDrawSetDisplayModeFn)(
     LPVOID,
@@ -3496,6 +3498,12 @@ void LogProxyAttach(HMODULE proxy)
 static LPTOP_LEVEL_EXCEPTION_FILTER g_previousExceptionFilter = NULL;
 static BOOL g_exceptionLogged = FALSE;
 
+// The game's C++ runtime sets its own filter between the two calls and
+// keeps this one as its previous filter (0x49E80C, called at 0x45F738), so
+// the two filters call each other. Entered again, this filter returns at
+// once and the crash ends as usual instead of in a stack overflow.
+static volatile LONG g_inExceptionFilter = 0;
+
 static void DescribeModule(DWORD address, CHAR* name, DWORD size, DWORD* base)
 {
     MEMORY_BASIC_INFORMATION memory;
@@ -3537,6 +3545,13 @@ static void DescribeModule(DWORD address, CHAR* name, DWORD size, DWORD* base)
 
 static LONG WINAPI LogUnhandledException(EXCEPTION_POINTERS* pointers)
 {
+    LONG result = EXCEPTION_CONTINUE_SEARCH;
+
+    if (_InterlockedCompareExchange(&g_inExceptionFilter, 1, 0) != 0)
+    {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+
     if (!g_exceptionLogged && pointers != NULL &&
         pointers->ExceptionRecord != NULL && pointers->ContextRecord != NULL)
     {
@@ -3595,10 +3610,11 @@ static LONG WINAPI LogUnhandledException(EXCEPTION_POINTERS* pointers)
 
     if (g_previousExceptionFilter != NULL)
     {
-        return g_previousExceptionFilter(pointers);
+        result = g_previousExceptionFilter(pointers);
     }
 
-    return EXCEPTION_CONTINUE_SEARCH;
+    InterlockedExchange(&g_inExceptionFilter, 0);
+    return result;
 }
 
 void InstallCrashLog()
