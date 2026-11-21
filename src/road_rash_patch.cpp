@@ -716,6 +716,12 @@ static BOOL GetSettingsPath(CHAR* path)
     return TRUE;
 }
 
+// For the proxy, which reads ChainDll= before the game creates DirectDraw.
+BOOL GetPatchSettingsPath(CHAR* path)
+{
+    return GetSettingsPath(path);
+}
+
 static void ReadVirtualWidthSetting()
 {
     CHAR path[MAX_PATH];

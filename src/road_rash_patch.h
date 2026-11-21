@@ -12,5 +12,6 @@ void LogProxyMessage(const CHAR* text, const CHAR* path, DWORD error);
 void LogProxyDetach();
 void RemoveProxyHooks();
 void InstallCrashLog();
+BOOL GetPatchSettingsPath(CHAR* path);
 
 #endif

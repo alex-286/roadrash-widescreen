@@ -51,7 +51,7 @@ if errorlevel 1 (
 set "INCLUDE=%PLATFORM_SDK_ROOT%\Include;%PLATFORM_SDK_ROOT%\Include\crt;%INCLUDE%"
 set "LIB=%PLATFORM_SDK_ROOT%\Lib;%LIB%"
 
-cl.exe /nologo /Zl /O2 /W3 /DWIN32 /D_WINDOWS /D_USRDLL /D_MBCS /Fo"%BUILD%\ddraw_proxy.obj" /c "%ROOT%\src\ddraw_proxy.cpp"
+cl.exe /nologo /Zl /GS- /O2 /W3 /DWIN32 /D_WINDOWS /D_USRDLL /D_MBCS /Fo"%BUILD%\ddraw_proxy.obj" /c "%ROOT%\src\ddraw_proxy.cpp"
 if errorlevel 1 (
     echo DirectDraw proxy compilation failed.
     exit /b 1

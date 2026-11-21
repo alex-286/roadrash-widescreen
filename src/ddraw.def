@@ -8,3 +8,4 @@ EXPORTS
     DirectDrawEnumerateW=_DirectDrawEnumerateW@8
     DirectDrawEnumerateExA=_DirectDrawEnumerateExA@12
     DirectDrawEnumerateExW=_DirectDrawEnumerateExW@12
+    RoadRashWidescreenVersion=_RoadRashWidescreenVersion@0

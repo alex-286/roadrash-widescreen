@@ -82,6 +82,26 @@ the patch under the name RRWS.dll.
 Keep RRWS.dll in the game folder: the changed ROADRASH.EXE does not start
 without it.
 
+Together with another DirectDraw wrapper (Windows XP and newer):
+
+A DirectDraw wrapper (for example dd2d9, for borderless fullscreen) is also
+a ddraw.dll in the game folder. The patch can run in front of it in two
+ways; use only one of them:
+
+- Rename the wrapper (for example to dd2d9.dll), copy the patch's ddraw.dll
+  next to it and set ChainDll=dd2d9.dll in RoadRashWidescreen.ini.
+- Or keep the wrapper as ddraw.dll, rename the patch's ddraw.dll to an .asi
+  file (for example RoadRashWidescreen.asi) and let an ASI loader such as
+  Ultimate ASI Loader load it. The ini and the log stay next to
+  ROADRASH.EXE. Road Rash loads Ultimate ASI Loader only as dsound.dll.
+
+The log names the library that receives the game's DirectDraw calls.
+
+With dd2d9 1.8.6, use ChainDll: the races run in widescreen, with and
+without a filter; the menus stay at 640x480, enlarged by dd2d9. Ultimate
+ASI Loader as dsound.dll together with dd2d9 crashes the game at start,
+also without the patch. Other wrappers are untested.
+
 
 Uninstallation
 --------------
