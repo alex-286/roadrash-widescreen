@@ -96,6 +96,11 @@ ddraw.dll in the game folder. The patch runs in front of it:
 The log then says "Loaded the DirectDraw library named by ChainDll". A
 wrapper that only works under the name ddraw.dll goes into a subfolder
 instead, for example Wrapper\ddraw.dll with ChainDll=Wrapper\ddraw.dll.
+
+Tested on Windows 11 with DDrawCompat 0.7.2. It turns itself off next to
+another ddraw.dll, so it goes into a subfolder: DDrawCompat\ddraw.dll with
+ChainDll=DDrawCompat\ddraw.dll.
+
 Other wrappers are untested with the patch. If a wrapper changes the game's
 window functions, the menus stay at 640x480.
 
