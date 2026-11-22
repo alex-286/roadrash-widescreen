@@ -58,7 +58,9 @@ the menu.</sub>
   wraps to 0 after 25.5; a music volume of 0 no longer mutes the whole game
   on newer Windows. Each fix can be turned off.
 - **Race music on any MIDI output:** if the races stay silent because the
-  MIDI mapper leads to the wrong output, `MusicDevice` picks another one.
+  MIDI mapper leads to the wrong output, `MusicDevice` picks another one. A
+  MIDI driver that cannot set the volume no longer stops the race music, and
+  a MIDI error no longer seems to freeze the game at the start of a race.
 - **Screenshots:** **F12** saves exactly what is on screen, at full
   resolution with the filter applied, in races and in the menus.
 - **Multi-core:** filters spread their work across up to 8 CPU cores.
@@ -171,8 +173,9 @@ ChainDll=        ; empty (default) = the Windows DirectDraw library, or the file
 [Fixes]
 FixBikeColors=1   ; 1 (default) = Rat and Super bikes in their own colors, 0 = original
 SmoothSprites=1   ; 1 (default) = objects move in 1-pixel steps in HiRes, 0 = original
-MidiVolumeGuard=1 ; 1 (default) = music volume 0 no longer mutes the game, 0 = original
+MidiVolumeGuard=1 ; 1 (default) = music volume 0 no longer mutes the game, and the music plays on if the driver cannot set the volume, 0 = original
 MusicDevice=-1    ; -1 (default) = race music on the MIDI mapper, or the number of a MIDI output
+MidiErrorsToLog=1 ; 1 (default) = a race music error goes to the log instead of a message box, 0 = original
 FullRateObjects=1 ; 1 (default) = riders and cars in view update every tick, 0 = original
 FixPunchShadow=1  ; 1 (default) = the shadow stays under the bike when punching, 0 = original
 GroundBuildings=1 ; 1 (default) = three hovering buildings stand on the ground, 0 = original
@@ -197,8 +200,9 @@ SmoothRoad=1      ; 1 (default) = the road and its edges move without jumps, 0 =
 | `ChainDll` | Another DirectDraw library that the patch passes the game's DirectDraw calls on to, instead of the one of Windows, see [Together with another DirectDraw wrapper](#together-with-another-directdraw-wrapper). A relative path starts in the folder of `ROADRASH.EXE`. If the library cannot be loaded, the patch uses the Windows one and says so in the log. |
 | `FixBikeColors` | The original game swaps the race colors of the Rat and Super bikes (the shop shows them correctly). The fix swaps the two groups of color tables back. |
 | `SmoothSprites` | In High Resolution mode the game keeps every corner of buildings, riders and cars on an even pixel, so they move in 2-pixel steps (about 4.5 screen pixels at 1080p). The fix uses the full 640x480 precision. |
-| `MidiVolumeGuard` | The game sets its music volume with `midiOutSetVolume`. Since Windows Vista, that call changes the volume of the whole game in the Windows volume mixer, and Windows keeps it, so a music volume of 0 also silenced all sound effects. With the fix, a song at volume 0 is not started at all, as when music is muted. Other volumes are passed on unchanged. |
+| `MidiVolumeGuard` | The game sets its music volume with `midiOutSetVolume`. Since Windows Vista, that call changes the volume of the whole game in the Windows volume mixer, and Windows keeps it, so a music volume of 0 also silenced all sound effects. With the fix, a song at volume 0 is not started at all, as when music is muted. Other volumes are passed on unchanged. If the MIDI driver cannot set the volume (for example an external MIDI port, or a synthesizer without volume control), the original game reports a "MIDI Error" and treats the music as off, although the song has already started, so it no longer stops that song later. With the fix, the song plays on at the driver's own volume and the game stops it as usual; the log records the failed call. |
 | `MusicDevice` | The race music (`AUDIO\MUSIC\GRUNGE1-5.MID`, MIDI stream files that Media Player cannot play) is played on the MIDI mapper, which uses the output chosen in the Windows Control Panel; the menus play their music from the video files instead. If the mapper leads to an external MIDI port, the races stay silent while everything else works. The log lists every MIDI output with its number and type at the first race; `MusicDevice` set to one of these numbers plays the race music on that output (and the game's music volume goes to it), `-1` (default) keeps the mapper. The log also records each music start and every MIDI call that fails. |
+| `MidiErrorsToLog` | If the race music cannot start (no usable MIDI output, a MIDI call that fails, or a missing song file), the game shows a "MIDI Error" message box with a warning sound and waits until it is closed. In fullscreen the box can stay hidden behind the picture, so the game seems to hang until **Enter** is pressed. With the fix, the error is written to the log instead, and the race starts without music, as after the box. |
 | `FullRateObjects` | The game updates each rider, car, pedestrian and cop at an interval that grows with its distance from the camera: every game tick close by, up to every 8th tick about 30 segments ahead. Their position still follows the elapsed time, so in the distance they move in visible jumps. With the fix, every one of them within the drawn range (4 segments behind to 33 ahead) is updated on every tick; the ones further away keep the original interval. |
 | `FixPunchShadow` | The rider's shadow frames (`DATA\BIKERS\HISHADOW.DAT`, `LOSHADOW.DAT`) are drawn centred on their box. In frame 176, the first frame of the punch, two stray pixels in the top corner make the box 118x168 (59x84) while the shadow is only the 13 (6) rows at its bottom, so the shadow jumps away from the bike. The fix cuts the loaded frame to the shadow itself (64x13, 32x6); the file is not changed. |
 | `GroundBuildings` | The pictures of the red barn (`BARN12`), the brown shop with the sign (`RUSTICA2`) and the white house (`HOUSEB2`) in `FAMILIES.RSC` end in empty rows, and the game places them as if the picture reached the bottom of the texture, so they hover. The fix draws them 2, 3 and 10 rows of their picture lower, found by the texture name; only the drawing changes. |
@@ -261,6 +265,16 @@ Please attach it when reporting a problem.
 - **No music in races, but music in the menus:** the race music is played on
   the MIDI mapper. The log lists every MIDI output with its number at the
   first race; set `MusicDevice` to the number of the one you want.
+- **The game seems to hang at the start of a race, after a warning sound:**
+  with `MidiErrorsToLog=0` this can be a hidden "MIDI Error" box; press
+  **Enter**. With the default `1`, the log names the MIDI call that failed;
+  try another `MusicDevice`, or set the game music to 0 in the Sound Mix
+  screen, which leaves MIDI unused.
+- **The whole PC freezes when a race starts:** some old sound card drivers
+  hang in MIDI playback. Set the game music to 0 in the Sound Mix screen,
+  which leaves MIDI unused, or choose another output with `MusicDevice`
+  (for example the Microsoft software synthesizer), or install a newer
+  driver for the sound card.
 - **The game crashes:** the log records the address and the registers of
   the crash. Please attach it.
 

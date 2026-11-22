@@ -648,6 +648,103 @@ static void GuardMidiVolume()
     LogFix("MIDI volume guard: a music volume of 0 no longer mutes the game.");
 }
 
+// MIDI errors: when the race music cannot start, FUN_00433BB0 reports it
+// through FUN_00443120, a modal MessageBoxA ("Warning") with a warning
+// sound that can stay hidden behind the race in fullscreen, so the game
+// seems to hang until Enter is pressed. At 0x433C6E it reports a missing song file ("Bad or
+// missing file", with name and extension as arguments) and then falls
+// through to 0x433C8B, which reports every failure of the MIDI stream
+// ("MIDI Error"). Both calls now write the log instead; the caller removes
+// the arguments (add esp), and the race starts without music as after the
+// box.
+static const DWORD kMusicFileErrorCallRva = 0x00033C6E;
+static const DWORD kMusicStartErrorCallRva = 0x00033C8B;
+static const DWORD kErrorBoxRva = 0x00043120;
+
+static void __cdecl HookedMusicFileError(
+    LPCSTR caption,
+    const CHAR* text,
+    const CHAR* name,
+    const CHAR* extension)
+{
+    CHAR shownName[32];
+    CHAR shownExtension[8];
+    CHAR message[128];
+
+    if (g_midiLogLines >= kMaxMidiLogLines)
+    {
+        return;
+    }
+
+    ++g_midiLogLines;
+    lstrcpynA(shownName, name != NULL ? name : "", sizeof(shownName));
+    lstrcpynA(
+        shownExtension,
+        extension != NULL ? extension : "",
+        sizeof(shownExtension));
+    wsprintfA(
+        message,
+        "Race music: Audio\\Music\\%s%s is missing or cannot be read.",
+        shownName,
+        shownExtension);
+    LogFix(message);
+}
+
+static void __cdecl HookedMusicStartError(LPCSTR caption, const CHAR* text)
+{
+    if (g_midiLogLines >= kMaxMidiLogLines)
+    {
+        return;
+    }
+
+    ++g_midiLogLines;
+    LogFix("Race music: the game reports a MIDI error (written here instead of a message box); the failed MIDI calls are listed above.");
+}
+
+static void LogMidiErrors()
+{
+    static const DWORD sites[2] =
+    {
+        kMusicFileErrorCallRva,
+        kMusicStartErrorCallRva
+    };
+    const LPVOID hooks[2] =
+    {
+        reinterpret_cast<LPVOID>(HookedMusicFileError),
+        reinterpret_cast<LPVOID>(HookedMusicStartError)
+    };
+    BYTE calls[2][5];
+    DWORD site;
+
+    for (site = 0; site < 2; ++site)
+    {
+        DWORD callEnd = g_fixesBase + sites[site] + 5;
+
+        calls[site][0] = 0xE8;
+        StoreDword(calls[site] + 1, g_fixesBase + kErrorBoxRva - callEnd);
+        if (!MatchesGameBytes(sites[site], calls[site], 5))
+        {
+            LogFix("MIDI errors to the log stay off: unexpected code at the music start.");
+            return;
+        }
+
+        StoreDword(
+            calls[site] + 1,
+            reinterpret_cast<DWORD>(hooks[site]) - callEnd);
+    }
+
+    for (site = 0; site < 2; ++site)
+    {
+        if (!WriteGameBytes(sites[site], calls[site], 5))
+        {
+            LogFix("MIDI errors to the log stay off: the music start could not be changed.");
+            return;
+        }
+    }
+
+    LogFix("MIDI errors to the log: a race music error no longer opens a message box.");
+}
+
 // Replaces mov eax, [esi + 0x14] / mov cl, [esp + 0x10] / add eax, edi
 // with call + mov cl, [esp + 0x10]: esi is the node, edi the tick, and eax
 // returns the next-update tick. Flags are set again by the test that
@@ -1133,6 +1230,12 @@ void ApplyGameFixes(DWORD gameBase, const CHAR* iniPath)
     }
 
     InstallMidiLogging();
+
+    if (iniPath == NULL ||
+        GetPrivateProfileIntA("Fixes", "MidiErrorsToLog", 1, iniPath) != 0)
+    {
+        LogMidiErrors();
+    }
 
     if (iniPath == NULL ||
         GetPrivateProfileIntA("Fixes", "FullRateObjects", 1, iniPath) != 0)
