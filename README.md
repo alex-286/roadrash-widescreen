@@ -244,7 +244,7 @@ single-core CPU such as a Pentium 4, `sharp-bilinear` is the fastest choice;
 
 The patch writes `RoadRashWidescreen.log` to the game folder each time the
 game starts. Its first line names the patch version (for example
-`Road Rash Widescreen 1.1.0`). It shows whether the game version was recognized, which display
+`Road Rash Widescreen 1.2.0`). It shows whether the game version was recognized, which display
 mode and filter are used, and, per filter, how the time of a frame is spent.
 Please attach it when reporting a problem.
 
@@ -291,7 +291,7 @@ The script also assembles the release package in `build\release\`: the DLL
 documentation and default settings from [`dist/`](dist/) (`README.txt`,
 `RoadRashWidescreen.ini`), and the license as `LICENSE.txt`. Zip that folder
 for a release, named after the version in [`src/version.h`](src/version.h)
-(for example `RoadRashWidescreen-1.1.0.zip`).
+(for example `RoadRashWidescreen-1.2.0.zip`).
 
 ## How it works
 

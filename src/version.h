@@ -9,8 +9,8 @@
 // win9x_patcher.manifest and the title of dist/README.txt follow it by
 // hand.
 #define RRWS_VERSION_MAJOR 1
-#define RRWS_VERSION_MINOR 1
+#define RRWS_VERSION_MINOR 2
 #define RRWS_VERSION_PATCH 0
-#define RRWS_VERSION_STRING "1.1.0"
+#define RRWS_VERSION_STRING "1.2.0"
 
 #endif
