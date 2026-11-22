@@ -37,6 +37,9 @@ struct ScaleJob
     const DWORD* rgb;
     // With MMX: the palette with each color's channels in 16-bit lanes.
     const __m64* palette;
+    // The smooth distance haze, or NULL; with MMX, its colors unpacked.
+    const HazeFrame* haze;
+    const __m64* hazePalette;
     BYTE* destination;
     LONG destinationPitch;
 };
@@ -143,21 +146,39 @@ static __forceinline DWORD Blend(DWORD first, DWORD second, DWORD weight)
     return (redBlue & 0x00FF00FF) | (green & 0x0000FF00);
 }
 
-static void FilterRow(const ScaleJob* job, DWORD sourceRow, DWORD* output)
+// The color table index of a source pixel: the palette index, or with
+// haze the haze level and palette index.
+template <bool Hazy>
+static __forceinline DWORD PixelKey(const BYTE* line, const BYTE* levels, DWORD column)
+{
+    return Hazy ? HazeKey(line, levels, column) : line[column];
+}
+
+template <bool Hazy>
+static const BYTE* LevelRow(const ScaleJob* job, DWORD sourceRow)
+{
+    return Hazy ?
+        job->haze->levels + static_cast<LONG>(sourceRow) * job->haze->levelPitch :
+        NULL;
+}
+
+template <bool Hazy>
+static void FilterRowWith(const ScaleJob* job, DWORD sourceRow, DWORD* output)
 {
     const BYTE* source = job->source +
         static_cast<LONG>(sourceRow) * job->sourcePitch;
-    const DWORD* rgb = job->rgb;
+    const BYTE* levels = LevelRow<Hazy>(job, sourceRow);
+    const DWORD* rgb = Hazy ? job->haze->rgb : job->rgb;
     DWORD column;
 
     for (column = 0; column < g_destinationWidth; ++column)
     {
         DWORD index = g_columns.index[column];
         DWORD weight = g_columns.weight[column];
-        DWORD color = rgb[source[index]];
+        DWORD color = rgb[PixelKey<Hazy>(source, levels, index)];
 
         output[column] = weight == 0 ?
-            color : Blend(color, rgb[source[index + 1]], weight);
+            color : Blend(color, rgb[PixelKey<Hazy>(source, levels, index + 1)], weight);
     }
 }
 
@@ -175,12 +196,14 @@ static __forceinline __m64 BlendMmx(__m64 first, __m64 second, __m64 weight)
         8);
 }
 
-static void FilterRowMmx(const ScaleJob* job, DWORD sourceRow, DWORD* output)
+template <bool Hazy>
+static void FilterRowMmxWith(const ScaleJob* job, DWORD sourceRow, DWORD* output)
 {
     const BYTE* source = job->source +
         static_cast<LONG>(sourceRow) * job->sourcePitch;
-    const DWORD* rgb = job->rgb;
-    const __m64* palette = job->palette;
+    const BYTE* levels = LevelRow<Hazy>(job, sourceRow);
+    const DWORD* rgb = Hazy ? job->haze->rgb : job->rgb;
+    const __m64* palette = Hazy ? job->hazePalette : job->palette;
     const DWORD* index = g_columns.index;
     const BYTE* weight = g_columns.weight;
     const __m64* weights = g_columnWeights;
@@ -189,17 +212,49 @@ static void FilterRowMmx(const ScaleJob* job, DWORD sourceRow, DWORD* output)
 
     for (column = 0; column < g_destinationWidth; ++column)
     {
-        const BYTE* pixel = source + index[column];
+        DWORD first = index[column];
 
         if (weight[column] == 0)
         {
-            output[column] = rgb[pixel[0]];
+            output[column] = rgb[PixelKey<Hazy>(source, levels, first)];
             continue;
         }
 
         output[column] = static_cast<DWORD>(_mm_cvtsi64_si32(_mm_packs_pu16(
-            BlendMmx(palette[pixel[0]], palette[pixel[1]], weights[column]),
+            BlendMmx(
+                palette[PixelKey<Hazy>(source, levels, first)],
+                palette[PixelKey<Hazy>(source, levels, first + 1)],
+                weights[column]),
             zero)));
+    }
+}
+
+static BOOL RowHasHaze(const ScaleJob* job, DWORD sourceRow)
+{
+    return job->haze != NULL && job->haze->rows[sourceRow] != 0;
+}
+
+static void FilterRow(const ScaleJob* job, DWORD sourceRow, DWORD* output)
+{
+    if (RowHasHaze(job, sourceRow))
+    {
+        FilterRowWith<true>(job, sourceRow, output);
+    }
+    else
+    {
+        FilterRowWith<false>(job, sourceRow, output);
+    }
+}
+
+static void FilterRowMmx(const ScaleJob* job, DWORD sourceRow, DWORD* output)
+{
+    if (RowHasHaze(job, sourceRow))
+    {
+        FilterRowMmxWith<true>(job, sourceRow, output);
+    }
+    else
+    {
+        FilterRowMmxWith<false>(job, sourceRow, output);
     }
 }
 
@@ -417,6 +472,7 @@ void SharpBilinearScale(
     const BYTE* source,
     LONG sourcePitch,
     const DWORD* rgb,
+    const HazeFrame* haze,
     BYTE* destination,
     LONG destinationPitch)
 {
@@ -431,9 +487,12 @@ void SharpBilinearScale(
     job.sourcePitch = sourcePitch;
     job.rgb = rgb;
     job.palette = NULL;
+    job.haze = haze;
+    job.hazePalette = NULL;
     if (g_columnWeights != NULL)
     {
         static __m64 unpacked[256];
+        static __m64 unpackedHaze[kHazeTableSize];
         __m64 zero = _mm_setzero_si64();
         DWORD index;
 
@@ -441,6 +500,17 @@ void SharpBilinearScale(
         {
             unpacked[index] = _mm_unpacklo_pi8(
                 _mm_cvtsi32_si64(static_cast<int>(rgb[index])), zero);
+        }
+
+        if (haze != NULL)
+        {
+            for (index = 0; index < kHazeTableSize; ++index)
+            {
+                unpackedHaze[index] = _mm_unpacklo_pi8(
+                    _mm_cvtsi32_si64(static_cast<int>(haze->rgb[index])), zero);
+            }
+
+            job.hazePalette = unpackedHaze;
         }
 
         _mm_empty();

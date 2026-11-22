@@ -421,7 +421,8 @@ void RenderScalePrepareHud(
 void RenderScaleComposeHud(
     const BYTE* hud, LONG hudPitch, const BYTE* before,
     LONG width, LONG height, DWORD scale,
-    BYTE* dest, LONG destPitch, LONG destWidth, LONG destHeight)
+    BYTE* dest, LONG destPitch, LONG destWidth, LONG destHeight,
+    BYTE* levels)
 {
     LONG factor = static_cast<LONG>(scale);
     LONG y;
@@ -452,6 +453,11 @@ void RenderScaleComposeHud(
                 for (blockY = 0; blockY < factor; ++blockY)
                 {
                     __stosb(block, value, static_cast<size_t>(factor));
+                    if (levels != NULL)
+                    {
+                        __stosb(levels + (block - dest), 0, static_cast<size_t>(factor));
+                    }
+
                     block += destPitch;
                 }
             }

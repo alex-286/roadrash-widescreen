@@ -6,6 +6,8 @@
 
 #include <windows.h>
 
+#include "haze_frame.h"
+
 // Sharp bilinear scaling of an 8-bit frame straight to the display size:
 // conceptually a nearest-neighbor enlargement by the whole factor closest to
 // the scale, followed by bilinear filtering of the remainder. Pixels stay
@@ -21,11 +23,13 @@ BOOL SharpBilinearInitialize(
 void SharpBilinearShutdown();
 BOOL SharpBilinearIsReady();
 
-// rgb maps palette indices to X8R8G8B8.
+// rgb maps palette indices to X8R8G8B8; haze (or NULL) adds the smooth
+// distance haze.
 void SharpBilinearScale(
     const BYTE* source,
     LONG sourcePitch,
     const DWORD* rgb,
+    const HazeFrame* haze,
     BYTE* destination,
     LONG destinationPitch);
 

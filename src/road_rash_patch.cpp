@@ -1257,7 +1257,8 @@ static DWORD __cdecl HookedHudDraw(void)
                         hud.pixels, hud.pitch, g_hudBefore,
                         g_hudWidth, kOriginalDisplayHeight, g_renderScale,
                         target.pixels, target.pitch,
-                        target.width, target.height);
+                        target.width, target.height,
+                        DistanceFadeLevelsFor(target.pixels, target.pitch));
                     UnlockWholeSurface(&target);
                 }
 
@@ -1357,6 +1358,7 @@ static void RestoreOriginalGameState()
     WriteGameDword(kClipRightRva, kOriginalDisplayWidth);
     WriteGameDword(kClipBottomRva, kOriginalDisplayHeight - 1);
     RenderScaleSetActive(1);
+    DistanceFadeSetSmooth(FALSE);
     if (g_virtualDisplayActive)
     {
         SetHudCentering(FALSE);
@@ -2412,6 +2414,7 @@ static HRESULT PresentFilteredFrame(LPVOID primary, FrameTiming* timing)
     DWORD outputWidth;
     DWORD outputHeight;
     RECT source;
+    const HazeFrame* haze;
     HRESULT result;
 
     if (!PrepareFilter(filter))
@@ -2529,6 +2532,8 @@ static HRESULT PresentFilteredFrame(LPVOID primary, FrameTiming* timing)
                     g_showFilter ? kFilterNames[filter] : NULL);
             }
 
+            haze = DistanceFadePrepareFrame(
+                sourcePixels, sourcePitch, GetFrameHeight(), g_paletteRgb);
             switch (filter)
             {
             case kFilterSharpBilinear:
@@ -2536,6 +2541,7 @@ static HRESULT PresentFilteredFrame(LPVOID primary, FrameTiming* timing)
                     sourcePixels,
                     sourcePitch,
                     g_paletteRgb,
+                    haze,
                     outputPixels,
                     outputPitch);
                 break;
@@ -2545,6 +2551,7 @@ static HRESULT PresentFilteredFrame(LPVOID primary, FrameTiming* timing)
                     sourcePixels,
                     sourcePitch,
                     g_paletteRgb,
+                    haze,
                     outputPixels,
                     outputPitch);
                 break;
@@ -2555,6 +2562,7 @@ static HRESULT PresentFilteredFrame(LPVOID primary, FrameTiming* timing)
                         sourcePixels,
                         sourcePitch,
                         g_paletteRgb,
+                        haze,
                         outputPixels,
                         outputPitch);
                 }
@@ -2565,6 +2573,8 @@ static HRESULT PresentFilteredFrame(LPVOID primary, FrameTiming* timing)
                 }
                 break;
             }
+
+            DistanceFadeFrameDone();
 
             // nearest keeps its plain pixel look without scanlines.
             if (filter != kFilterNearest)
@@ -3234,6 +3244,10 @@ static HRESULT WINAPI HookedSetDisplayMode(
                     kVirtualDisplayWidth * g_renderScale,
                     kOriginalDisplayHeight * g_renderScale);
                 RenderScaleSetActive(g_renderScale);
+                // Smooth haze needs a 32-bit filter, and the HUD drawn by
+                // this DLL (RenderScale above 1), which clears the haze of
+                // the pixels it covers.
+                DistanceFadeSetSmooth(g_presenterDisplayActive && g_renderScale > 1);
                 {
                     CHAR message[96];
 

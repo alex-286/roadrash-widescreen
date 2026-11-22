@@ -43,10 +43,12 @@ void RenderScalePrepareHud(
     BYTE* hud, LONG hudPitch, LONG width, LONG height, BYTE* before);
 
 // After the HUD was drawn: every pixel that changed is copied as a block of
-// scale x scale pixels into dest.
+// scale x scale pixels into dest. levels (laid out like dest, or NULL) is
+// the smooth haze level plane, cleared under those blocks.
 void RenderScaleComposeHud(
     const BYTE* hud, LONG hudPitch, const BYTE* before,
     LONG width, LONG height, DWORD scale,
-    BYTE* dest, LONG destPitch, LONG destWidth, LONG destHeight);
+    BYTE* dest, LONG destPitch, LONG destWidth, LONG destHeight,
+    BYTE* levels);
 
 #endif

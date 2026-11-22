@@ -25,13 +25,25 @@
 // color is the average of the track's sky panorama (sky and distant land).
 // The haze grows from the first of the farthest fadeSegments segments to
 // 3/4 in the farthest one, so new segments appear out of the haze.
+//
+// Smooth haze (a 32-bit filter and RenderScale above 1): the remap can only
+// pick among the 256 palette colors, so the haze shows in steps. Instead,
+// hazy pixels keep their own color and their level goes into a plane laid
+// out like the frame (the rasterizer's destination is base 0x4B7EC0 +
+// y * pitch 0x4B7EC4 + x). Pixels that nearer quads draw over get level 0
+// again; transparent texels, which a span leaves unchanged, keep the level
+// of what lies behind them. The filter looks up each hazy pixel in a table
+// of the palette blended toward the haze color (DistanceFadePrepareFrame),
+// and the levels are cleared after the frame.
 
 static const DWORD kImageBase = 0x00400000;
 static const DWORD kQuadSize = 0xA8;
 static const DWORD kNodeOffset = 0x68;
 static const DWORD kSliceSize = 0x224;
 static const DWORD kMaxQuads = 8192;
-static const DWORD kMaxSpan = 4096;
+// The widest frame row: 1280 virtual pixels at RenderScale 4.
+static const DWORD kMaxSpan = 5120;
+static const DWORD kMaxFrameRows = 1920;
 static const DWORD kHazeSteps = 16;
 static const DWORD kMaxHaze = 12;
 
@@ -43,6 +55,8 @@ static const DWORD kSpanDestinationVa = 0x004C5D50;
 static const DWORD kLoadedPaletteVa = 0x004B8490;
 static const DWORD kSkySurfaceAVa = 0x00475418;
 static const DWORD kSkySurfaceBVa = 0x0047541C;
+static const DWORD kFrameBaseVa = 0x004B7EC0;
+static const DWORD kFramePitchVa = 0x004B7EC4;
 
 static const DWORD kObjectsFunctionRva = 0x00043CD0;
 static const DWORD kRoadFunctionRva = 0x00043B40;
@@ -94,6 +108,26 @@ static LPVOID g_hazeSkyA = NULL;
 static LPVOID g_hazeSkyB = NULL;
 static BOOL g_remapReady = FALSE;
 static BYTE g_remap[kHazeSteps][256];
+// How often each palette index occurs in the sky panorama, for the haze
+// color in the displayed palette.
+static DWORD g_skyCounts[256];
+static DWORD g_skyTotal = 0;
+
+// Smooth haze: wanted for this race, and the level plane for the frame at
+// g_frameBase (g_framePitch bytes per row, g_frameRows rows) once it is
+// known. g_hazeRows marks the rows that hold haze, from g_firstHazeRow to
+// g_lastHazeRow.
+static BOOL g_smoothWanted = FALSE;
+static BYTE* g_levels = NULL;
+static DWORD g_levelBytes = 0;
+static const BYTE* g_frameBase = NULL;
+static LONG g_framePitch = 0;
+static DWORD g_frameRows = 0;
+static BYTE g_hazeRows[kMaxFrameRows];
+static LONG g_firstHazeRow = 0x7FFFFFFF;
+static LONG g_lastHazeRow = -1;
+static DWORD g_hazeRgb[kHazeTableSize];
+static HazeFrame g_hazeFrame;
 
 static DWORD GameVa(DWORD va)
 {
@@ -168,7 +202,8 @@ static BYTE CurrentQuadLevel()
 }
 
 // Adds the colors of one sky panorama half to the sums.
-static void AddSkyColors(LPVOID surface, const BYTE* palette, DWORD* sums, DWORD* count)
+static void AddSkyColors(
+    LPVOID surface, const BYTE* palette, DWORD* sums, DWORD* count, DWORD* counts)
 {
     BYTE description[kDescriptionSize];
     volatile DWORD* words = reinterpret_cast<volatile DWORD*>(description);
@@ -215,6 +250,7 @@ static void AddSkyColors(LPVOID surface, const BYTE* palette, DWORD* sums, DWORD
                 sums[1] += entry[1];
                 sums[2] += entry[2];
                 ++*count;
+                ++counts[row[x]];
             }
         }
     }
@@ -250,8 +286,10 @@ static void UpdateRemap()
         return;
     }
 
-    AddSkyColors(skyA, palette, sums, &count);
-    AddSkyColors(skyB, palette, sums, &count);
+    __stosb(reinterpret_cast<BYTE*>(g_skyCounts), 0, sizeof(g_skyCounts));
+    AddSkyColors(skyA, palette, sums, &count, g_skyCounts);
+    AddSkyColors(skyB, palette, sums, &count, g_skyCounts);
+    g_skyTotal = count;
     if (count == 0)
     {
         haze[0] = 176;
@@ -346,35 +384,138 @@ static DWORD __fastcall HookedListBuild(DWORD list)
     return result;
 }
 
+// The levels of the count pixels from destination on, when the game draws
+// into the frame of the level plane and they lie within one of its rows;
+// otherwise NULL.
+static BYTE* LevelsAt(const BYTE* destination, int count, LONG* row)
+{
+    const BYTE* base;
+    LONG pitch;
+    DWORD offset;
+    LONG y;
+
+    if (g_levels == NULL || g_frameBase == NULL)
+    {
+        return NULL;
+    }
+
+    base = GameVariable<const BYTE*>(kFrameBaseVa);
+    pitch = GameVariable<LONG>(kFramePitchVa);
+    if (base != g_frameBase || pitch != g_framePitch || destination < base)
+    {
+        return NULL;
+    }
+
+    offset = static_cast<DWORD>(destination - base);
+    y = static_cast<LONG>(offset / static_cast<DWORD>(pitch));
+    if (y >= static_cast<LONG>(g_frameRows) ||
+        static_cast<LONG>(offset - static_cast<DWORD>(y * pitch)) + count > pitch)
+    {
+        return NULL;
+    }
+
+    *row = y;
+    return g_levels + offset;
+}
+
+static void MarkHazeRow(LONG row)
+{
+    g_hazeRows[row] = 1;
+    if (row < g_firstHazeRow)
+    {
+        g_firstHazeRow = row;
+    }
+
+    if (row > g_lastHazeRow)
+    {
+        g_lastHazeRow = row;
+    }
+}
+
+static BOOL AnyLevel(const BYTE* levels, int count)
+{
+    int index;
+
+    for (index = 0; index < count; ++index)
+    {
+        if (levels[index] != 0)
+        {
+            return TRUE;
+        }
+    }
+
+    return FALSE;
+}
+
+// Lets the span draw into the row buffer, which starts as a copy of the
+// frame, so the pixels it changed can be told from those it left out
+// (transparent texels).
+static void DrawSpanToRow(
+    SpanFn span, int count, DWORD u, DWORD a3, DWORD a4, DWORD a5,
+    BYTE** destinationVariable, const BYTE* destination)
+{
+    __movsb(g_row, destination, static_cast<size_t>(count));
+    *destinationVariable = g_row;
+    span(count, u, a3, a4, a5);
+    *destinationVariable = const_cast<BYTE*>(destination);
+}
+
 static void __fastcall HookedSpan(int count, DWORD u, DWORD a3, DWORD a4, DWORD a5)
 {
     SpanFn span = GameVariable<SpanFn>(kSpanFunctionVa);
     BYTE level = CurrentQuadLevel();
     BYTE** destinationVariable;
     BYTE* destination;
+    BYTE* levels;
     const BYTE* remap;
+    LONG row;
     int index;
 
-    if (level == 0 || count <= 0 || count > static_cast<int>(kMaxSpan))
+    if (count <= 0 || count > static_cast<int>(kMaxSpan))
     {
         span(count, u, a3, a4, a5);
         return;
     }
 
-    // The span draws into the row buffer, which starts as a copy of the
-    // frame; the pixels it changed go into the frame through the remap.
-    // (Pixels it leaves out, transparent texels, stay as they are.)
     destinationVariable = &GameVariable<BYTE*>(kSpanDestinationVa);
     destination = *destinationVariable;
-    for (index = 0; index < count; ++index)
+    levels = LevelsAt(destination, count, &row);
+    if (levels != NULL)
     {
-        g_row[index] = destination[index];
+        // Smooth haze: the changed pixels keep their color and get the
+        // quad's level (0 for a quad without haze).
+        if (level == 0 && (g_hazeRows[row] == 0 || !AnyLevel(levels, count)))
+        {
+            span(count, u, a3, a4, a5);
+            return;
+        }
+
+        DrawSpanToRow(span, count, u, a3, a4, a5, destinationVariable, destination);
+        for (index = 0; index < count; ++index)
+        {
+            if (g_row[index] != destination[index])
+            {
+                destination[index] = g_row[index];
+                levels[index] = level;
+            }
+        }
+
+        if (level != 0)
+        {
+            MarkHazeRow(row);
+        }
+
+        return;
     }
 
-    *destinationVariable = g_row;
-    span(count, u, a3, a4, a5);
-    *destinationVariable = destination;
+    if (level == 0)
+    {
+        span(count, u, a3, a4, a5);
+        return;
+    }
 
+    // The pixels the span changed go into the frame through the remap.
+    DrawSpanToRow(span, count, u, a3, a4, a5, destinationVariable, destination);
     remap = g_remap[level];
     for (index = 0; index < count; ++index)
     {
@@ -388,8 +529,33 @@ static void __fastcall HookedSpan(int count, DWORD u, DWORD a3, DWORD a4, DWORD 
 static void __fastcall HookedFill(int count, DWORD color, BYTE* destination)
 {
     BYTE level = CurrentQuadLevel();
+    BYTE* levels;
+    LONG row;
 
-    if (level == 0 || count <= 0)
+    if (count <= 0)
+    {
+        reinterpret_cast<FillFn>(g_base + kFillFunctionRva)(count, color, destination);
+        return;
+    }
+
+    levels = LevelsAt(destination, count, &row);
+    if (levels != NULL)
+    {
+        reinterpret_cast<FillFn>(g_base + kFillFunctionRva)(count, color, destination);
+        if (level != 0)
+        {
+            __stosb(levels, level, static_cast<size_t>(count));
+            MarkHazeRow(row);
+        }
+        else if (g_hazeRows[row] != 0)
+        {
+            __stosb(levels, 0, static_cast<size_t>(count));
+        }
+
+        return;
+    }
+
+    if (level == 0)
     {
         reinterpret_cast<FillFn>(g_base + kFillFunctionRva)(count, color, destination);
         return;
@@ -398,6 +564,159 @@ static void __fastcall HookedFill(int count, DWORD color, BYTE* destination)
     // String intrinsic: a plain loop would compile to memset, which this
     // CRT-free DLL does not have.
     __stosb(destination, g_remap[level][color & 0xFF], static_cast<size_t>(count));
+}
+
+void DistanceFadeSetSmooth(BOOL smooth)
+{
+    g_smoothWanted = smooth;
+    g_frameBase = NULL;
+    g_framePitch = 0;
+    g_frameRows = 0;
+    __stosb(g_hazeRows, 0, sizeof(g_hazeRows));
+    g_firstHazeRow = 0x7FFFFFFF;
+    g_lastHazeRow = -1;
+}
+
+// The haze color in the displayed palette rgb (which the game fades in and
+// out): the sky panorama's average.
+static DWORD HazeColor(const DWORD* rgb)
+{
+    DWORD red = 0;
+    DWORD green = 0;
+    DWORD blue = 0;
+    DWORD index;
+
+    if (g_skyTotal == 0)
+    {
+        return 0x00B0C0D8;
+    }
+
+    for (index = 0; index < 256; ++index)
+    {
+        DWORD count = g_skyCounts[index];
+
+        if (count != 0)
+        {
+            red += ((rgb[index] >> 16) & 0xFF) * count;
+            green += ((rgb[index] >> 8) & 0xFF) * count;
+            blue += (rgb[index] & 0xFF) * count;
+        }
+    }
+
+    return ((red / g_skyTotal) << 16) | ((green / g_skyTotal) << 8) | (blue / g_skyTotal);
+}
+
+const HazeFrame* DistanceFadePrepareFrame(
+    const BYTE* frame, LONG pitch, DWORD height, const DWORD* rgb)
+{
+    DWORD haze;
+    DWORD hazeRed;
+    DWORD hazeGreen;
+    DWORD hazeBlue;
+    DWORD level;
+    DWORD index;
+
+    if (!g_smoothWanted || g_fadeSegments == 0 || frame == NULL || pitch <= 0 ||
+        height == 0 || height > kMaxFrameRows)
+    {
+        return NULL;
+    }
+
+    // A new frame layout: haze levels start with the next frame.
+    if (frame != g_frameBase || pitch != g_framePitch || height != g_frameRows)
+    {
+        DWORD bytes = static_cast<DWORD>(pitch) * height;
+
+        if (bytes > g_levelBytes)
+        {
+            if (g_levels != NULL)
+            {
+                VirtualFree(g_levels, 0, MEM_RELEASE);
+            }
+
+            // Committed pages start zeroed.
+            g_levels = reinterpret_cast<BYTE*>(
+                VirtualAlloc(NULL, bytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+            g_levelBytes = g_levels != NULL ? bytes : 0;
+        }
+        else if (g_levels != NULL)
+        {
+            __stosb(g_levels, 0, bytes);
+        }
+
+        DistanceFadeSetSmooth(TRUE);
+        if (g_levels != NULL)
+        {
+            g_frameBase = frame;
+            g_framePitch = pitch;
+            g_frameRows = height;
+        }
+
+        return NULL;
+    }
+
+    if (g_lastHazeRow < 0)
+    {
+        return NULL;
+    }
+
+    haze = HazeColor(rgb);
+    hazeRed = (haze >> 16) & 0xFF;
+    hazeGreen = (haze >> 8) & 0xFF;
+    hazeBlue = haze & 0xFF;
+    for (level = 0; level < kHazeLevels; ++level)
+    {
+        DWORD keep = kHazeLevels - level;
+        DWORD* table = g_hazeRgb + level * 256;
+
+        for (index = 0; index < 256; ++index)
+        {
+            DWORD color = rgb[index];
+            DWORD red = (((color >> 16) & 0xFF) * keep + hazeRed * level) >> 4;
+            DWORD green = (((color >> 8) & 0xFF) * keep + hazeGreen * level) >> 4;
+            DWORD blue = ((color & 0xFF) * keep + hazeBlue * level) >> 4;
+
+            table[index] = (red << 16) | (green << 8) | blue;
+        }
+    }
+
+    g_hazeFrame.levels = g_levels;
+    g_hazeFrame.levelPitch = g_framePitch;
+    g_hazeFrame.rows = g_hazeRows;
+    g_hazeFrame.rgb = g_hazeRgb;
+    return &g_hazeFrame;
+}
+
+void DistanceFadeFrameDone()
+{
+    LONG row;
+
+    if (g_levels == NULL || g_frameBase == NULL)
+    {
+        return;
+    }
+
+    for (row = g_firstHazeRow; row <= g_lastHazeRow; ++row)
+    {
+        if (g_hazeRows[row] != 0)
+        {
+            __stosb(g_levels + row * g_framePitch, 0, static_cast<size_t>(g_framePitch));
+            g_hazeRows[row] = 0;
+        }
+    }
+
+    g_firstHazeRow = 0x7FFFFFFF;
+    g_lastHazeRow = -1;
+}
+
+BYTE* DistanceFadeLevelsFor(const BYTE* frame, LONG pitch)
+{
+    if (g_levels == NULL || frame != g_frameBase || pitch != g_framePitch)
+    {
+        return NULL;
+    }
+
+    return g_levels;
 }
 
 static DWORD ReadDword(const BYTE* bytes)

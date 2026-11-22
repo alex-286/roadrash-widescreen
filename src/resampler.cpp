@@ -27,6 +27,9 @@ struct ScaleJob
     // With MMX: the palette with each color's channels already in 16-bit
     // lanes.
     const __m64* palette;
+    // The smooth distance haze, or NULL; with MMX, its colors unpacked.
+    const HazeFrame* haze;
+    const __m64* hazePalette;
     BYTE* destination;
     LONG destinationPitch;
 };
@@ -273,27 +276,39 @@ static __forceinline void SplitWeights(const SHORT* weights, __m64* split)
     split[1] = _mm_unpackhi_pi32(all, all);
 }
 
+// The color table index of a source pixel: the palette index, or with
+// haze the haze level and palette index.
+template <bool Hazy>
+static __forceinline DWORD PixelKey(const BYTE* line, const BYTE* levels, DWORD column)
+{
+    return Hazy ? HazeKey(line, levels, column) : line[column];
+}
+
 // Filters source row `sourceRow` horizontally into output (X8R8G8B8).
-static void FilterRow(const ScaleJob* job, DWORD sourceRow, DWORD* output)
+template <bool Hazy>
+static void FilterRowWith(const ScaleJob* job, DWORD sourceRow, DWORD* output)
 {
     const Resampler* resampler = job->resampler;
     const BYTE* line =
         job->source + static_cast<LONG>(sourceRow) * job->sourcePitch;
+    const BYTE* levels = Hazy ?
+        job->haze->levels + static_cast<LONG>(sourceRow) * job->haze->levelPitch :
+        NULL;
     const DWORD* index = resampler->columnIndex;
     const SHORT* weight = resampler->columnWeight;
-    const DWORD* rgb = job->rgb;
+    const DWORD* rgb = Hazy ? job->haze->rgb : job->rgb;
     DWORD width = resampler->destinationWidth;
     DWORD column;
 
     if (g_useMmx)
     {
-        const __m64* palette = job->palette;
+        const __m64* palette = Hazy ? job->hazePalette : job->palette;
 
         for (column = 0; column < width; ++column)
         {
             if (IsCopy(weight))
             {
-                output[column] = rgb[line[index[0]]];
+                output[column] = rgb[PixelKey<Hazy>(line, levels, index[0])];
             }
             else
             {
@@ -301,10 +316,10 @@ static void FilterRow(const ScaleJob* job, DWORD sourceRow, DWORD* output)
 
                 SplitWeights(weight, split);
                 output[column] = CombineMmxLanes(
-                    &palette[line[index[0]]],
-                    &palette[line[index[1]]],
-                    &palette[line[index[2]]],
-                    &palette[line[index[3]]],
+                    &palette[PixelKey<Hazy>(line, levels, index[0])],
+                    &palette[PixelKey<Hazy>(line, levels, index[1])],
+                    &palette[PixelKey<Hazy>(line, levels, index[2])],
+                    &palette[PixelKey<Hazy>(line, levels, index[3])],
                     split);
             }
 
@@ -318,15 +333,27 @@ static void FilterRow(const ScaleJob* job, DWORD sourceRow, DWORD* output)
     for (column = 0; column < width; ++column)
     {
         output[column] = IsCopy(weight) ?
-            rgb[line[index[0]]] :
+            rgb[PixelKey<Hazy>(line, levels, index[0])] :
             Combine(
-                rgb[line[index[0]]],
-                rgb[line[index[1]]],
-                rgb[line[index[2]]],
-                rgb[line[index[3]]],
+                rgb[PixelKey<Hazy>(line, levels, index[0])],
+                rgb[PixelKey<Hazy>(line, levels, index[1])],
+                rgb[PixelKey<Hazy>(line, levels, index[2])],
+                rgb[PixelKey<Hazy>(line, levels, index[3])],
                 weight);
         index += kTaps;
         weight += kTaps;
+    }
+}
+
+static void FilterRow(const ScaleJob* job, DWORD sourceRow, DWORD* output)
+{
+    if (job->haze != NULL && job->haze->rows[sourceRow] != 0)
+    {
+        FilterRowWith<true>(job, sourceRow, output);
+    }
+    else
+    {
+        FilterRowWith<false>(job, sourceRow, output);
     }
 }
 
@@ -524,6 +551,7 @@ void ResamplerScaleIndexed(
     const BYTE* source,
     LONG sourcePitch,
     const DWORD* rgb,
+    const HazeFrame* haze,
     BYTE* destination,
     LONG destinationPitch)
 {
@@ -539,14 +567,27 @@ void ResamplerScaleIndexed(
     job.sourcePitch = sourcePitch;
     job.rgb = rgb;
     job.palette = NULL;
+    job.haze = haze;
+    job.hazePalette = NULL;
     if (g_useMmx)
     {
         static __m64 unpacked[256];
+        static __m64 unpackedHaze[kHazeTableSize];
         DWORD index;
 
         for (index = 0; index < 256; ++index)
         {
             unpacked[index] = Unpack(rgb[index]);
+        }
+
+        if (haze != NULL)
+        {
+            for (index = 0; index < kHazeTableSize; ++index)
+            {
+                unpackedHaze[index] = Unpack(haze->rgb[index]);
+            }
+
+            job.hazePalette = unpackedHaze;
         }
 
         _mm_empty();

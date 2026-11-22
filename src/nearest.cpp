@@ -13,6 +13,7 @@ struct ScaleJob
     const BYTE* source;
     LONG sourcePitch;
     const DWORD* rgb;
+    const HazeFrame* haze;
     BYTE* destination;
     LONG destinationPitch;
 };
@@ -95,11 +96,26 @@ static void ScaleTask(DWORD part, DWORD parts, void* context)
                 static_cast<LONG>(g_rows[row]) * job->sourcePitch;
             const DWORD* columns = g_columns;
             const DWORD* rgb = job->rgb;
+            const HazeFrame* haze = job->haze;
             DWORD column;
 
-            for (column = 0; column < g_destinationWidth; ++column)
+            if (haze != NULL && haze->rows[g_rows[row]] != 0)
             {
-                buffer[column] = rgb[line[columns[column]]];
+                const BYTE* levels = haze->levels +
+                    static_cast<LONG>(g_rows[row]) * haze->levelPitch;
+                const DWORD* hazed = haze->rgb;
+
+                for (column = 0; column < g_destinationWidth; ++column)
+                {
+                    buffer[column] = hazed[HazeKey(line, levels, columns[column])];
+                }
+            }
+            else
+            {
+                for (column = 0; column < g_destinationWidth; ++column)
+                {
+                    buffer[column] = rgb[line[columns[column]]];
+                }
             }
 
             converted = static_cast<LONG>(g_rows[row]);
@@ -189,6 +205,7 @@ void NearestScale(
     const BYTE* source,
     LONG sourcePitch,
     const DWORD* rgb,
+    const HazeFrame* haze,
     BYTE* destination,
     LONG destinationPitch)
 {
@@ -202,6 +219,7 @@ void NearestScale(
     job.source = source;
     job.sourcePitch = sourcePitch;
     job.rgb = rgb;
+    job.haze = haze;
     job.destination = destination;
     job.destinationPitch = destinationPitch;
     WorkerPoolRun(ScaleTask, &job);
