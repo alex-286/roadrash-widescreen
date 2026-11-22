@@ -206,11 +206,36 @@ static BOOL g_directPresent = TRUE;
 // [Display] NativeMenus: the menus stay in the native resolution.
 static BOOL g_nativeMenus = FALSE;
 
-// RenderScale=2 (default): the world is drawn at twice the 480-line
-// resolution into a back buffer of twice the size; the sky and the HUD are
-// enlarged into it from their 480-line art. 1 when RenderScale=1 or when the
-// rasterizer could not be prepared.
+// The scale of the current race: the world is drawn at that many times the
+// 480-line resolution into a back buffer of that many times the size; the
+// sky and the HUD are enlarged into it from their 480-line art. The setting
+// is 1 to 4, or 0 (auto, the default): the largest scale whose lines fit
+// the height of the race's display mode, chosen for each race. Both become
+// 1 when the rasterizer could not be prepared.
+static DWORD g_renderScaleSetting = 0;
 static DWORD g_renderScale = 2;
+
+static DWORD ChooseRenderScale(DWORD displayHeight)
+{
+    DWORD scale = g_renderScaleSetting;
+
+    if (scale == 0)
+    {
+        scale = displayHeight / kOriginalDisplayHeight;
+    }
+
+    if (scale < 1)
+    {
+        scale = 1;
+    }
+
+    if (scale > kMaxRenderScale)
+    {
+        scale = kMaxRenderScale;
+    }
+
+    return scale;
+}
 
 // The size of the game's frame in the virtual back buffer.
 static DWORD GetFrameWidth()
@@ -223,7 +248,7 @@ static DWORD GetFrameHeight()
     return kOriginalDisplayHeight * g_renderScale;
 }
 
-// RenderScale=2: the HUD is drawn into a 480-line surface and then enlarged
+// RenderScale above 1: the HUD is drawn into a 480-line surface and then enlarged
 // over the world; g_hudBefore holds that surface as it was before the HUD
 // was drawn, to find the pixels the HUD changed.
 static LPVOID g_hudSurface = NULL;
@@ -782,8 +807,11 @@ static void ReadVirtualWidthSetting()
             g_virtualWidthOverride = width;
         }
 
-        g_renderScale = GetPrivateProfileIntA(
-            "Display", "RenderScale", 2, path) == 1 ? 1 : 2;
+        g_renderScaleSetting = GetPrivateProfileIntA("Display", "RenderScale", 0, path);
+        if (g_renderScaleSetting > kMaxRenderScale)
+        {
+            g_renderScaleSetting = 0;
+        }
     }
 
     if (displayWidth < kOriginalDisplayWidth ||
@@ -1006,9 +1034,9 @@ static void UnlockWholeSurface(LockedSurface* locked)
         vtable[kSurfaceUnlockVtableIndex])(locked->surface, NULL);
 }
 
-// RenderScale=2: draws the sky at twice its size straight into the back
-// buffer, so it covers the 960-line view down to the horizon.
-static BOOL DrawDoubledSky(
+// RenderScale above 1: draws the sky enlarged straight into the back
+// buffer, so it covers the whole view down to the horizon.
+static BOOL DrawScaledSky(
     LPVOID back, LPVOID first, LPVOID second,
     LONG half, LONG period, LONG height, LONG top)
 {
@@ -1051,10 +1079,11 @@ static BOOL DrawDoubledSky(
             target.pixels, target.pitch, target.width, target.height,
             firstHalf.pixels, firstHalf.pitch,
             secondHalf.pixels, secondHalf.pitch,
-            half, period, height,
-            -(camera >> 14),
-            static_cast<LONG>(ReadGameDword(kDisplayOriginXRva)) * 2,
-            (static_cast<LONG>(ReadGameDword(kDisplayOriginYRva)) + top) * 2);
+            half, period, height, g_renderScale,
+            RenderScaleFixed(camera, g_renderScale),
+            static_cast<LONG>(ReadGameDword(kDisplayOriginXRva) * g_renderScale),
+            (static_cast<LONG>(ReadGameDword(kDisplayOriginYRva)) + top) *
+                static_cast<LONG>(g_renderScale));
     }
 
     UnlockWholeSurface(&target);
@@ -1095,8 +1124,8 @@ static void __fastcall HookedSkyDraw(int scroll, int top)
     reinterpret_cast<SurfaceRestoreFn>(g_gameBase + kSurfaceRestoreRva)(first);
     reinterpret_cast<SurfaceRestoreFn>(g_gameBase + kSurfaceRestoreRva)(second);
 
-    if (g_renderScale == 2 && g_virtualDisplayActive && back == g_virtualBack &&
-        DrawDoubledSky(
+    if (g_renderScale > 1 && g_virtualDisplayActive && back == g_virtualBack &&
+        DrawScaledSky(
             back, first, second,
             static_cast<LONG>(half), static_cast<LONG>(period), height, top))
     {
@@ -1181,10 +1210,10 @@ static DWORD __cdecl HookedHudDraw(void)
 {
     DWORD result;
 
-    // RenderScale=2: the HUD art and text exist at 480 lines only. The game
-    // draws them into a 480-line surface, and every pixel it changed is
-    // enlarged 2x over the world.
-    if (g_renderScale == 2 && g_hudSurface != NULL && g_hudBefore != NULL &&
+    // RenderScale above 1: the HUD art and text exist at 480 lines only. The
+    // game draws them into a 480-line surface, and every pixel it changed is
+    // enlarged over the world.
+    if (g_renderScale > 1 && g_hudSurface != NULL && g_hudBefore != NULL &&
         ReadGameDword(kGameBackBufferRva) == reinterpret_cast<DWORD>(g_virtualBack))
     {
         LockedSurface hud;
@@ -1217,8 +1246,8 @@ static DWORD __cdecl HookedHudDraw(void)
             SetWidescreenGameState(
                 kVirtualLogicalWidth,
                 kOriginalLogicalHeight,
-                kVirtualDisplayWidth * 2,
-                kOriginalDisplayHeight * 2);
+                kVirtualDisplayWidth * g_renderScale,
+                kOriginalDisplayHeight * g_renderScale);
 
             if (LockWholeSurface(g_hudSurface, kDdlockReadOnly, &hud))
             {
@@ -1226,7 +1255,7 @@ static DWORD __cdecl HookedHudDraw(void)
                 {
                     RenderScaleComposeHud(
                         hud.pixels, hud.pitch, g_hudBefore,
-                        g_hudWidth, kOriginalDisplayHeight,
+                        g_hudWidth, kOriginalDisplayHeight, g_renderScale,
                         target.pixels, target.pitch,
                         target.width, target.height);
                     UnlockWholeSurface(&target);
@@ -1327,7 +1356,7 @@ static void RestoreOriginalGameState()
     WriteGameDword(kClipTopRva, 0);
     WriteGameDword(kClipRightRva, kOriginalDisplayWidth);
     WriteGameDword(kClipBottomRva, kOriginalDisplayHeight - 1);
-    RenderScaleSetDoubled(FALSE);
+    RenderScaleSetActive(1);
     if (g_virtualDisplayActive)
     {
         SetHudCentering(FALSE);
@@ -1450,7 +1479,7 @@ static void AttachGamePaletteToBackBuffer()
     LPVOID palette = reinterpret_cast<LPVOID>(ReadGameDword(kGamePaletteRva));
     HRESULT result;
 
-    // RenderScale=2: GDI draws the HUD text into the HUD surface.
+    // RenderScale above 1: GDI draws the HUD text into the HUD surface.
     if (palette != NULL && palette != g_hudPalette && g_hudSurface != NULL)
     {
         result = reinterpret_cast<SurfaceSetPaletteFn>(
@@ -1924,7 +1953,7 @@ static HRESULT CreateVirtualPrimary(
         }
     }
 
-    if (g_renderScale == 2)
+    if (g_renderScale > 1)
     {
         BYTE hudDescription[kDdsurfaceDescSize];
         LPVOID hudSurface = NULL;
@@ -1963,8 +1992,8 @@ static HRESULT CreateVirtualPrimary(
             }
 
             LogMessage(
-                "RenderScale=2: the HUD surface could not be created; the HUD stays small.\r\n",
-                sizeof("RenderScale=2: the HUD surface could not be created; the HUD stays small.\r\n") - 1);
+                "RenderScale: the HUD surface could not be created; the HUD stays small.\r\n",
+                sizeof("RenderScale: the HUD surface could not be created; the HUD stays small.\r\n") - 1);
         }
         else
         {
@@ -3188,6 +3217,7 @@ static HRESULT WINAPI HookedSetDisplayMode(
                 break;
             }
 
+            g_renderScale = ChooseRenderScale(targetHeight);
             SelectVirtualWidth(targetWidth, targetHeight);
             result = SetVirtualDisplayMode(
                 directDraw,
@@ -3203,7 +3233,17 @@ static HRESULT WINAPI HookedSetDisplayMode(
                     kOriginalLogicalHeight,
                     kVirtualDisplayWidth * g_renderScale,
                     kOriginalDisplayHeight * g_renderScale);
-                RenderScaleSetDoubled(g_renderScale == 2);
+                RenderScaleSetActive(g_renderScale);
+                {
+                    CHAR message[96];
+
+                    wsprintfA(
+                        message,
+                        "RenderScale: this race is drawn at %lux (%lu lines).\r\n",
+                        g_renderScale,
+                        kOriginalDisplayHeight * g_renderScale);
+                    LogMessage(message, lstrlenA(message));
+                }
                 g_virtualDisplayActive = TRUE;
                 SetHudCentering(TRUE);
                 g_widescreenActive = TRUE;
@@ -3357,10 +3397,15 @@ BOOL InstallRoadRashWidescreenHook(LPVOID directDraw)
                         "Display", "MenuBackground", 1, settingsPath) != 0);
         }
 
-        if (g_renderScale == 2 && !RenderScaleInstall(base))
+        if (g_renderScaleSetting != 1 &&
+            !RenderScaleInstall(
+                base,
+                g_renderScaleSetting == 0 ? kMaxRenderScale : g_renderScaleSetting))
         {
-            g_renderScale = 1;
+            g_renderScaleSetting = 1;
         }
+
+        g_renderScale = g_renderScaleSetting == 1 ? 1 : g_renderScale;
     }
 
     if (g_hookState.object == directDraw)

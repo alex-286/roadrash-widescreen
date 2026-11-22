@@ -10,8 +10,9 @@ https://github.com/alex-286/roadrash-widescreen
 A widescreen patch for the Windows 95 version of Road Rash. It runs the
 game at the native resolution of your monitor with a view that matches its
 aspect ratio, so you see more of the road instead of a stretched 4:3
-picture. Races are drawn at twice the original resolution (960 lines), and
-optional filters smooth the classic graphics on modern displays.
+picture. Races are drawn at up to four times the original resolution (as
+many lines as fit your screen), and optional filters smooth the classic
+graphics on modern displays.
 
 The menus stay at the resolution of the races: they are enlarged to the
 screen height in the middle of the screen, and the videos by the largest

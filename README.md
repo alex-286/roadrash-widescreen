@@ -30,8 +30,9 @@ the menu.</sub>
 - **Native resolution, true widescreen:** the game renders a view as wide as
   your display's aspect ratio (1712x960 for 16:9, 2240x960 for 21:9), which
   is scaled to the full screen. Uses the desktop resolution by default.
-- **Twice the resolution:** the race world is drawn at 960 lines (1712x960
-  at 16:9) by the game's own renderer, for sharper roads, scenery and
+- **Higher resolution:** the race world is drawn at up to four times the
+  original 480 lines by the game's own renderer, as many as fit your screen
+  (960 lines at 1080p, 1440 at 1440p), for sharper roads, scenery and
   riders, also on Windows 98.
 - **Longer view:** the road and its scenery (walls, rock faces, trees,
   buildings, signs) are drawn 48 segments ahead instead of the game's 32, as
@@ -165,7 +166,7 @@ DirectPresent=1  ; 1 (default) = filters write into the screen, 0 = copy each fr
 Scanlines=0      ; 0 (default) = off, or 1-100 = scanline darkening in percent
 ShowFps=0        ; 0 (default) = off, 1 = show the frame rate during races
 ShowFilter=0     ; 0 (default) = off, 1 = show the active filter's name
-RenderScale=2    ; 2 (default) = race world at 960 lines, 1 = the original 480 lines
+RenderScale=0    ; 0 (default) = most lines that fit the screen, 1 = original 480 lines, 2-4 = 960-1920 lines
 NativeMenus=1    ; 1 (default) = menus enlarged in the middle of the native resolution, 0 = 640x480
 MenuBackground=1 ; 1 (default) = the menu picture blurred around the menu, 0 = black
 ChainDll=        ; empty (default) = the Windows DirectDraw library, or the file name of another one
@@ -192,10 +193,10 @@ AllowAltTab=0     ; 0 (default) = Alt+Tab and the Windows key blocked, 1 = Alt+T
 | `Filter` | The display filter, see [Filters](#filters). `none` keeps the game's original 8-bit display mode. |
 | `DrawDistance` | How many road segments ahead the game draws, 48 by default. The original draws 32, although it loads 80 ahead; up to 48 shows the road further into the distance (48 is also what the 30th Anniversary Edition draws). The scenery beside the road (walls, rock faces, trees, buildings, signs) is drawn out to the full distance once the game has loaded its pictures, which it does for the original distance; until then, a far segment shows only the road. Riders, cars and pedestrians appear out to the same distance; the list of objects the game draws holds proportionally more of them for it (75 at 48 segments instead of 50). The road arrays, the crest thresholds and the depth table are enlarged in memory for it. |
 | `DistanceFade` | How many of the farthest road segments fade into a haze (16 by default), so new segments appear out of it instead of popping in whole. The haze grows toward the far end to 3/4 and takes its color from the track's sky panorama; the game's 256-color palette is remapped for it, so the steps may show slight color shifts. 0 turns it off. |
-| `DirectPresent` | Only for the filters other than `none`. With `1`, a filter whose output has the screen size writes straight into the screen surface after the vertical blank, instead of into system memory that is then copied to the graphics card. That copy took 8 ms per frame at 1920x1080 on a Windows 98 PC. While `Scanlines` are on (which read the frame back), frames are still copied, except with `nearest`. If the screen surface cannot be locked, the frame is copied as with `0`. |
+| `DirectPresent` | Only for the filters other than `none`. With `1`, a filter whose output has the screen size writes straight into the screen surface after the vertical blank, instead of into system memory that is then copied to the graphics card. On older PCs that copy can take several milliseconds per frame. While `Scanlines` are on (which read the frame back), frames are still copied, except with `nearest`. If the screen surface cannot be locked, the frame is copied as with `0`. |
 | `Scanlines` | Strength of the scanline effect; 30 to 50 is a good start. |
 | `ShowFps`, `ShowFilter` | On-screen display in the top-left corner, for example `60 FPS  BICUBIC`. |
-| `RenderScale` | `2` (default) makes the game's own rasterizer draw the race world at twice the resolution (960 lines, 1712x960 at 16:9), so roads, scenery and riders are sharper; the sky and the cockpit are enlarged from their 480-line art. `1` keeps the original 480 lines, for very slow PCs. On a Windows 98 PC with a Pentium Dual-Core E5800 at 1920x1080, `none` runs at 59 fps (5.4 ms of game time per frame); with `WaitForVBlank=0`, `nearest` reaches 59 fps, `sharp-bilinear` 44 and `bicubic` 28. |
+| `RenderScale` | How many times the original 480 lines the game's own rasterizer draws the race world at, so roads, scenery and riders are sharper; the sky and the cockpit are enlarged from their 480-line art. `0` (default) picks for each race the most lines that fit the height of its display mode: 2 (960 lines, 1712x960 at 16:9) at 1080 lines, 3 (1440 lines) at 1440 lines, 4 (1920 lines) at 2160 lines or more, and 1 below 960 lines. `1` keeps the original 480 lines, for very slow PCs; `2`, `3` and `4` draw 960, 1440 or 1920 lines on every screen. Each step draws more pixels and costs speed; on older PCs, use `1` or `2`, and with a filter other than `none` try `WaitForVBlank=0` for a higher frame rate. |
 | `NativeMenus` | The game's menus are a Windows interface of 640x480: a main window with the buttons as windows of their own, dialogs and a video window. Windows 98 cannot enlarge such windows, so with `1` the screen stays at the resolution of the races (in 16-bit color), the menu fills the screen height in the middle (2.25x at 1920x1080, 3x at 2560x1440; with a factor that is not a whole number, some rows and columns of pixels are one screen pixel wider than others, and the mouse, the windows and the drawing all use the same mapping), and the videos are enlarged by the largest whole factor of their own size that fits (320x192 videos: 5x at 1920x1080, 7x at 2560x1440), on black. Everything visible in the menus is drawn by copying rectangles into the screen, so the patch enlarges those copies; the game's main window covers the whole screen as in the original, its invisible button windows are enlarged the same way, and the positions the game reads (window rectangles, the mouse, paint areas) come back in its 640x480 coordinates. Windows dialogs (the save dialog, message boxes) keep their size and are centred. With `0`, the screen switches to 640x480 for the menus as in the original game. |
 | `MenuBackground` | Only with `NativeMenus=1`: what fills the screen around the menu. With `1`, each new menu screen is averaged into a grid of 32x24 colors, which is stretched smoothly over the screen and darkened: the menu picture, enlarged and heavily blurred, made at runtime from the game's own picture. It is drawn only when the game shows a whole new menu screen, not for every small change. With `0` the area stays black. Videos always play on black. |
 | `ChainDll` | Another DirectDraw library that the patch passes the game's DirectDraw calls on to, instead of the one of Windows, see [Together with another DirectDraw wrapper](#together-with-another-directdraw-wrapper). A relative path starts in the folder of `ROADRASH.EXE`. If the library cannot be loaded, the patch uses the Windows one and says so in the log. |
@@ -213,8 +214,9 @@ AllowAltTab=0     ; 0 (default) = Alt+Tab and the Windows key blocked, 1 = Alt+T
 
 ## Filters
 
-The game draws at 960 lines (`RenderScale=2`) or 480 lines, so the picture
-is always enlarged. A filter decides how:
+The game draws at 480, 960, 1440 or 1920 lines (`RenderScale`), so the
+picture is usually enlarged, or shrunk when it has more lines than the
+screen. A filter decides how:
 
 | Filter | Look | Best for |
 |---|---|---|
@@ -223,7 +225,7 @@ is always enlarged. A filter decides how:
 | `sharp-bilinear` | Crisp pixels of even size, also at non-integer scales such as 1080p. | A clean pixel look on any resolution. |
 | `bicubic` | Smooth, photo-like enlargement; also softens the game's blocky near sprites. | A soft, modern look. |
 
-The same frame at 2560x1440 with the default `RenderScale=2`: a 320x240
+The same frame at 2560x1440 with `RenderScale=2`: a 320x240
 crop of the rider, enlarged 2x by doubling the pixels:
 
 | `nearest` | `sharp-bilinear` | `bicubic` |
@@ -317,10 +319,12 @@ for a release, named after the version in [`src/version.h`](src/version.h)
   the game's `DDRAW.dll!DirectDrawCreate` import at itself and forwards to
   the function the import held before.
 - When a race starts, the display is set to the native resolution while the
-  game renders into a wider 960-line (or 480-line) buffer, which is scaled to
-  the screen on every frame. For 960 lines, the game's own rasterizer gets
-  larger edge tables and converts its 3D coordinates at twice the scale; the
-  sky and the HUD exist as 480-line art and are enlarged into the frame. Two game routines are redirected while racing: the HUD is
+  game renders into a wider buffer of 480 lines times the render scale,
+  which is scaled to the screen on every frame. For more than 480 lines, the
+  game's own rasterizer gets larger edge tables and converts its 3D
+  coordinates at the render scale (a finer shift at 2x and 4x, a
+  multiplication at 3x); the sky and the HUD exist as 480-line art and are
+  enlarged into the frame. Two game routines are redirected while racing: the HUD is
   drawn centered, and the sky panorama is tiled across the whole width. Both
   are restored when returning to the menu.
 - With a filter, the display runs at 32 bits per pixel. The game keeps
