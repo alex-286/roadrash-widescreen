@@ -2,6 +2,7 @@
 // Copyright (C) 2026 Alexander Schmidt
 
 #include "game_fixes.h"
+#include "alt_tab.h"
 #include "road_rash_patch.h"
 
 // Every fix checks the original bytes before it changes anything and logs
@@ -1259,5 +1260,11 @@ void ApplyGameFixes(DWORD gameBase, const CHAR* iniPath)
         GetPrivateProfileIntA("Fixes", "FixOdometer", 1, iniPath) != 0)
     {
         FixOdometer();
+    }
+
+    if (iniPath != NULL &&
+        GetPrivateProfileIntA("Fixes", "AllowAltTab", 0, iniPath) != 0)
+    {
+        AllowAltTab(gameBase);
     }
 }

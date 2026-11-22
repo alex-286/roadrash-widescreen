@@ -181,6 +181,7 @@ FixPunchShadow=1  ; 1 (default) = the shadow stays under the bike when punching,
 GroundBuildings=1 ; 1 (default) = three hovering buildings stand on the ground, 0 = original
 FixOdometer=1     ; 1 (default) = the distance no longer wraps to 0 after 25.5, 0 = original
 SmoothRoad=1      ; 1 (default) = the road and its edges move without jumps, 0 = original
+AllowAltTab=0     ; 0 (default) = Alt+Tab and the Windows key blocked, 1 = Alt+Tab and the Windows key work
 ```
 
 | Setting | Description |
@@ -208,6 +209,7 @@ SmoothRoad=1      ; 1 (default) = the road and its edges move without jumps, 0 =
 | `GroundBuildings` | The pictures of the red barn (`BARN12`), the brown shop with the sign (`RUSTICA2`) and the white house (`HOUSEB2`) in `FAMILIES.RSC` end in empty rows, and the game places them as if the picture reached the bottom of the texture, so they hover. The fix draws them 2, 3 and 10 rows of their picture lower, found by the texture name; only the drawing changes. |
 | `FixOdometer` | The game computes the distance in the cockpit in tenths of a mile (of a kilometer with metric units) but keeps only one byte of it, so the display wraps to 0 after 25.5, which most courses in kilometers pass, and shows 25.x before the start line. The fix keeps the whole value; the display starts at 0.0 and goes up to 999.9. |
 | `SmoothRoad` | The game projects the road ahead segment by segment, starting from the camera's position within its segment. It starts the height and the bend of the first segment in whole units and drops the rest, so the road is up to one unit too high and every segment further ahead a little further to the side. Whenever the whole parts change, the road and its edges jump by a few pixels near the camera (twice as many at 960 lines). The fix adds the dropped parts back to the screen positions of every plain road segment; segments of other kinds are left as the game computes them. |
+| `AllowAltTab` | The compatibility database of Windows (`sysmain.sdb`) applies its IgnoreAltTab fix to `ROADRASH.EXE`. That fix runs a keyboard hook in the game that swallows Alt+Tab, Alt+Esc, Ctrl+Esc and the Windows and menu keys. With `1`, the patch ends the thread of that hook when the game starts DirectDraw, and Windows removes the hook with it; the log says whether it worked. Windows 95/98/ME do not have the fix, but there the game blocks the keys itself: a keyboard hook of its own discards Tab while Alt is held, and its windows keep Alt+Tab, Alt+Esc and the commands for switching from Windows. With `1`, the patch removes that hook and gives these keys and commands of the game's windows to Windows. In both cases the game keeps running in the background, and Alt+Tab brings it back. Tested on Windows 98 SE, and on Windows 11 with the Windows DirectDraw library and with DDrawCompat. |
 
 ## Filters
 
