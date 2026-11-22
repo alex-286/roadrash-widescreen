@@ -55,11 +55,14 @@ typedef DWORD (__fastcall *MusicStartFn)(DWORD, DWORD);
 // the distance to the camera: 1 tick close by, up to 8 for riders 30
 // segments ahead (0x1E for nodes off the road). Far riders and cars
 // therefore move in visible jumps. At 0x438108 it computes
-// next = [node + 0x14] + tick. Within the range where nodes are drawn
-// (FUN_00438450: up to camera + 0x2000), next becomes tick + 1, so they move
-// every tick; their movement still follows the elapsed time as before.
-// Nodes further away, behind the camera or off the road keep their
-// interval, and [node + 0x14] stays as the game computed it.
+// next = [node + 0x14] + tick. Within the range where the original game
+// draws nodes (FUN_00438450: up to camera + 0x2000), next becomes tick + 1,
+// so they move every tick; their movement still follows the elapsed time as
+// before. Nodes further away, behind the camera or off the road keep their
+// interval, and [node + 0x14] stays as the game computed it. (With
+// DrawDistance, nodes are drawn up to 48 segments ahead; updating those
+// every tick as well more than doubled the game time per frame, so they keep
+// the game's interval.)
 static const DWORD kNextUpdateRva = 0x00038108;
 static const DWORD kCameraPositionRva = 0x000B6E5C;
 static const LONG kFullRateBehind = -0x400;

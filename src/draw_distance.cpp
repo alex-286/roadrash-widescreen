@@ -12,9 +12,13 @@
 // the road, however, are loaded for the original distance only, so beyond
 // 33 segments they are not drawn (see HookedSectionSetup).
 //
-// Riders, cars, pedestrians and other world nodes are still registered only
-// up to depth camera + 0x2000 (32 segments, at most 50; FUN_00438450), so
-// they keep appearing at the original distance.
+// Riders, cars, pedestrians and other world nodes are drawn from a visible
+// list that FUN_00438450 builds every frame: the nodes from just ahead of
+// the camera up to depth (camera & ~0xFF) + 0x2000 (32 segments), at most
+// 50, in course order. Only the drawing reads it (FUN_00438610, per segment
+// from far to near, and the cursor at 0x4385F0), and the game logic does
+// not. The depth limit follows the draw distance; the list moves into this
+// DLL with room for proportionally more nodes (see HookedFarScenery).
 //
 // Arrays sized for 32 segments move into this DLL at the requested size:
 // - the slices (0x224 bytes, segments + 2 of them) and the two row caches
@@ -151,11 +155,10 @@ static const DWORD kSiteCount = sizeof(kSites) / sizeof(kSites[0]);
 // Otherwise the entry is emptied and given a negative key, which
 // FUN_00444630 never fills. A far entry is emptied again as soon as one of
 // its slots is locked or changes, before the next frame is drawn (the main
-// thread locks a slot before the loader thread frees it). Objects beyond 33
-// segments (FUN_00438610) are not drawn at all: the game registers them
-// only that far. Once a segment is within 33 segments, an emptied entry
-// gets a key that matches no position, and the game fills it as in the
-// original.
+// thread locks a slot before the loader thread frees it). The scenery a far
+// segment draws through FUN_00438610 is held to the same rule. Once a
+// segment is within 33 segments, an emptied entry gets a key that matches
+// no position, and the game fills it as in the original.
 static const DWORD kSectionSetupRva = 0x00044630;
 static const DWORD kSectionSetupCalls[] =
 {
@@ -232,6 +235,29 @@ static const DWORD kSceneryOtherLayers = 0xFFFFF007;
 static const DWORD kSceneryCalls[] = { 0x0003864C, 0x000386D5, 0x00038764 };
 static const DWORD kSingleSceneryCalls[] = { 0x000386EA, 0x00038779 };
 
+// The visible list of FUN_00438450 (see the top of this file): 50 node
+// pointers at 0x4C3D30, filled 1-based through 0x4C3D2C. FUN_00438610 also
+// reads the entry before the first one (when the cursor is -1), so the moved
+// list keeps a spare entry in front.
+static const DWORD kVisibleListVa = 0x004C3D30;
+static const DWORD kOriginalVisibleCount = 50;
+static const DWORD kMaxVisibleCount =
+    (kOriginalVisibleCount * kMaxDrawSegments + kOriginalDrawSegments - 1) /
+    kOriginalDrawSegments;
+static const AddressSite kVisibleListSites[] =
+{
+    // FUN_00438450: mov [esi * 4 + list - 4], ebx
+    { 0x0003852E, { 0x89, 0x1C, 0xB5 }, 3, 0x004C3D2C },
+    // FUN_00438610: mov ebx, [eax * 4 + list] / lea esi, [eax * 4 + list]
+    { 0x00038669, { 0x8B, 0x1C, 0x85 }, 3, 0x004C3D30 },
+    { 0x00038673, { 0x8D, 0x34, 0x85 }, 3, 0x004C3D30 },
+    // FUN_00438610: cmp esi, list (end of the walk)
+    { 0x00038727, { 0x81, 0xFE }, 2, 0x004C3D30 },
+};
+// FUN_00438450: add eax, 0x2000 (the depth limit) and mov edx, 50.
+static const DWORD kVisibleDepthRva = 0x000384C0;
+static const DWORD kVisibleCountRva = 0x000384C9;
+
 typedef void (__cdecl *SetupFn)(void);
 
 static DWORD g_base = 0;
@@ -241,6 +267,8 @@ static BYTE* g_cache2 = NULL;
 static BYTE* g_slices = NULL;
 static LONG* g_thresholds = NULL;
 static LONG* g_reciprocal = NULL;
+static BOOL g_farObjects = FALSE;
+static DWORD g_visibleList[1 + kMaxVisibleCount];
 
 static void LogDistance(const CHAR* text)
 {
@@ -308,6 +336,22 @@ static BOOL MatchesSite(const AddressSite& site)
     }
 
     return ReadDword(code + site.prefixLength) == GameVa(site.original);
+}
+
+static BOOL MatchesBytes(DWORD rva, const BYTE* bytes, DWORD length)
+{
+    const BYTE* code = reinterpret_cast<const BYTE*>(g_base + rva);
+    DWORD index;
+
+    for (index = 0; index < length; ++index)
+    {
+        if (code[index] != bytes[index])
+        {
+            return FALSE;
+        }
+    }
+
+    return TRUE;
 }
 
 static BYTE* Slice(DWORD index)
@@ -695,14 +739,10 @@ static void __fastcall HookedSectionSetup(
 
 // record[6]: the segment's depth; record[2]: the segment (its position at
 // +8); record[3]: its course section; record[0x3F]: its row cache entry.
-// Beyond 33 segments FUN_00438610 is not called: the riders, cars and
-// pedestrians it draws from the visible list exist only up to 32 segments,
-// and the list's order does not hold out there. The object cursor is handed
-// on unchanged, as by a segment without objects. The segment's scenery
-// (trees, buildings, signs) is drawn as FUN_00438610 draws it when no
-// object is in the way, but only while the entry was filled from loaded
+// Whether a segment's scenery (trees, buildings, signs) may be drawn: always
+// within 33 segments; beyond, only while its entry was filled from loaded
 // slots that still hold the same families (see HookedSectionSetup).
-static void __fastcall HookedSliceObjects(LONG* record, int from, int to)
+static BOOL SceneryReady(const LONG* record)
 {
     const BYTE* section;
     const LONG* entry;
@@ -711,6 +751,49 @@ static void __fastcall HookedSliceObjects(LONG* record, int from, int to)
 
     if (record[6] <= kNearDepth)
     {
+        return TRUE;
+    }
+
+    section = reinterpret_cast<const BYTE*>(record[3]);
+    entry = reinterpret_cast<const LONG*>(record[0x3F]);
+    key = *reinterpret_cast<const LONG*>(record[2] + 8);
+    fill = FillOf(entry);
+    return fill != NULL && fill->valid && fill->key == key && entry[0] == key &&
+        (SectionSlots(section) & ~fill->slots) == 0 && FillStillValid(fill);
+}
+
+// With the visible list reaching as far as the road, FUN_00438610 draws
+// every segment, interleaving riders, cars and pedestrians with the scenery
+// as in the original; its scenery calls come here and are skipped for a far
+// segment whose pictures are not ready.
+static void __fastcall HookedFarScenery(LONG* record, DWORD layers, int from, int to)
+{
+    if (SceneryReady(record))
+    {
+        reinterpret_cast<SceneryFn>(g_base + kSceneryRva)(record, layers, from, to);
+    }
+}
+
+static void __fastcall HookedFarSingleScenery(LONG* record, int from, int to)
+{
+    if (SceneryReady(record))
+    {
+        reinterpret_cast<SingleSceneryFn>(g_base + kSingleSceneryRva)(record, from, to);
+    }
+}
+
+// Without the longer visible list (its code differed from the original),
+// FUN_00438610 is not called beyond 33 segments: the riders, cars and
+// pedestrians it draws exist only up to 32 segments there, and the list's
+// order does not hold further out. The object cursor is handed on
+// unchanged, as by a segment without objects. The segment's scenery is drawn
+// as FUN_00438610 draws it when no object is in the way.
+static void __fastcall HookedSliceObjects(LONG* record, int from, int to)
+{
+    const BYTE* section;
+
+    if (record[6] <= kNearDepth || g_farObjects)
+    {
         reinterpret_cast<SliceObjectsFn>(g_base + kSliceObjectsRva)(record, from, to);
         return;
     }
@@ -718,16 +801,12 @@ static void __fastcall HookedSliceObjects(LONG* record, int from, int to)
     *reinterpret_cast<LONG*>(GameVa(kObjectCursorNextVa)) =
         *reinterpret_cast<LONG*>(GameVa(kObjectCursorVa));
 
-    section = reinterpret_cast<const BYTE*>(record[3]);
-    entry = reinterpret_cast<const LONG*>(record[0x3F]);
-    key = *reinterpret_cast<const LONG*>(record[2] + 8);
-    fill = FillOf(entry);
-    if (fill == NULL || !fill->valid || fill->key != key || entry[0] != key ||
-        (SectionSlots(section) & ~fill->slots) != 0 || !FillStillValid(fill))
+    if (!SceneryReady(record))
     {
         return;
     }
 
+    section = reinterpret_cast<const BYTE*>(record[3]);
     if (section[0x3D] != 0)
     {
         reinterpret_cast<SceneryFn>(g_base + kSceneryRva)(
@@ -768,6 +847,7 @@ static void* Allocate(DWORD bytes)
 BOOL DrawDistanceInstall(DWORD gameBase, DWORD segments)
 {
     BYTE call[5];
+    BOOL farObjects;
     const BYTE* code;
     DWORD slices;
     DWORD cacheBytes;
@@ -856,6 +936,31 @@ BOOL DrawDistanceInstall(DWORD gameBase, DWORD segments)
         }
     }
 
+    // The visible list: optional, the road works without it.
+    {
+        static const BYTE depth[5] = { 0x05, 0x00, 0x20, 0x00, 0x00 };
+        static const BYTE count[5] =
+        {
+            0xBA, static_cast<BYTE>(kOriginalVisibleCount), 0x00, 0x00, 0x00
+        };
+
+        farObjects =
+            MatchesBytes(kVisibleDepthRva, depth, sizeof(depth)) &&
+            MatchesBytes(kVisibleCountRva, count, sizeof(count));
+        for (index = 0;
+             farObjects &&
+             index < sizeof(kVisibleListSites) / sizeof(kVisibleListSites[0]);
+             ++index)
+        {
+            farObjects = MatchesSite(kVisibleListSites[index]);
+        }
+
+        if (!farObjects)
+        {
+            LogDistance("DrawDistance: unexpected code in the object list; riders, cars and pedestrians stay at 32 segments.");
+        }
+    }
+
     // One block in the original layout: cache 1, cache 2, gap, slices.
     slices = segments + 2;
     cacheBytes = slices * kCacheEntrySize;
@@ -926,6 +1031,47 @@ BOOL DrawDistanceInstall(DWORD gameBase, DWORD segments)
         CHAR message[96];
 
         wsprintfA(message, "DrawDistance: the road is drawn %lu segments ahead.", segments);
+        LogDistance(message);
+    }
+
+    if (farObjects)
+    {
+        DWORD listBase = reinterpret_cast<DWORD>(&g_visibleList[1]);
+        DWORD visibleCount =
+            (kOriginalVisibleCount * segments + kOriginalDrawSegments - 1) /
+            kOriginalDrawSegments;
+        CHAR message[112];
+
+        for (index = 0;
+             index < sizeof(kVisibleListSites) / sizeof(kVisibleListSites[0]);
+             ++index)
+        {
+            const AddressSite& site = kVisibleListSites[index];
+
+            WriteCodeDword(
+                site.rva + site.prefixLength,
+                listBase + (site.original - kVisibleListVa));
+        }
+
+        WriteCodeDword(kVisibleDepthRva + 1, segments * kSegmentUnit);
+        WriteCodeDword(kVisibleCountRva + 1, visibleCount);
+
+        for (index = 0; index < sizeof(kSceneryCalls) / sizeof(DWORD); ++index)
+        {
+            RedirectCall(kSceneryCalls[index], HookedFarScenery);
+        }
+
+        for (index = 0; index < sizeof(kSingleSceneryCalls) / sizeof(DWORD); ++index)
+        {
+            RedirectCall(kSingleSceneryCalls[index], HookedFarSingleScenery);
+        }
+
+        g_farObjects = TRUE;
+        wsprintfA(
+            message,
+            "DrawDistance: riders, cars and pedestrians appear %lu segments ahead (up to %lu).",
+            segments,
+            visibleCount);
         LogDistance(message);
     }
 
