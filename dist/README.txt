@@ -1,4 +1,4 @@
-Road Rash Widescreen Patch 1.2.0
+Road Rash Widescreen Patch 1.3.0
 ================================
 
 Native resolution, double resolution, a longer view and fixes for the

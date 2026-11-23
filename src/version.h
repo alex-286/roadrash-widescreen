@@ -18,10 +18,10 @@
 /** The major version: changes that break existing installations. */
 #define RRWS_VERSION_MAJOR 1
 /** The minor version: new features. */
-#define RRWS_VERSION_MINOR 2
+#define RRWS_VERSION_MINOR 3
 /** The patch version: fixes. */
 #define RRWS_VERSION_PATCH 0
 /** The whole version as text, "major.minor.patch". */
-#define RRWS_VERSION_STRING "1.2.0"
+#define RRWS_VERSION_STRING "1.3.0"
 
 #endif
