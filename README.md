@@ -67,32 +67,30 @@ the menu.</sub>
 
 ## Fixes
 
-The patch also repairs faults of the original game. Each fix has a setting
-in the `[Fixes]` section of `RoadRashWidescreen.ini` (see
-[Configuration](#configuration)); its default is in parentheses.
+The patch also repairs faults of the original game. Each fix can be turned
+off in [Configuration](#configuration).
 
-- `FixBikeColors` (on): the Rat and Super bikes race in their own colors, as
-  the shop shows them.
-- `SmoothSprites` (on): buildings, riders and cars move in 1-pixel steps
-  instead of 2-pixel steps in High Resolution mode.
-- `FullRateObjects` (on): riders and cars in the distance move smoothly
-  instead of in jumps.
-- `FixPunchShadow` (on): the rider's shadow stays under the bike when
-  punching.
-- `GroundBuildings` (on): three hovering buildings stand on the ground.
-- `FixOdometer` (on): the distance in the cockpit no longer wraps to 0 after
-  25.5.
-- `SmoothRoad` (on): the road and its edges no longer jump by a few pixels
+- **Bike colors:** the Rat and Super bikes race in their own colors, as the
+  shop shows them.
+- **Smooth movement:** buildings, riders and cars move in fine steps instead
+  of jumping by two pixels, and riders and cars in the distance no longer
+  move in jumps.
+- **Punch shadow:** the rider's shadow stays under the bike when punching.
+- **Grounded buildings:** three buildings that hover above the ground stand
+  on it.
+- **Odometer:** the distance in the cockpit no longer wraps to 0 after 25.5.
+- **Steady road:** the road and its edges no longer jump by a few pixels
   while riding.
-- `MidiVolumeGuard` (on): a music volume of 0 no longer mutes the whole game
-  on Windows Vista and newer, and a MIDI driver that cannot set the volume no
-  longer stops the race music.
-- `MidiErrorsToLog` (on): a race music error goes to the log instead of a
-  message box that can hide behind the race and seem to freeze the game.
-- `MusicDevice` (the MIDI mapper): plays the race music on another MIDI
-  output when the races stay silent.
-- `AllowAltTab` (off): Alt+Tab and the Windows key switch away from the game
-  while it keeps running.
+- **Music volume:** a music volume of 0 no longer mutes the whole game on
+  newer Windows, and a sound card that cannot set the volume no longer stops
+  the race music.
+- **MIDI errors:** when the race music cannot start, the game no longer
+  seems to freeze behind a hidden error message; the race starts without
+  music.
+- **Silent races:** if the races have no music while the menus do, the race
+  music can play on another MIDI output.
+- **Alt+Tab (optional):** Alt+Tab and the Windows key switch away from the
+  game while it keeps running.
 
 ## Requirements
 
