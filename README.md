@@ -251,7 +251,8 @@ single-core CPU such as a Pentium 4, `sharp-bilinear` is the fastest choice;
 ## Troubleshooting
 
 The patch writes `RoadRashWidescreen.log` to the game folder each time the
-game starts. Its first line names the patch version (for example
+game starts. Each line begins with the time since the game started, in
+seconds. Its first line names the patch version (for example
 `Road Rash Widescreen 1.2.0`). It shows whether the game version was recognized, which display
 mode and filter are used, and, per filter, how the time of a frame is spent.
 Please attach it when reporting a problem.

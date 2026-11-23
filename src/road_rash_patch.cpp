@@ -305,6 +305,66 @@ static BOOL g_showFps = FALSE;
 static BOOL g_showFilter = FALSE;
 // The first log message of a run replaces the previous log.
 static BOOL g_truncateLog = FALSE;
+// Each log line starts with the time since the first message, in seconds
+// and milliseconds (GetTickCount: 32-bit, available on Windows 95).
+static DWORD g_logStartTick = 0;
+static BOOL g_logAtLineStart = TRUE;
+
+static BOOL WriteLogText(HANDLE file, const char* text, DWORD length)
+{
+    DWORD bytesWritten;
+
+    return WriteFile(file, text, length, &bytesWritten, NULL) &&
+        bytesWritten == length;
+}
+
+// Writes the message with a time stamp in front of each line it begins.
+static BOOL WriteStampedLog(HANDLE file, const char* message, DWORD length)
+{
+    DWORD offset = 0;
+
+    while (offset < length)
+    {
+        DWORD lineEnd = offset;
+
+        while (lineEnd < length && message[lineEnd] != '\n')
+        {
+            ++lineEnd;
+        }
+
+        if (lineEnd < length)
+        {
+            ++lineEnd;
+        }
+
+        if (g_logAtLineStart)
+        {
+            DWORD elapsed = GetTickCount() - g_logStartTick;
+            CHAR stamp[24];
+            int stampLength = wsprintfA(
+                stamp,
+                "[%4lu.%03lu] ",
+                elapsed / 1000,
+                elapsed % 1000);
+
+            if (stampLength > 0 &&
+                !WriteLogText(file, stamp, static_cast<DWORD>(stampLength)))
+            {
+                return FALSE;
+            }
+        }
+
+        if (!WriteLogText(file, message + offset, lineEnd - offset))
+        {
+            return FALSE;
+        }
+
+        g_logAtLineStart = message[lineEnd - 1] == '\n';
+        offset = lineEnd;
+    }
+
+    return TRUE;
+}
 
 static void LogMessage(const char* message, DWORD length)
 {
@@ -313,7 +373,12 @@ static void LogMessage(const char* message, DWORD length)
     DWORD directoryLength;
     static const CHAR fileName[] = "RoadRashWidescreen.log";
     HANDLE file;
-    DWORD bytesWritten;
+
+    if (g_truncateLog)
+    {
+        g_logStartTick = GetTickCount();
+        g_logAtLineStart = TRUE;
+    }
 
     if (pathLength == 0 || pathLength >= MAX_PATH)
     {
@@ -363,8 +428,7 @@ static void LogMessage(const char* message, DWORD length)
         return;
     }
 
-    if (!WriteFile(file, message, length, &bytesWritten, NULL) ||
-        bytesWritten != length)
+    if (!WriteStampedLog(file, message, length))
     {
         OutputDebugStringA(message);
     }

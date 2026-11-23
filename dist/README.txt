@@ -157,7 +157,8 @@ Troubleshooting
 ---------------
 
 Each time the game starts, the patch writes RoadRashWidescreen.log to the
-game folder. It shows whether the game version was recognized and which
+game folder. Each line begins with the time since the game started, in
+seconds. It shows whether the game version was recognized and which
 display mode and filter are used. Please attach it when reporting a
 problem.
 
