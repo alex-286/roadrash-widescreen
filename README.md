@@ -1,6 +1,6 @@
 # Road Rash Widescreen Patch
 
-**Native resolution, higher resolution, a longer view and fixes for the
+**Native resolution, true widescreen, higher resolution, a longer view and fixes for the
 original 1996 PC version of Road Rash, from Windows 95 to Windows 11.**
 
 [Features](#features) · [Fixes](#fixes) · [Requirements](#requirements) · [Installation](#installation) · [Configuration](#configuration) · [Hotkeys](#hotkeys) · [Troubleshooting](#troubleshooting) · [Building](#building) · [Known limitations](#known-limitations) · [Credits](#credits) · [License](#license)
