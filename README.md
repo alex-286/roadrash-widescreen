@@ -1,12 +1,12 @@
 # Road Rash Widescreen Patch
 
-**Native resolution, double resolution, a longer view and fixes for the
+**Native resolution, higher resolution, a longer view and fixes for the
 original 1996 PC version of Road Rash, from Windows 95 to Windows 11.**
 
 A widescreen patch for the Windows 95 version of **Road Rash**. It runs the
 game at your monitor's native resolution with a view that matches its aspect
 ratio, so you see more of the road instead of a stretched 4:3 picture.
-Optional filters smooth the classic 640x480 graphics on modern displays.
+Optional filters smooth the classic graphics on modern displays.
 
 On Windows XP and newer, the patch is a drop-in `ddraw.dll` placed next to the
 game. It changes nothing on disk: delete the file and the game is back to
@@ -28,15 +28,16 @@ the menu.</sub>
 ## Features
 
 - **Native resolution, true widescreen:** the game renders a view as wide as
-  your display's aspect ratio (1712x960 for 16:9, 2240x960 for 21:9), which
-  is scaled to the full screen. Uses the desktop resolution by default.
+  your display's aspect ratio (1712x960 at 1920x1080, 2568x1440 at
+  2560x1440), which is scaled to the full screen. Uses the desktop resolution by default.
 - **Higher resolution:** the race world is drawn at up to four times the
   original 480 lines by the game's own renderer, as many as fit your screen
   (960 lines at 1080p, 1440 at 1440p), for sharper roads, scenery and
   riders, also on Windows 98.
-- **Longer view:** the road and its scenery (walls, rock faces, trees,
-  buildings, signs) are drawn 48 segments ahead instead of the game's 32, as
-  far as the 30th Anniversary Edition shows.
+- **Longer view:** the road, its scenery (walls, rock faces, trees,
+  buildings, signs) and the riders, cars and pedestrians are drawn 48
+  segments ahead instead of the game's 32, as far as the 30th Anniversary
+  Edition shows.
 - **Distance haze:** the farthest segments fade into a haze in the colors
   of the track's sky, so the road no longer pops in at the far end.
 - **Fixed HUD and sky:** the cockpit, gauges and messages stay centered, and
@@ -57,7 +58,8 @@ the menu.</sub>
   punching; three hovering buildings stand on the ground; the road and its
   edges no longer jump while riding; the distance in the cockpit no longer
   wraps to 0 after 25.5; a music volume of 0 no longer mutes the whole game
-  on newer Windows. Each fix can be turned off.
+  on newer Windows. Each fix can be turned off. Optionally, Alt+Tab and the
+  Windows key work while the game runs.
 - **Race music on any MIDI output:** if the races stay silent because the
   MIDI mapper leads to the wrong output, `MusicDevice` picks another one. A
   MIDI driver that cannot set the volume no longer stops the race music, and
@@ -308,15 +310,15 @@ Windows 95 and 98. It also builds `build\RRWSPatch.exe`, the Windows 9x setup to
 The script also assembles the release package in `build\release\`: the DLL
 (as `ddraw.dll` and as `RRWS.dll`), `RRWSPatch.exe`, the player
 documentation and default settings from [`dist/`](dist/) (`README.txt`,
-`RoadRashWidescreen.ini`), and the license as `LICENSE.txt`. Zip that folder
-for a release, named after the version in [`src/version.h`](src/version.h)
+`RoadRashWidescreen.ini`), and the license as `LICENSE.txt`. Zip the files
+in that folder for a release, named after the version in [`src/version.h`](src/version.h)
 (for example `RoadRashWidescreen-1.3.0.zip`).
 
 ## How it works
 
 - The proxy forwards all DirectDraw calls to the system's `ddraw.dll` (or to
   the library named by `ChainDll`) and patches only the supported Road Rash
-  executable, in memory. Loaded under another name (as an `.asi`), it points
+  executable, in memory. Loaded under another name, it points
   the game's `DDRAW.dll!DirectDrawCreate` import at itself and forwards to
   the function the import held before.
 - When a race starts, the display is set to the native resolution while the

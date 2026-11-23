@@ -1,7 +1,7 @@
 Road Rash Widescreen Patch 1.3.0
 ================================
 
-Native resolution, double resolution, a longer view and fixes for the
+Native resolution, higher resolution, a longer view and fixes for the
 original 1996 PC version of Road Rash, from Windows 95 to Windows 11.
 
 Project page, source code and new versions:
@@ -106,8 +106,7 @@ Tested on Windows 11 with cnc-ddraw 7.1.0.0 in a subfolder:
 cnc-ddraw\ddraw.dll, with its ddraw.ini next to it, and
 ChainDll=cnc-ddraw\ddraw.dll.
 
-Other wrappers are untested with the patch. If a wrapper changes the game's
-window functions, the menus stay at 640x480.
+Other wrappers are untested with the patch.
 
 
 Uninstallation
@@ -140,6 +139,11 @@ turned off in the [Fixes] section of RoadRashWidescreen.ini.
   instead of hovering above it.
 - The distance in the cockpit no longer wraps to 0 after 25.5.
 - The road and its edges move smoothly instead of jumping by a few pixels.
+- When the race music cannot start, the error goes to the log instead of a
+  message box that can stay hidden behind the race.
+
+Optional (AllowAltTab=1, off by default): Alt+Tab and the Windows key work
+while the game runs.
 
 
 Hotkeys
