@@ -96,6 +96,8 @@ off in [Configuration](#configuration).
 
 - **Road Rash for Windows 95, version 1.0A**: the `ROADRASH.EXE` of
   23 August 1996, 541,184 bytes (SHA-256 `73d7f974…60f18a2`).
+- The game installed. Its 16-bit installer does not run on 64-bit Windows; see
+  [the manual installation on PCGamingWiki](https://www.pcgamingwiki.com/wiki/Road_Rash#Installing_Retail_version_on_64-bit_versions_of_Windows).
 - The game option **High Resolution** (640x480) must be enabled.
 - Windows 95 or newer. The patch is tested on Windows 98 SE and Windows 11.
   It uses only functions that Windows 95 already has, so it should also run

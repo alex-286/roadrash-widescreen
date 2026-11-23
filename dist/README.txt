@@ -49,6 +49,9 @@ Requirements
   541,184 bytes. This executable serves all of the game's languages
   (English, German, French, Spanish, Italian). Other executables are not
   patched; the game then runs as usual.
+- The game installed. Its 16-bit installer does not run on 64-bit Windows;
+  PCGamingWiki describes a manual installation:
+  https://www.pcgamingwiki.com/wiki/Road_Rash
 - The game option "High Resolution" (640x480) must be enabled.
 - Windows 95 or newer. Tested on Windows 98 SE and Windows 11; Windows 95,
   ME and the versions from XP to 10 should work but are untested.
