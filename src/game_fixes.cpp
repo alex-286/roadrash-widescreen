@@ -1189,10 +1189,11 @@ static int __cdecl HookedShadowLoader()
  * rider's shadow frames (DATA\\BIKERS\\HISHADOW.DAT, LOSHADOW.DAT in low
  * resolution) into a table of 326 entries at 0x49BFE0: pixel pointer,
  * width byte, height byte. Every frame is drawn centred on its box. Frame
- * 176, the first frame of the punch, has two stray pixels in the top corner
- * of a 118x168 box (59x84 in low resolution), while the shadow itself is
- * the band of 13 (6) rows at the bottom, so the shadow jumps far away from
- * the bike. After loading, the entry points at a copy of the shadow alone.
+ * 176, the first frame of the punch, has a few stray pixels in the top
+ * corner of a 118x168 box (59x84 in low resolution), while the shadow
+ * itself is the band of 13 (6) rows at the bottom, so the shadow jumps far
+ * away from the bike. After loading, the entry points at a copy of the
+ * shadow alone.
  */
 static void FixPunchShadow()
 {
