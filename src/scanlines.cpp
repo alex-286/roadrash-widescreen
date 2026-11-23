@@ -1,5 +1,12 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
-// Copyright (C) 2026 Alexander Schmidt
+/**
+ * CRT-like scanlines for the filtered 32-bit frames, split across the
+ * worker pool, with MMX when the processor has it.
+ *
+ * @file scanlines.cpp
+ * @author Alexander Schmidt
+ * @copyright Copyright (C) 2026 Alexander Schmidt
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ */
 
 #include "scanlines.h"
 #include "cpu_features.h"
@@ -10,27 +17,42 @@
 // ScanlineTask clears the MMX state once with _mm_empty after all rows.
 #pragma warning(disable : 4799)
 
+/** The parameters of ScanlinesApply, shared by all parts. */
 struct ScanlineJob
 {
+    /** The first pixel of the X8R8G8B8 frame. */
     BYTE* pixels;
+    /** The bytes per row of the frame. */
     LONG pitch;
+    /** The width of the frame in pixels. */
     DWORD width;
+    /** The height of the frame in pixels. */
     DWORD height;
+    /** The number of lines of the frame before it was filtered. */
     DWORD sourceHeight;
+    /** The darkening in percent (1-100). */
     DWORD strength;
+    /** TRUE to darken two pixels at a time with MMX. */
     BOOL mmx;
 };
 
-// The brightness factor (0-256) of an output row. Its center lies at
-// fraction phase / period within its source line, where
-// phase = (2 * row + 1) * sourceHeight mod period and period = 2 * height.
-//
-// With a whole number of rows per source line, the rows in the last third
-// of each line are darkened by the full strength. Otherwise rows fall at
-// varying phases, which would leave some lines without a dark row; rows are
-// then darkened in proportion to their closeness to a line boundary (full
-// strength on it, none from a third of a line away), which spreads the
-// darkening evenly.
+/**
+ * Gives the brightness factor of an output row.
+ *
+ * Its center lies at fraction phase / period within its source line, where
+ * phase = (2 * row + 1) * sourceHeight mod period and period = 2 * height.
+ *
+ * With a whole number of rows per source line, the rows in the last third
+ * of each line are darkened by the full strength. Otherwise rows fall at
+ * varying phases, which would leave some lines without a dark row; rows are
+ * then darkened in proportion to their closeness to a line boundary (full
+ * strength on it, none from a third of a line away), which spreads the
+ * darkening evenly.
+ *
+ * @param [in] job The frame and the strength.
+ * @param [in] row The output row.
+ * @return The factor, 0-256; 256 leaves the row unchanged.
+ */
 static DWORD RowFactor(const ScanlineJob* job, DWORD row)
 {
     DWORD period = 2 * job->height;
@@ -55,6 +77,13 @@ static DWORD RowFactor(const ScanlineJob* job, DWORD row)
         static_cast<int>(period)));
 }
 
+/**
+ * Darkens the rows of one part of the frame (a WorkerTask).
+ *
+ * @param [in] part The part to darken, 0 to parts - 1.
+ * @param [in] parts The number of parts.
+ * @param [in] context The ScanlineJob.
+ */
 static void ScanlineTask(DWORD part, DWORD parts, void* context)
 {
     const ScanlineJob* job = reinterpret_cast<const ScanlineJob*>(context);

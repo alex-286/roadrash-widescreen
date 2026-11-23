@@ -1,5 +1,12 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
-// Copyright (C) 2026 Alexander Schmidt
+/**
+ * A small frame rate and label display in the top-left corner of the
+ * screen, drawn with built-in 5x7 glyphs.
+ *
+ * @file fps_overlay.cpp
+ * @author Alexander Schmidt
+ * @copyright Copyright (C) 2026 Alexander Schmidt
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ */
 
 #include "fps_overlay.h"
 
@@ -7,23 +14,33 @@
 
 #pragma intrinsic(__stosb, __stosd)
 
+/** The width of a glyph in pixels (before scaling). */
 static const DWORD kGlyphWidth = 5;
+/** The height of a glyph in pixels (before scaling). */
 static const DWORD kGlyphHeight = 7;
+/** The distance from one glyph to the next in pixels (before scaling). */
 static const DWORD kGlyphAdvance = kGlyphWidth + 1;
+/** The space between the text and the edge of its box (before scaling). */
 static const DWORD kBoxPadding = 2;
+/** The space between the box and the screen corner (before scaling). */
 static const DWORD kMargin = 4;
+/** The time between refreshes of the displayed rate in milliseconds. */
 static const DWORD kUpdateIntervalMs = 500;
+/** The longest rate text, such as "999 FPS". */
 static const DWORD kMaxTextLength = 8;
+/** The longest line drawn: the rate, two spaces and the label. */
 static const DWORD kMaxLineLength = 40;
 
+/** The 5x7 picture of one character. */
 struct Glyph
 {
+    /** The character, in upper case. */
     CHAR character;
+    /** One bit per pixel and row; bit 4 is the leftmost column. */
     BYTE rows[7];
 };
 
-// 5x7 glyphs; bit 4 is the leftmost column. Digits and the letters of "FPS"
-// and of the filter names.
+/** The glyphs: digits and the letters of "FPS" and of the filter names. */
 static const Glyph kGlyphs[] =
 {
     { 'A', { 0x0E, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11 } },
@@ -56,9 +73,13 @@ static const Glyph kGlyphs[] =
     { '-', { 0x00, 0x00, 0x00, 0x1F, 0x00, 0x00, 0x00 } },
 };
 
+/** The rate text, such as "60 FPS". */
 static CHAR g_text[kMaxTextLength + 1] = "-- FPS";
+/** The frames counted since g_intervalStart. */
 static DWORD g_frameCount = 0;
+/** The tick count at which the current interval began. */
 static DWORD g_intervalStart = 0;
+/** TRUE once the first frame was counted. */
 static BOOL g_started = FALSE;
 
 void FpsOverlayCountFrame()
@@ -112,6 +133,13 @@ void FpsOverlayCountFrame()
     g_intervalStart = now;
 }
 
+/**
+ * Finds the glyph of a character; lower case letters use the upper case
+ * glyph.
+ *
+ * @param [in] character The character.
+ * @return The kGlyphHeight rows of the glyph, or NULL when it has none.
+ */
 static const BYTE* FindGlyph(CHAR character)
 {
     DWORD index;
@@ -132,6 +160,18 @@ static const BYTE* FindGlyph(CHAR character)
     return NULL;
 }
 
+/**
+ * Fills a rectangle of a locked surface with one color.
+ *
+ * @param [in,out] pixels The first pixel of the surface.
+ * @param [in] pitch The bytes per row of the surface.
+ * @param [in] bytesPerPixel 1 (palette indices) or 4 (X8R8G8B8).
+ * @param [in] left The first column of the rectangle.
+ * @param [in] top The first row of the rectangle.
+ * @param [in] right The column after the rectangle.
+ * @param [in] bottom The row after the rectangle.
+ * @param [in] color The color, in the surface's format.
+ */
 static void FillPixels(
     BYTE* pixels,
     LONG pitch,

@@ -1,5 +1,12 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
-// Copyright (C) 2026 Alexander Schmidt
+/**
+ * Detection of the processor features the frame filters can use, with
+ * CPUID.
+ *
+ * @file cpu_features.cpp
+ * @author Alexander Schmidt
+ * @copyright Copyright (C) 2026 Alexander Schmidt
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ */
 
 #include "cpu_features.h"
 

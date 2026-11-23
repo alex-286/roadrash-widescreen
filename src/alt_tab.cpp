@@ -1,47 +1,77 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
-// Copyright (C) 2026 Alexander Schmidt
+/**
+ * Gives Alt+Tab and the other task switching keys back to Windows while
+ * the game runs.
+ *
+ * The Windows compatibility database (sysmain.sdb) applies the IgnoreAltTab
+ * fix to ROADRASH.EXE (matched by its name and IMAGES\\STREET.RRI and
+ * IMAGES\\SPLASH.RRI). The fix lives in the 32-bit AcGenral.dll. When the
+ * process has started, it creates a thread that installs a WH_KEYBOARD_LL
+ * hook and then only runs a GetMessage loop. The hook swallows Alt+Tab,
+ * Alt+Esc, Ctrl+Esc and the Windows and menu keys.
+ *
+ * Windows removes a low-level hook when the thread that installed it ends.
+ * WM_QUIT ends the loop of that thread, so its hook goes away with it. The
+ * thread is recognized by its start address inside AcGenral.dll and by its
+ * first instructions, which push WH_KEYBOARD_LL (6A 0D) and call
+ * SetWindowsHookEx through the import table (FF 15).
+ *
+ * The functions newer than Windows 95 are looked up at run time, so the DLL
+ * still loads on Windows 9x, where the fix does not exist.
+ *
+ * Windows NT and newer handle Alt+Tab before the game gets the keys, so the
+ * game's own block (see AllowAltTabWin9x) has no effect there.
+ *
+ * @file alt_tab.cpp
+ * @author Alexander Schmidt
+ * @copyright Copyright (C) 2026 Alexander Schmidt
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ */
 
 #include "alt_tab.h"
 #include "road_rash_patch.h"
 
 #include <tlhelp32.h>
 
-// The Windows compatibility database (sysmain.sdb) applies the IgnoreAltTab
-// fix to ROADRASH.EXE (matched by its name and IMAGES\STREET.RRI and
-// IMAGES\SPLASH.RRI). The fix lives in the 32-bit AcGenral.dll. When the
-// process has started, it creates a thread that installs a WH_KEYBOARD_LL
-// hook and then only runs a GetMessage loop. The hook swallows Alt+Tab,
-// Alt+Esc, Ctrl+Esc and the Windows and menu keys.
-//
-// Windows removes a low-level hook when the thread that installed it ends.
-// WM_QUIT ends the loop of that thread, so its hook goes away with it. The
-// thread is recognized by its start address inside AcGenral.dll and by its
-// first instructions, which push WH_KEYBOARD_LL (6A 0D) and call
-// SetWindowsHookEx through the import table (FF 15).
-//
-// The functions newer than Windows 95 are looked up at run time, so the DLL
-// still loads on Windows 9x, where the fix does not exist.
-//
-// Windows NT and newer handle Alt+Tab before the game gets the keys, so the
-// game's own block (see below) has no effect there.
-
+/**
+ * ThreadQuerySetWin32StartAddress, the information class of
+ * NtQueryInformationThread that gives a thread's start address.
+ */
 static const DWORD kThreadQuerySetWin32StartAddress = 9;
+/** The number of bytes at a thread's start searched for the hook call. */
 static const DWORD kStartCodeScanLength = 64;
+/** The number of tries to post WM_QUIT to the hook thread. */
 static const DWORD kPostAttempts = 20;
+/** The wait between two tries in milliseconds. */
 static const DWORD kPostRetryDelay = 50;
+/** The longest wait for the hook thread to end in milliseconds. */
 static const DWORD kThreadExitTimeout = 2000;
 
+/** CreateToolhelp32Snapshot, looked up at run time. */
 typedef HANDLE (WINAPI *CreateToolhelp32SnapshotFn)(DWORD, DWORD);
+/** Thread32First or Thread32Next, looked up at run time. */
 typedef BOOL (WINAPI *Thread32Fn)(HANDLE, LPTHREADENTRY32);
+/** OpenThread, looked up at run time (not in Windows 95). */
 typedef HANDLE (WINAPI *OpenThreadFn)(DWORD, BOOL, DWORD);
+/** NtQueryInformationThread from ntdll.dll, looked up at run time. */
 typedef LONG (WINAPI *NtQueryInformationThreadFn)(
     HANDLE, DWORD, PVOID, ULONG, PULONG);
 
+/**
+ * Writes a line to the log.
+ *
+ * @param [in] text The line, without line break.
+ */
 static void LogAltTab(const CHAR* text)
 {
     LogProxyMessage(text, NULL, 0);
 }
 
+/**
+ * Gives the size of a loaded module from its PE header.
+ *
+ * @param [in] module The module.
+ * @return SizeOfImage, or 0 when the header is not valid.
+ */
 static DWORD ModuleImageSize(HMODULE module)
 {
     const BYTE* base = reinterpret_cast<const BYTE*>(module);
@@ -63,8 +93,15 @@ static DWORD ModuleImageSize(HMODULE module)
     return nt->OptionalHeader.SizeOfImage;
 }
 
-// TRUE when the code at start installs a low-level keyboard hook first:
-// push 0Dh (WH_KEYBOARD_LL) directly followed by call dword ptr [import].
+/**
+ * Tells whether the code at a thread's start installs a low-level keyboard
+ * hook first: push 0Dh (WH_KEYBOARD_LL) directly followed by
+ * call dword ptr [import].
+ *
+ * @param [in] start The start of the thread.
+ * @param [in] moduleEnd The end of the module that holds start.
+ * @return TRUE when the code was found.
+ */
 static BOOL InstallsKeyboardHook(const BYTE* start, const BYTE* moduleEnd)
 {
     DWORD index;
@@ -86,6 +123,16 @@ static BOOL InstallsKeyboardHook(const BYTE* start, const BYTE* moduleEnd)
     return FALSE;
 }
 
+/**
+ * Ends the thread of the IgnoreAltTab fix with WM_QUIT.
+ *
+ * Posting fails while the thread has no message queue yet, so it is tried
+ * kPostAttempts times.
+ *
+ * @param [in] thread The thread, opened with SYNCHRONIZE.
+ * @param [in] threadId The id of the thread.
+ * @return TRUE when the thread has ended.
+ */
 static BOOL EndHookThread(HANDLE thread, DWORD threadId)
 {
     DWORD attempt;
@@ -105,31 +152,20 @@ static BOOL EndHookThread(HANDLE thread, DWORD threadId)
     return FALSE;
 }
 
-// Windows 95/98/ME have no such fix: there the game blocks the keys itself.
-// On Windows 9x, DefWindowProc starts the switch when it gets Alt+Tab or
-// Alt+Esc and then sends the main window a WM_SYSCOMMAND. ROADRASH.EXE 1.0A
-// keeps both from it in three places:
-// - Its main window (class RashRoot, procedure 0x4232A0, handle at
-//   0x4753DC) installs a WH_KEYBOARD hook (0x423260, handle at 0x49612C)
-//   in WM_CREATE that discards Tab while Alt is held.
-// - During a race the main window answers every WM_SYSKEYDOWN itself. In
-//   the menus the focus is on the buttons (class RashButton, 0x4227D0),
-//   which answer every WM_KEYDOWN and WM_SYSKEYDOWN.
-// - In the menus the main window swallows every WM_SYSCOMMAND except
-//   SC_RESTORE.
-// The patch removes the hook. A message hook moves the switching keys of
-// every window of the game to the main window, and a subclass of the main
-// window gives these keys and the switching commands to DefWindowProc. The
-// game itself restores its surfaces when it gets the focus back
-// (0x41DF60).
+/** The game's WH_KEYBOARD hook procedure (0x423260). */
 static const DWORD kGameKeyboardHookRva = 0x00023260;
+/** The game's handle of that hook (0x49612C). */
 static const DWORD kGameKeyboardHookHandleRva = 0x0009612C;
+/** The handle of the game's main window (0x4753DC). */
 static const DWORD kGameWindowRva = 0x000753DC;
+/** The window procedure of the main window, class RashRoot (0x4232A0). */
 static const DWORD kGameWindowProcRva = 0x000232A0;
+/** The context code bit of a key message: Alt is held. */
 static const DWORD kKeyAltDown = 0x20000000;
+/** The largest number of switching keys and commands written to the log. */
 static const DWORD kMaxSwitchLogs = 8;
 
-// The start of the game's hook up to its test for Tab with Alt held.
+/** The start of the game's hook up to its test for Tab with Alt held. */
 static const BYTE kGameKeyboardHookCode[] =
 {
     0x8B, 0x44, 0x24, 0x04, 0x53, 0x8B, 0x4C, 0x24, 0x0C, 0x85, 0xC0, 0x7C,
@@ -137,12 +173,24 @@ static const BYTE kGameKeyboardHookCode[] =
     0x00, 0x00, 0x00, 0x20
 };
 
+/** The game's main window, on Windows 9x. */
 static HWND g_gameWindow = NULL;
+/** The game's window procedure that SwitchWindowProc passes on to. */
 static WNDPROC g_gameWindowProc = NULL;
+/** The WH_GETMESSAGE hook of SwitchMessageHook. */
 static HHOOK g_messageHook = NULL;
+/** The number of switching keys and commands written to the log. */
 static DWORD g_switchLogCount = 0;
 
-// Alt+Tab, Alt+Shift+Tab, Alt+Esc and the Windows keys.
+/**
+ * Tells whether a key message is Alt+Tab, Alt+Shift+Tab, Alt+Esc or a
+ * Windows key.
+ *
+ * @param [in] message The message.
+ * @param [in] key The virtual key (wParam).
+ * @param [in] data The key data (lParam).
+ * @return TRUE for a switching key.
+ */
 static BOOL IsSwitchKey(UINT message, WPARAM key, LPARAM data)
 {
     if (message == WM_SYSKEYDOWN || message == WM_SYSKEYUP)
@@ -159,6 +207,13 @@ static BOOL IsSwitchKey(UINT message, WPARAM key, LPARAM data)
     return FALSE;
 }
 
+/**
+ * Tells whether a message is a WM_SYSCOMMAND that switches windows.
+ *
+ * @param [in] message The message.
+ * @param [in] command The command (wParam).
+ * @return TRUE for SC_NEXTWINDOW, SC_PREVWINDOW and SC_TASKLIST.
+ */
 static BOOL IsSwitchCommand(UINT message, WPARAM command)
 {
     if (message != WM_SYSCOMMAND)
@@ -171,6 +226,11 @@ static BOOL IsSwitchCommand(UINT message, WPARAM command)
         command == SC_TASKLIST;
 }
 
+/**
+ * Writes a line to the log, up to kMaxSwitchLogs times.
+ *
+ * @param [in] text The line, without line break.
+ */
 static void LogSwitch(const CHAR* text)
 {
     if (g_switchLogCount < kMaxSwitchLogs)
@@ -180,6 +240,15 @@ static void LogSwitch(const CHAR* text)
     }
 }
 
+/**
+ * WH_GETMESSAGE hook: moves the switching keys of every window of the game
+ * to the main window.
+ *
+ * @param [in] code The hook code.
+ * @param [in] removal PM_REMOVE when the message is taken from the queue.
+ * @param [in,out] data The MSG.
+ * @return The result of the next hook.
+ */
 static LRESULT CALLBACK SwitchMessageHook(int code, WPARAM removal, LPARAM data)
 {
     if (code == HC_ACTION && removal == PM_REMOVE)
@@ -196,6 +265,16 @@ static LRESULT CALLBACK SwitchMessageHook(int code, WPARAM removal, LPARAM data)
     return CallNextHookEx(g_messageHook, code, removal, data);
 }
 
+/**
+ * Subclass of the main window: gives the switching keys and commands to
+ * DefWindowProc and everything else to the game.
+ *
+ * @param [in] window The main window.
+ * @param [in] message The message.
+ * @param [in] wParam The first message parameter.
+ * @param [in] lParam The second message parameter.
+ * @return The result of DefWindowProc or of the game's procedure.
+ */
 static LRESULT CALLBACK SwitchWindowProc(
     HWND window,
     UINT message,
@@ -228,6 +307,29 @@ static LRESULT CALLBACK SwitchWindowProc(
     return CallWindowProcA(g_gameWindowProc, window, message, wParam, lParam);
 }
 
+/**
+ * Removes the game's own Alt+Tab block on Windows 95/98/ME.
+ *
+ * These have no IgnoreAltTab fix: there the game blocks the keys itself.
+ * On Windows 9x, DefWindowProc starts the switch when it gets Alt+Tab or
+ * Alt+Esc and then sends the main window a WM_SYSCOMMAND. ROADRASH.EXE 1.0A
+ * keeps both from it in three places:
+ * - Its main window (class RashRoot, procedure 0x4232A0, handle at
+ *   0x4753DC) installs a WH_KEYBOARD hook (0x423260, handle at 0x49612C)
+ *   in WM_CREATE that discards Tab while Alt is held.
+ * - During a race the main window answers every WM_SYSKEYDOWN itself. In
+ *   the menus the focus is on the buttons (class RashButton, 0x4227D0),
+ *   which answer every WM_KEYDOWN and WM_SYSKEYDOWN.
+ * - In the menus the main window swallows every WM_SYSCOMMAND except
+ *   SC_RESTORE.
+ *
+ * This removes the hook. A message hook moves the switching keys of every
+ * window of the game to the main window, and a subclass of the main window
+ * gives these keys and the switching commands to DefWindowProc. The game
+ * itself restores its surfaces when it gets the focus back (0x41DF60).
+ *
+ * @param [in] gameBase Module base of ROADRASH.EXE 1.0A.
+ */
 static void AllowAltTabWin9x(DWORD gameBase)
 {
     const BYTE* hookCode =

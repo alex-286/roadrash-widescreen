@@ -1,5 +1,47 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
-// Copyright (C) 2026 Alexander Schmidt
+/**
+ * Menus in the native display mode.
+ *
+ * The menus are a Windows interface drawn with DirectDraw: FUN_004485D0
+ * sets 640x480x16, creates the primary surface (stored at 0x475404) and
+ * 640x480 offscreen surfaces. The main window RashRoot (0x4753DC, a topmost
+ * popup at 0,0, 640x480, with a null background brush, so it never paints
+ * itself) holds the menu buttons as invisible child windows (RashButton,
+ * RashInfo, placed with MoveWindow), so Windows itself finds the button
+ * under the mouse. Everything visible is drawn by copying rectangles of the
+ * offscreen picture to the same place on the primary (BltFast,
+ * FUN_0041FC10), with the rectangles taken from the update region of
+ * RashRoot or from GetWindowRect: the game assumes a 640x480 screen.
+ * Dialogs, the save dialog (centred by MoveWindow) and the video window
+ * ("AVI Window", 0,0, 640x480, played into by MCI) are top-level windows
+ * placed in screen coordinates.
+ *
+ * In the native display mode the menu is enlarged to the screen height
+ * (2.25x at 1920x1080, 3x at 2560x1440; the scale is a fraction, and
+ * screen pixels are mapped back to the game pixel they show) and centred.
+ * RashRoot covers the whole screen, as in the original: on Windows 8 and
+ * newer, what the game copies into the primary surface is shown only where
+ * its window is. Then:
+ * - its copies into the primary (Blt, BltFast) are enlarged and moved, and
+ *   a Lock of the primary (screenshots) sees a 640x480 copy of the menu;
+ * - the child windows of RashRoot and the video window are enlarged and
+ *   moved, both when the menus start and whenever the game places them
+ *   (MoveWindow, and a CBT hook for new windows); the video window then
+ *   becomes the largest whole multiple of the video's own size (MCI_PUT),
+ *   centred on black (or the Matte picture). Dialogs keep their size and
+ *   are centred where they would be in the enlarged menu;
+ * - positions the game reads come back in its 640x480 coordinates:
+ *   GetWindowRect, GetCursorPos, and the paint rectangle and update region
+ *   of RashRoot (as their bounding box); rectangles it invalidates in
+ *   RashRoot go the other way.
+ *
+ * The rest of the screen is cleared to black once per primary surface and
+ * then shows the menu picture blurred and darkened (see DrawBackground).
+ *
+ * @file native_menus.cpp
+ * @author Alexander Schmidt
+ * @copyright Copyright (C) 2026 Alexander Schmidt
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ */
 
 #include "native_menus.h"
 #include "road_rash_patch.h"
@@ -9,184 +51,288 @@
 
 #pragma intrinsic(__stosb)
 
-// The menus are a Windows interface drawn with DirectDraw: FUN_004485D0
-// sets 640x480x16, creates the primary surface (stored at 0x475404) and
-// 640x480 offscreen surfaces. The main window RashRoot (0x4753DC, a topmost
-// popup at 0,0, 640x480, with a null background brush, so it never paints
-// itself) holds the menu buttons as invisible child windows (RashButton,
-// RashInfo, placed with MoveWindow), so Windows itself finds the button
-// under the mouse. Everything visible is drawn by copying rectangles of the
-// offscreen picture to the same place on the primary (BltFast,
-// FUN_0041FC10), with the rectangles taken from the update region of
-// RashRoot or from GetWindowRect: the game assumes a 640x480 screen.
-// Dialogs, the save dialog (centred by MoveWindow) and the video window
-// ("AVI Window", 0,0, 640x480, played into by MCI) are top-level windows
-// placed in screen coordinates.
-//
-// In the native display mode the menu is enlarged to the screen height
-// (2.25x at 1920x1080, 3x at 2560x1440; the scale is a fraction, and
-// screen pixels are mapped back to the game pixel they show) and centred.
-// RashRoot covers the whole
-// screen, as in the original: on
-// Windows 8 and newer, what the game copies into the primary surface is
-// shown only where its window is. Then:
-// - its copies into the primary (Blt, BltFast) are enlarged and moved, and
-//   a Lock of the primary (screenshots) sees a 640x480 copy of the menu;
-// - the child windows of RashRoot and the video window are enlarged and
-//   moved, both when the menus start and whenever the game places them
-//   (MoveWindow, and a CBT hook for new windows); the video window then
-//   becomes the largest whole multiple of the video's own size (MCI_PUT),
-//   centred on black (or the Matte picture). Dialogs keep their size and
-//   are centred where they would be in the enlarged menu;
-// - positions the game reads come back in its 640x480 coordinates:
-//   GetWindowRect, GetCursorPos, and the paint rectangle and update region
-//   of RashRoot (as their bounding box); rectangles it invalidates in
-//   RashRoot go the other way.
-// The rest of the screen is cleared to black once per primary surface and
-// then shows the menu picture blurred and darkened (see DrawBackground).
-
+/**
+ * The preferred load address of ROADRASH.EXE, which its absolute addresses
+ * assume.
+ */
 static const DWORD kImageBase = 0x00400000;
+/** The handle of the main window RashRoot (0x4753DC). */
 static const DWORD kRootWindowVa = 0x004753DC;
+/** The menu's primary surface (0x475404). */
 static const DWORD kMenuPrimaryVa = 0x00475404;
+/** The handle of the video window (0x47E9B8). */
 static const DWORD kVideoWindowVa = 0x0047E9B8;
+/** The surface of the Matte picture behind small videos (0x4753F8). */
 static const DWORD kMattePictureVa = 0x004753F8;
-// The video's own size, which FUN_00402650 reads with MCI_WHERE.
+/** The video's own width, which FUN_00402650 reads with MCI_WHERE. */
 static const DWORD kVideoWidthVa = 0x0047E9D4;
+/** The video's own height, which FUN_00402650 reads with MCI_WHERE. */
 static const DWORD kVideoHeightVa = 0x0047E9D8;
 
+/** The game's import slot of GetWindowRect. */
 static const DWORD kGetWindowRectIatVa = 0x004CA8C4;
+/** The game's import slot of GetCursorPos. */
 static const DWORD kGetCursorPosIatVa = 0x004CA858;
+/** The game's import slot of MoveWindow. */
 static const DWORD kMoveWindowIatVa = 0x004CA834;
+/** The game's import slot of InvalidateRect. */
 static const DWORD kInvalidateRectIatVa = 0x004CA8CC;
+/** The game's import slot of BeginPaint. */
 static const DWORD kBeginPaintIatVa = 0x004CA840;
+/** The game's import slot of GetUpdateRgn. */
 static const DWORD kGetUpdateRgnIatVa = 0x004CA844;
+/** The game's import slot of mciSendCommandA. */
 static const DWORD kMciSendCommandIatVa = 0x004CA920;
 
+/** The width of the game's menu. */
 static const LONG kMenuWidth = 640;
+/** The height of the game's menu. */
 static const LONG kMenuHeight = 480;
+/** The window class of the video window. */
 static const CHAR kVideoWindowClass[] = "AVI Window";
 
-// IDirectDrawSurface vtable slots, DDSURFACEDESC and DDBLTFX fields, flags.
+/** The vtable slot of IDirectDrawSurface::Blt. */
 static const DWORD kSurfaceBltIndex = 5;
+/** The vtable slot of IDirectDrawSurface::BltFast. */
 static const DWORD kSurfaceBltFastIndex = 7;
+/** The vtable slot of IDirectDrawSurface::GetSurfaceDesc. */
 static const DWORD kSurfaceGetSurfaceDescIndex = 22;
+/** The vtable slot of IDirectDrawSurface::Lock. */
 static const DWORD kSurfaceLockIndex = 25;
+/** The vtable slot of IDirectDrawSurface::Unlock. */
 static const DWORD kSurfaceUnlockIndex = 32;
+/** The size of DDSURFACEDESC in bytes. */
 static const DWORD kDescriptionSize = 0x6C;
+/** The offset of dwHeight in DDSURFACEDESC. */
 static const DWORD kDescriptionHeight = 0x08;
+/** The offset of dwWidth in DDSURFACEDESC. */
 static const DWORD kDescriptionWidth = 0x0C;
+/** The offset of lPitch in DDSURFACEDESC. */
 static const DWORD kDescriptionPitch = 0x10;
+/** The offset of lpSurface in DDSURFACEDESC. */
 static const DWORD kDescriptionSurface = 0x24;
+/** The offset of the RGB bit count in DDSURFACEDESC. */
 static const DWORD kDescriptionBitCount = 0x54;
+/** The size of DDBLTFX in bytes. */
 static const DWORD kBltFxSize = 100;
+/** The offset of dwFillColor in DDBLTFX. */
 static const DWORD kBltFxFillColor = 0x50;
+/** DDBLT_COLORFILL. */
 static const DWORD kBltColorFill = 0x00000400;
+/** DDBLT_KEYDEST. */
 static const DWORD kBltKeyDest = 0x00002000;
+/** DDBLT_KEYSRC. */
 static const DWORD kBltKeySource = 0x00008000;
+/** DDBLT_WAIT. */
 static const DWORD kBltWait = 0x01000000;
+/** DDBLTFAST_SRCCOLORKEY. */
 static const DWORD kBltFastSourceKey = 0x00000001;
+/** DDBLTFAST_DESTCOLORKEY. */
 static const DWORD kBltFastDestKey = 0x00000002;
+/** DDBLTFAST_WAIT. */
 static const DWORD kBltFastWait = 0x00000010;
 
-// MCI_PUT with MCI_DGV_PUT_DESTINATION | MCI_DGV_RECT: the video's place in
-// its window, as x, y, width, height after the callback dword.
+/** MCI_PUT. */
 static const UINT kMciPut = 0x0842;
+/** MCI_DGV_PUT_DESTINATION. */
 static const DWORD kMciPutDestination = 0x00040000;
+/**
+ * MCI_DGV_RECT: the video's place in its window follows as x, y, width,
+ * height after the callback DWORD.
+ */
 static const DWORD kMciRect = 0x00010000;
+/** The size of the MCI_PUT parameters in bytes. */
 static const DWORD kMciPutParamsSize = 20;
 
+/** GetWindowRect. */
 typedef BOOL (WINAPI *GetWindowRectFn)(HWND, LPRECT);
+/** GetCursorPos. */
 typedef BOOL (WINAPI *GetCursorPosFn)(LPPOINT);
+/** MoveWindow. */
 typedef BOOL (WINAPI *MoveWindowFn)(HWND, int, int, int, int, BOOL);
+/** InvalidateRect. */
 typedef BOOL (WINAPI *InvalidateRectFn)(HWND, const RECT*, BOOL);
+/** BeginPaint. */
 typedef HDC (WINAPI *BeginPaintFn)(HWND, LPPAINTSTRUCT);
+/** GetUpdateRgn. */
 typedef int (WINAPI *GetUpdateRgnFn)(HWND, HRGN, BOOL);
+/** mciSendCommandA. */
 typedef DWORD (WINAPI *MciSendCommandFn)(UINT, UINT, DWORD, DWORD);
+/** IDirectDrawSurface::Blt. */
 typedef HRESULT (WINAPI *SurfaceBltFn)(
     LPVOID, LPRECT, LPVOID, LPRECT, DWORD, LPVOID);
+/** IDirectDrawSurface::BltFast. */
 typedef HRESULT (WINAPI *SurfaceBltFastFn)(
     LPVOID, DWORD, DWORD, LPVOID, LPRECT, DWORD);
+/** IDirectDrawSurface::GetSurfaceDesc. */
 typedef HRESULT (WINAPI *SurfaceGetSurfaceDescFn)(LPVOID, LPVOID);
+/** IDirectDrawSurface::Lock. */
 typedef HRESULT (WINAPI *SurfaceLockFn)(
     LPVOID, LPRECT, LPVOID, DWORD, HANDLE);
+/** IDirectDrawSurface::Unlock. */
 typedef HRESULT (WINAPI *SurfaceUnlockFn)(LPVOID, LPVOID);
 
+/** Module base of ROADRASH.EXE; 0 before NativeMenusInstall. */
 static DWORD g_menusBase = 0;
+/** TRUE while the native menus are shown. */
 static BOOL g_menusActive = FALSE;
-// Menu scale = g_scaleNumerator / g_scaleDenominator.
+/** The numerator of the menu scale. */
 static LONG g_scaleNumerator = 1;
+/** The denominator of the menu scale. */
 static LONG g_scaleDenominator = 1;
+/** The screen column of the menu's left edge. */
 static LONG g_offsetX = 0;
+/** The screen row of the menu's top edge. */
 static LONG g_offsetY = 0;
+/** The width of the display mode. */
 static LONG g_screenWidth = 0;
+/** The height of the display mode. */
 static LONG g_screenHeight = 0;
+/** The primary surface that was last cleared to black. */
 static LPVOID g_clearedPrimary = NULL;
+/** The WH_CBT hook of MenuCbtHook. */
 static HHOOK g_cbtHook = NULL;
+/** The WH_KEYBOARD hook of MenuKeyboardHook. */
 static HHOOK g_keyboardHook = NULL;
+/** The 640x480 copy of the menu a Lock of the primary sees. */
 static BYTE* g_lockCopy = NULL;
+/** TRUE while a Lock of the primary sees g_lockCopy. */
 static BOOL g_lockCopyActive = FALSE;
 
+/** The function the GetWindowRect import slot held. */
 static GetWindowRectFn g_originalGetWindowRect = NULL;
+/** The function the GetCursorPos import slot held. */
 static GetCursorPosFn g_originalGetCursorPos = NULL;
+/** The function the MoveWindow import slot held. */
 static MoveWindowFn g_originalMoveWindow = NULL;
+/** The function the InvalidateRect import slot held. */
 static InvalidateRectFn g_originalInvalidateRect = NULL;
+/** The function the BeginPaint import slot held. */
 static BeginPaintFn g_originalBeginPaint = NULL;
+/** The function the GetUpdateRgn import slot held. */
 static GetUpdateRgnFn g_originalGetUpdateRgn = NULL;
+/** The function the mciSendCommandA import slot held. */
 static MciSendCommandFn g_originalMciSendCommand = NULL;
 
+/** The surface's Blt before the hook. */
 static SurfaceBltFn g_originalBlt = NULL;
+/** The surface's BltFast before the hook. */
 static SurfaceBltFastFn g_originalBltFast = NULL;
+/** The surface's Lock before the hook. */
 static SurfaceLockFn g_originalLock = NULL;
+/** The surface's Unlock before the hook. */
 static SurfaceUnlockFn g_originalUnlock = NULL;
 
 static BOOL GetSurfaceSize(LPVOID surface, LONG* width, LONG* height);
 static void InvalidateBackground();
 static void ReassertImportHooks();
 
+/**
+ * Writes a line to the log.
+ *
+ * @param [in] text The line, without line break.
+ */
 static void LogMenus(const CHAR* text)
 {
     LogProxyMessage(text, NULL, 0);
 }
 
+/**
+ * Converts an address of the game's image to the loaded module.
+ *
+ * @param [in] va The address for the preferred image base.
+ * @return The address in the loaded module.
+ */
 static DWORD GameVa(DWORD va)
 {
     return g_menusBase - kImageBase + va;
 }
 
+/**
+ * Gives the main window RashRoot.
+ *
+ * @return The window, or NULL before the game created it.
+ */
 static HWND RootWindow()
 {
     return *reinterpret_cast<HWND*>(GameVa(kRootWindowVa));
 }
 
+/**
+ * Divides, rounding toward minus infinity.
+ *
+ * @param [in] value The dividend.
+ * @param [in] divisor The divisor, above 0.
+ * @return The quotient.
+ */
 static LONG FloorDivide(LONG value, LONG divisor)
 {
     return value >= 0 ? value / divisor : -((-value + divisor - 1) / divisor);
 }
 
+/**
+ * Divides, rounding toward plus infinity.
+ *
+ * @param [in] value The dividend.
+ * @param [in] divisor The divisor, above 0.
+ * @return The quotient.
+ */
 static LONG CeilDivide(LONG value, LONG divisor)
 {
     return -FloorDivide(-value, divisor);
 }
 
-// Game coordinates (640x480) and screen coordinates. A length is the
-// difference of its two ends, so neighbouring rectangles stay seamless
-// when the scale is not a whole number.
+/**
+ * Converts a game coordinate (640x480) to screen pixels, without the
+ * offset.
+ *
+ * A length is the difference of its two ends, so neighbouring rectangles
+ * stay seamless when the scale is not a whole number.
+ *
+ * @param [in] value The game coordinate.
+ * @return The scaled coordinate.
+ */
 static LONG Scaled(LONG value)
 {
     return FloorDivide(value * g_scaleNumerator, g_scaleDenominator);
 }
 
+/**
+ * Converts a game column to a screen column.
+ *
+ * @param [in] x The game column.
+ * @return The screen column.
+ */
 static LONG ScreenX(LONG x) { return g_offsetX + Scaled(x); }
+/**
+ * Converts a game row to a screen row.
+ *
+ * @param [in] y The game row.
+ * @return The screen row.
+ */
 static LONG ScreenY(LONG y) { return g_offsetY + Scaled(y); }
 
-// The game pixel that a screen pixel belongs to (the inverse of ScreenX
-// and ScreenY, also for scales that are not whole numbers).
+/**
+ * Gives the game pixel a screen pixel belongs to.
+ *
+ * The inverse of ScreenX and ScreenY, also for scales that are not whole
+ * numbers.
+ *
+ * @param [in] screen The screen column or row.
+ * @param [in] offset g_offsetX or g_offsetY.
+ * @return The game column or row.
+ */
 static LONG GamePixel(LONG screen, LONG offset)
 {
     return CeilDivide(
         (screen - offset + 1) * g_scaleDenominator, g_scaleNumerator) - 1;
 }
 
+/**
+ * Converts a rectangle from game to screen coordinates.
+ *
+ * @param [in,out] rect The rectangle.
+ */
 static void RectToScreen(RECT* rect)
 {
     rect->left = ScreenX(rect->left);
@@ -195,6 +341,12 @@ static void RectToScreen(RECT* rect)
     rect->bottom = ScreenY(rect->bottom);
 }
 
+/**
+ * Converts a rectangle from screen to game coordinates: every game pixel
+ * it touches; exact for rectangles made by RectToScreen.
+ *
+ * @param [in,out] rect The rectangle.
+ */
 static void RectFromScreen(RECT* rect)
 {
     // Every game pixel the rectangle touches; exact for rectangles made by
@@ -205,11 +357,23 @@ static void RectFromScreen(RECT* rect)
     rect->bottom = GamePixel(rect->bottom - 1, g_offsetY) + 1;
 }
 
+/**
+ * Tells whether a window is a child window.
+ *
+ * @param [in] window The window.
+ * @return TRUE when it has WS_CHILD.
+ */
 static BOOL IsChildWindow(HWND window)
 {
     return (GetWindowLongA(window, GWL_STYLE) & WS_CHILD) != 0;
 }
 
+/**
+ * Gives the top-level window a window belongs to.
+ *
+ * @param [in] window The window, or NULL.
+ * @return The top-level window, or NULL.
+ */
 static HWND TopLevelOf(HWND window)
 {
     while (window != NULL && IsChildWindow(window))
@@ -220,12 +384,24 @@ static HWND TopLevelOf(HWND window)
     return window;
 }
 
+/**
+ * Tells whether a class name is the video window's.
+ *
+ * @param [in] name The class name, an atom, or NULL.
+ * @return TRUE for kVideoWindowClass.
+ */
 static BOOL IsVideoClass(LPCSTR name)
 {
     return name != NULL && HIWORD(reinterpret_cast<DWORD>(name)) != 0 &&
         lstrcmpiA(name, kVideoWindowClass) == 0;
 }
 
+/**
+ * Tells whether a window is the video window.
+ *
+ * @param [in] window The window, or NULL.
+ * @return TRUE for a window of kVideoWindowClass.
+ */
 static BOOL IsVideoWindow(HWND window)
 {
     CHAR name[32];
@@ -235,26 +411,54 @@ static BOOL IsVideoWindow(HWND window)
         IsVideoClass(name);
 }
 
-// RashRoot's children and the video window are enlarged with the menu;
-// other top-level windows (dialogs) keep their size and are centred where
-// they would be in the enlarged menu.
+/**
+ * Tells whether a top-level window is enlarged with the menu.
+ *
+ * RashRoot's children and the video window are enlarged with the menu;
+ * other top-level windows (dialogs) keep their size and are centred where
+ * they would be in the enlarged menu.
+ *
+ * @param [in] top The top-level window, or NULL.
+ * @return TRUE for RashRoot and the video window.
+ */
 static BOOL IsScaledTopLevel(HWND top)
 {
     return top != NULL && (top == RootWindow() || IsVideoWindow(top));
 }
 
+/**
+ * Places a window of unchanged size centred where it would be in the
+ * enlarged menu.
+ *
+ * @param [in] position The game coordinate of its left or top edge.
+ * @param [in] size Its width or height.
+ * @param [in] offset g_offsetX or g_offsetY.
+ * @return The screen coordinate of its edge.
+ */
 static LONG CentredScreen(LONG position, LONG size, LONG offset)
 {
     return offset + Scaled(position + size / 2) - size / 2;
 }
 
+/**
+ * The inverse of CentredScreen.
+ *
+ * @param [in] position The screen coordinate of the window's edge.
+ * @param [in] size Its width or height.
+ * @param [in] offset g_offsetX or g_offsetY.
+ * @return The game coordinate of its edge.
+ */
 static LONG CentredGame(LONG position, LONG size, LONG offset)
 {
     return GamePixel(position + size / 2, offset) - size / 2;
 }
 
-// Clears the whole screen surface once, so the area around the menu is
-// black (RashRoot paints nothing there).
+/**
+ * Clears the whole screen surface once, so the area around the menu is
+ * black (RashRoot paints nothing there).
+ *
+ * @param [in] surface The menu's primary surface.
+ */
 static void ClearPrimaryOnce(LPVOID surface)
 {
     BYTE effects[kBltFxSize];
@@ -273,6 +477,13 @@ static void ClearPrimaryOnce(LPVOID surface)
         surface, NULL, NULL, NULL, kBltColorFill | kBltWait, effects);
 }
 
+/**
+ * Tells whether a surface is the menu's primary while the native menus
+ * are shown, and clears it the first time.
+ *
+ * @param [in] surface The surface, or NULL.
+ * @return TRUE for the menu's primary.
+ */
 static BOOL IsMenuPrimary(LPVOID surface)
 {
     if (!g_menusActive || surface == NULL ||
@@ -285,6 +496,13 @@ static BOOL IsMenuPrimary(LPVOID surface)
     return TRUE;
 }
 
+/**
+ * Replaces the game's GetWindowRect: gives rectangles in game coordinates.
+ *
+ * @param [in] window The window.
+ * @param [out] rect Receives the rectangle.
+ * @return The result of GetWindowRect.
+ */
 static BOOL WINAPI HookedGetWindowRect(HWND window, LPRECT rect)
 {
     BOOL result;
@@ -327,6 +545,13 @@ static BOOL WINAPI HookedGetWindowRect(HWND window, LPRECT rect)
     return result;
 }
 
+/**
+ * Replaces the game's GetCursorPos: gives the position in game
+ * coordinates.
+ *
+ * @param [out] point Receives the position.
+ * @return The result of GetCursorPos.
+ */
 static BOOL WINAPI HookedGetCursorPos(LPPOINT point)
 {
     BOOL result = g_originalGetCursorPos(point);
@@ -340,6 +565,18 @@ static BOOL WINAPI HookedGetCursorPos(LPPOINT point)
     return result;
 }
 
+/**
+ * Replaces the game's MoveWindow: enlarges RashRoot's children and the
+ * video window, and centres dialogs.
+ *
+ * @param [in] window The window.
+ * @param [in] x The game column of its left edge.
+ * @param [in] y The game row of its top edge.
+ * @param [in] width Its width.
+ * @param [in] height Its height.
+ * @param [in] repaint Passed on to Windows.
+ * @return The result of MoveWindow.
+ */
 static BOOL WINAPI HookedMoveWindow(
     HWND window,
     int x,
@@ -381,6 +618,15 @@ static BOOL WINAPI HookedMoveWindow(
     }
 }
 
+/**
+ * Replaces the game's InvalidateRect: converts rectangles in RashRoot to
+ * screen coordinates.
+ *
+ * @param [in] window The window.
+ * @param [in] rect The rectangle, or NULL for the whole window.
+ * @param [in] erase Passed on to Windows.
+ * @return The result of InvalidateRect.
+ */
 static BOOL WINAPI HookedInvalidateRect(HWND window, const RECT* rect, BOOL erase)
 {
     RECT shifted;
@@ -396,6 +642,11 @@ static BOOL WINAPI HookedInvalidateRect(HWND window, const RECT* rect, BOOL eras
     return g_originalInvalidateRect(window, rect, erase);
 }
 
+/**
+ * Clips a rectangle to the 640x480 menu.
+ *
+ * @param [in,out] rect The rectangle; empty when it lies outside.
+ */
 static void ClipToMenu(RECT* rect)
 {
     RECT menu;
@@ -412,6 +663,14 @@ static void ClipToMenu(RECT* rect)
     }
 }
 
+/**
+ * Replaces the game's BeginPaint: gives RashRoot's paint rectangle in game
+ * coordinates.
+ *
+ * @param [in] window The window.
+ * @param [out] paint Receives the paint information.
+ * @return The result of BeginPaint.
+ */
 static HDC WINAPI HookedBeginPaint(HWND window, LPPAINTSTRUCT paint)
 {
     HDC result = g_originalBeginPaint(window, paint);
@@ -426,8 +685,16 @@ static HDC WINAPI HookedBeginPaint(HWND window, LPPAINTSTRUCT paint)
     return result;
 }
 
-// The update region becomes its bounding box in game coordinates, so the
-// game copies that rectangle (as it does for a simple region).
+/**
+ * Replaces the game's GetUpdateRgn: RashRoot's update region becomes its
+ * bounding box in game coordinates, so the game copies that rectangle (as
+ * it does for a simple region).
+ *
+ * @param [in] window The window.
+ * @param [in,out] region Receives the region.
+ * @param [in] erase Passed on to Windows.
+ * @return The region type.
+ */
 static int WINAPI HookedGetUpdateRgn(HWND window, HRGN region, BOOL erase)
 {
     int result = g_originalGetUpdateRgn(window, region, erase);
@@ -456,12 +723,17 @@ static int WINAPI HookedGetUpdateRgn(HWND window, HRGN region, BOOL erase)
     return SIMPLEREGION;
 }
 
-// Before a video, the game fills its offscreen picture black (a full-size
-// video) or loads the Matte picture into the surface at 0x4753F8 (a small
-// one, at x = 160), but leaves the screen as it is, so the last menu
-// showed around the video. The screen is now cleared to black (also the
-// menu background around it), with the Matte picture in the menu area for
-// a small video.
+/**
+ * Clears the screen before a video.
+ *
+ * The game fills its offscreen picture black (a full-size video) or loads
+ * the Matte picture into the surface at 0x4753F8 (a small one, at x = 160),
+ * but leaves the screen as it is, so the last menu showed around the video.
+ * The screen is now cleared to black (also the menu background around it),
+ * with the Matte picture in the menu area for a small video.
+ *
+ * @param [in] matte TRUE to draw the Matte picture.
+ */
 static void PaintVideoBackground(BOOL matte)
 {
     LPVOID primary = *reinterpret_cast<LPVOID*>(GameVa(kMenuPrimaryVa));
@@ -488,38 +760,58 @@ static void PaintVideoBackground(BOOL matte)
     }
 }
 
-// The menu background: the area around the enlarged menu shows the
-// current menu picture, enlarged to cover the screen, heavily blurred and
-// darkened. Whenever the game copies a whole new menu screen (640x480) to
-// the screen, its picture is averaged into a grid of kGridColumns x
-// kGridRows colours, which is then stretched smoothly (bilinear, in
-// integers) over the area around the menu. Smaller copies (a button lit
-// up) leave it as it is.
+/** The columns of the background grid. */
 static const LONG kGridColumns = 32;
+/** The rows of the background grid. */
 static const LONG kGridRows = 24;
+/** The menu pixels per grid cell. */
 static const LONG kCellSize = kMenuWidth / kGridColumns;
+/** The brightness of the background, of 256. */
 static const LONG kBackgroundBrightness = 152;  // of 256
+/** The colour strength of the background, of 256. */
 static const LONG kBackgroundSaturation = 333;  // of 256
+/** The widest screen the background is drawn on. */
 static const LONG kMaxScreenWidth = 8192;
+/** DDLOCK_WAIT. */
 static const DWORD kLockWait = 0x00000001;
+/** The offset of the red mask in DDSURFACEDESC (green and blue follow). */
 static const DWORD kDescriptionRedMask = 0x58;
 
+/** The pixel format of a 16- or 32-bit surface. */
 struct PixelLayout
 {
+    /** The bytes per pixel, 2 or 4. */
     DWORD bytes;
+    /** The mask of red, green and blue, shifted down. */
     DWORD mask[3];
+    /** The bit position of red, green and blue. */
     LONG shift[3];
+    /** The largest value of red, green and blue. */
     LONG maximum[3];
 };
 
+/** TRUE to show the blurred menu picture around the menu. */
 static BOOL g_backgroundEnabled = TRUE;
+/** TRUE when the background on the screen shows g_drawnGrid. */
 static BOOL g_backgroundValid = FALSE;
+/** The grid of the latest menu picture, 0..255 per channel. */
 static LONG g_grid[kGridRows][kGridColumns][3];
+/** The grid the background on the screen was drawn from. */
 static LONG g_drawnGrid[kGridRows][kGridColumns][3];
+/** The grid column of each screen column. */
 static LONG g_columnIndex[kMaxScreenWidth];
+/** The fraction (0..255) toward the next grid column of each screen column. */
 static LONG g_columnFraction[kMaxScreenWidth];
+/** Each channel level (0..255) in the screen's pixel format. */
 static DWORD g_pack[3][256];
 
+/**
+ * Reads the pixel format of a locked surface.
+ *
+ * @param [in] description The DDSURFACEDESC of the surface.
+ * @param [out] layout Receives the format.
+ * @return FALSE for formats other than 16 and 32 bits.
+ */
 static BOOL ReadPixelLayout(const BYTE* description, PixelLayout* layout)
 {
     DWORD channel;
@@ -556,6 +848,13 @@ static BOOL ReadPixelLayout(const BYTE* description, PixelLayout* layout)
     return TRUE;
 }
 
+/**
+ * Reads a pixel of a 16- or 32-bit surface.
+ *
+ * @param [in] pixel The pixel.
+ * @param [in] bytes The bytes per pixel, 2 or 4.
+ * @return The value.
+ */
 static DWORD ReadPixel(const BYTE* pixel, DWORD bytes)
 {
     return bytes == 2 ?
@@ -563,8 +862,15 @@ static DWORD ReadPixel(const BYTE* pixel, DWORD bytes)
         *reinterpret_cast<const DWORD*>(pixel);
 }
 
-// The source picture (640x480 from sourceLeft, sourceTop) into the grid,
-// already darkened, as 0..255 per channel.
+/**
+ * Averages a menu picture into g_grid, already darkened, as 0..255 per
+ * channel.
+ *
+ * @param [in] source The surface that holds the picture.
+ * @param [in] sourceLeft The left edge of the 640x480 picture.
+ * @param [in] sourceTop The top edge of the 640x480 picture.
+ * @return FALSE when the surface could not be read.
+ */
 static BOOL ReadBackgroundGrid(LPVOID source, LONG sourceLeft, LONG sourceTop)
 {
     BYTE description[kDescriptionSize];
@@ -664,8 +970,18 @@ static BOOL ReadBackgroundGrid(LPVOID source, LONG sourceLeft, LONG sourceTop)
     return TRUE;
 }
 
-// Grid position (index, 0..255 fraction) of a screen coordinate: the
-// picture covers the screen (scale numerator / denominator), centred.
+/**
+ * Gives the grid position of a screen coordinate: the picture covers the
+ * screen, centred.
+ *
+ * @param [in] screen The screen column or row.
+ * @param [in] padding The screen pixels before the picture.
+ * @param [in] numerator The numerator of the picture's scale.
+ * @param [in] denominator The denominator of the picture's scale.
+ * @param [in] cells The grid columns or rows.
+ * @param [out] index Receives the grid column or row.
+ * @param [out] fraction Receives the fraction toward the next one, 0..255.
+ */
 static void GridPosition(
     LONG screen,
     LONG padding,
@@ -692,6 +1008,18 @@ static void GridPosition(
     *fraction = position & 255;
 }
 
+/**
+ * Draws the menu background around the enlarged menu.
+ *
+ * The area around the enlarged menu shows the current menu picture,
+ * enlarged to cover the screen, heavily blurred and darkened. Whenever the
+ * game copies a whole new menu screen (640x480) to the screen, its picture
+ * is averaged into a grid of kGridColumns x kGridRows colours, which is
+ * then stretched smoothly (bilinear, in integers) over the area around the
+ * menu. Smaller copies (a button lit up) leave it as it is.
+ *
+ * @param [in] primary The menu's primary surface.
+ */
 static void DrawBackground(LPVOID primary)
 {
     BYTE description[kDescriptionSize];
@@ -825,8 +1153,15 @@ static void DrawBackground(LPVOID primary)
     g_originalUnlock(primary, NULL);
 }
 
-// Called before the game copies to the menu's screen surface: a copy of a
-// whole menu screen renews the background.
+/**
+ * Renews the background when the game copies a whole menu screen to the
+ * menu's screen surface; called before the copy.
+ *
+ * @param [in] primary The menu's primary surface.
+ * @param [in] source The surface copied from, or NULL.
+ * @param [in] sourceRect The rectangle copied, or NULL for the whole
+ *             surface.
+ */
 static void UpdateBackground(LPVOID primary, LPVOID source, const RECT* sourceRect)
 {
     LONG left = 0;
@@ -888,20 +1223,33 @@ static void UpdateBackground(LPVOID primary, LPVOID source, const RECT* sourceRe
     }
 }
 
-// The screen was cleared: the next whole menu screen draws it again.
+/**
+ * Marks the background as gone after the screen was cleared: the next
+ * whole menu screen draws it again.
+ */
 static void InvalidateBackground()
 {
     g_backgroundValid = FALSE;
 }
 
-// The game plays a video into its 640x480 video window at x, y, width,
-// height (FUN_00402650: 320x192 doubled to 640x384 at 0,20, or 320x192 on
-// the Matte picture). The window has no background, so the rest of it is
-// never painted: on Windows 98 it shows the game's picture underneath,
-// on Windows 8 and newer an old video frame. The window therefore becomes
-// the largest whole multiple of the video's own size that fits the screen
-// (5x of 320x192 at 1920x1080, 7x at 2560x1440), centred on black, and the
-// video fills it.
+/**
+ * Replaces the game's mciSendCommandA: places the video window.
+ *
+ * The game plays a video into its 640x480 video window at x, y, width,
+ * height (FUN_00402650: 320x192 doubled to 640x384 at 0,20, or 320x192 on
+ * the Matte picture). The window has no background, so the rest of it is
+ * never painted: on Windows 98 it shows the game's picture underneath, on
+ * Windows 8 and newer an old video frame. The window therefore becomes the
+ * largest whole multiple of the video's own size that fits the screen (5x
+ * of 320x192 at 1920x1080, 7x at 2560x1440), centred on black, and the
+ * video fills it.
+ *
+ * @param [in] device Passed on to Windows.
+ * @param [in] message The MCI command.
+ * @param [in] flags The command flags.
+ * @param [in] parameters The command parameters.
+ * @return The result of mciSendCommandA.
+ */
 static DWORD WINAPI HookedMciSendCommand(
     UINT device,
     UINT message,
@@ -994,10 +1342,13 @@ static DWORD WINAPI HookedMciSendCommand(
     return result;
 }
 
-// F12 in the menus: the screen as shown (without the mouse pointer, which
-// Windows draws on top) as RoadRashScreen001.bmp, 002, ... like F12 in a
-// race. The screen is 16-bit, so its pixels are widened to 8 bits per
-// channel first.
+/**
+ * Saves the screen as shown in the menus (F12).
+ *
+ * The screen as shown (without the mouse pointer, which Windows draws on
+ * top) is saved as RoadRashScreen001.bmp, 002, ... like F12 in a race. The
+ * screen is 16-bit, so its pixels are widened to 8 bits per channel first.
+ */
 static void SaveMenuScreenshot()
 {
     LPVOID primary = *reinterpret_cast<LPVOID*>(GameVa(kMenuPrimaryVa));
@@ -1096,8 +1447,17 @@ static void SaveMenuScreenshot()
     }
 }
 
-// Bit 30 of lParam: the key was already down (auto-repeat); bit 31: it is
-// being released.
+/**
+ * WH_KEYBOARD hook: saves a menu screenshot when F12 goes down.
+ *
+ * Bit 30 of lParam is set when the key was already down (auto-repeat),
+ * bit 31 when it is being released.
+ *
+ * @param [in] code The hook code.
+ * @param [in] wParam The virtual key.
+ * @param [in] lParam The key data.
+ * @return The result of the next hook.
+ */
 static LRESULT CALLBACK MenuKeyboardHook(int code, WPARAM wParam, LPARAM lParam)
 {
     if (code == HC_ACTION && g_menusActive && wParam == VK_F12 &&
@@ -1109,10 +1469,19 @@ static LRESULT CALLBACK MenuKeyboardHook(int code, WPARAM wParam, LPARAM lParam)
     return CallNextHookEx(g_keyboardHook, code, wParam, lParam);
 }
 
-// New windows: RashRoot's children and the video window are enlarged with
-// the menu; other top-level windows that fit into the 640x480 screen the
-// game was made for (its dialogs; not message boxes, which Windows centres
-// on the real screen) are centred in it.
+/**
+ * WH_CBT hook: places new windows.
+ *
+ * RashRoot's children and the video window are enlarged with the menu;
+ * other top-level windows that fit into the 640x480 screen the game was
+ * made for (its dialogs; not message boxes, which Windows centres on the
+ * real screen) are centred in it.
+ *
+ * @param [in] code The hook code.
+ * @param [in] wParam The new window.
+ * @param [in,out] lParam The CBT_CREATEWND of the new window.
+ * @return The result of the next hook.
+ */
 static LRESULT CALLBACK MenuCbtHook(int code, WPARAM wParam, LPARAM lParam)
 {
     if (code == HCBT_CREATEWND && g_menusActive)
@@ -1155,6 +1524,18 @@ static LRESULT CALLBACK MenuCbtHook(int code, WPARAM wParam, LPARAM lParam)
     return CallNextHookEx(g_cbtHook, code, wParam, lParam);
 }
 
+/**
+ * Replaces the surface's Blt: enlarges and moves copies into the menu's
+ * primary.
+ *
+ * @param [in] surface The destination surface.
+ * @param [in] destination The destination rectangle, or NULL.
+ * @param [in] source The source surface.
+ * @param [in] sourceRect The source rectangle, or NULL.
+ * @param [in] flags The DDBLT flags.
+ * @param [in] effects The DDBLTFX, or NULL.
+ * @return The result of Blt.
+ */
 static HRESULT WINAPI HookedBlt(
     LPVOID surface,
     LPRECT destination,
@@ -1185,6 +1566,14 @@ static HRESULT WINAPI HookedBlt(
     return g_originalBlt(surface, &shifted, source, sourceRect, flags, effects);
 }
 
+/**
+ * Gives the size of a surface.
+ *
+ * @param [in] surface The surface.
+ * @param [out] width Receives its width.
+ * @param [out] height Receives its height.
+ * @return FALSE when GetSurfaceDesc failed.
+ */
 static BOOL GetSurfaceSize(LPVOID surface, LONG* width, LONG* height)
 {
     BYTE description[kDescriptionSize];
@@ -1203,6 +1592,18 @@ static BOOL GetSurfaceSize(LPVOID surface, LONG* width, LONG* height)
     return TRUE;
 }
 
+/**
+ * Replaces the surface's BltFast: enlarges copies into the menu's primary
+ * as a stretching Blt of the same rectangle.
+ *
+ * @param [in] surface The destination surface.
+ * @param [in] x The destination column.
+ * @param [in] y The destination row.
+ * @param [in] source The source surface.
+ * @param [in] sourceRect The source rectangle, or NULL.
+ * @param [in] flags The DDBLTFAST flags.
+ * @return The result of BltFast or Blt.
+ */
 static HRESULT WINAPI HookedBltFast(
     LPVOID surface,
     DWORD x,
@@ -1272,8 +1673,19 @@ static HRESULT WINAPI HookedBltFast(
     return g_originalBlt(surface, &to, source, &from, bltFlags, NULL);
 }
 
-// A Lock of the whole primary (the game's screenshot) gets the menu as the
-// game drew it: the 640x480 area, one screen pixel per game pixel.
+/**
+ * Replaces the surface's Lock.
+ *
+ * A Lock of the whole primary (the game's screenshot) gets the menu as the
+ * game drew it: the 640x480 area, one screen pixel per game pixel.
+ *
+ * @param [in] surface The surface.
+ * @param [in] rect The rectangle to lock, or NULL.
+ * @param [in,out] description The DDSURFACEDESC.
+ * @param [in] flags The DDLOCK flags.
+ * @param [in] event Passed on to DirectDraw.
+ * @return The result of Lock.
+ */
 static HRESULT WINAPI HookedLock(
     LPVOID surface,
     LPRECT rect,
@@ -1350,6 +1762,13 @@ static HRESULT WINAPI HookedLock(
     return result;
 }
 
+/**
+ * Replaces the surface's Unlock; the end of a Lock that saw the copy.
+ *
+ * @param [in] surface The surface.
+ * @param [in] data Passed on to DirectDraw.
+ * @return The result of Unlock.
+ */
 static HRESULT WINAPI HookedUnlock(LPVOID surface, LPVOID data)
 {
     if (g_lockCopyActive && IsMenuPrimary(surface))
@@ -1361,6 +1780,14 @@ static HRESULT WINAPI HookedUnlock(LPVOID surface, LPVOID data)
     return g_originalUnlock(surface, data);
 }
 
+/**
+ * Overwrites a pointer in an import table or vtable.
+ *
+ * @param [in,out] slot The pointer.
+ * @param [in] value The new value.
+ * @param [out] original Receives the old value, or NULL.
+ * @return FALSE when the memory could not be made writable.
+ */
 static BOOL PatchPointer(LPVOID* slot, LPVOID value, LPVOID* original)
 {
     DWORD oldProtection;
@@ -1381,15 +1808,22 @@ static BOOL PatchPointer(LPVOID* slot, LPVOID value, LPVOID* original)
     return TRUE;
 }
 
+/** A game import replaced by a hook. */
 struct ImportHook
 {
+    /** The address of the import slot. */
     DWORD iatVa;
+    /** The DLL of the import. */
     const CHAR* module;
+    /** The name of the import. */
     const CHAR* name;
+    /** The hook. */
     LPVOID hook;
+    /** Receives the function the slot held. */
     LPVOID* original;
 };
 
+/** The game imports the native menus replace. */
 static const ImportHook g_importHooks[] =
 {
     { kGetWindowRectIatVa, "user32.dll", "GetWindowRect",
@@ -1415,15 +1849,26 @@ static const ImportHook g_importHooks[] =
       reinterpret_cast<LPVOID*>(&g_originalMciSendCommand) }
 };
 
+/** The number of entries in g_importHooks. */
 static const DWORD kImportHookCount =
     sizeof(g_importHooks) / sizeof(g_importHooks[0]);
+/** TRUE once the import hooks are in. */
 static BOOL g_importHooksInstalled = FALSE;
 
-// Whether the game's import table names `name` from `module` for the import
-// slot at `iatVa`, read from the name list the linker kept beside the slots
-// (the executable has one for every DLL). A wrapper loaded by ChainDll may
-// have written its own function into the slot already (dd2d9 does as it
-// loads); the name still says which function the slot is for.
+/**
+ * Tells whether the game's import table names a function for an import
+ * slot.
+ *
+ * Read from the name list the linker kept beside the slots (the executable
+ * has one for every DLL). A wrapper loaded by ChainDll may have written its
+ * own function into the slot already, as it loads; the name still says
+ * which function the slot is for.
+ *
+ * @param [in] iatVa The address of the import slot.
+ * @param [in] module The DLL of the import.
+ * @param [in] name The name of the import.
+ * @return TRUE when the slot is that function's.
+ */
 static BOOL ImportSlotNames(DWORD iatVa, const CHAR* module, const CHAR* name)
 {
     const BYTE* base = reinterpret_cast<const BYTE*>(GameVa(kImageBase));
@@ -1501,12 +1946,16 @@ static BOOL ImportSlotNames(DWORD iatVa, const CHAR* module, const CHAR* name)
     return FALSE;
 }
 
-// A DirectDraw wrapper behind ChainDll can write its own functions into the
-// same import slots after the hooks are in, again whenever a DLL is loaded
-// (cnc-ddraw does, also when the video DLLs load). The hook then goes back
-// in front, and the wrapper's function becomes the one it calls, so both
-// keep working. Without such a wrapper the slots never change. Called after
-// the hooks pass a call on, for every new surface and for the menu copies.
+/**
+ * Puts the import hooks back in front of a wrapper that replaced them.
+ *
+ * A DirectDraw wrapper behind ChainDll can write its own functions into the
+ * same import slots after the hooks are in, again whenever a DLL is loaded
+ * (cnc-ddraw does, also when the video DLLs load). The hook then goes back
+ * in front, and the wrapper's function becomes the one it calls, so both
+ * keep working. Without such a wrapper the slots never change. Called after
+ * the hooks pass a call on, for every new surface and for the menu copies.
+ */
 static void ReassertImportHooks()
 {
     static BOOL logged = FALSE;
@@ -1599,22 +2048,39 @@ BOOL NativeMenusInstall(DWORD gameBase, BOOL background)
     return TRUE;
 }
 
-// Puts the hook into a vtable slot unless it is there already. Windows 8
-// and newer rebuild the surface vtable when the display mode changes (as
-// the Flip hook in road_rash_patch.cpp notices too), so every new surface
-// is checked again.
-// Every vtable slot changed, with the value it had, for NativeMenusShutdown.
+/**
+ * A vtable slot that was changed, with the value it had, for
+ * NativeMenusShutdown.
+ */
 struct PatchedSlot
 {
+    /** The slot. */
     LPVOID* slot;
+    /** The hook put into it. */
     LPVOID hook;
+    /** The value it had. */
     LPVOID original;
 };
 
+/** The most slots remembered. */
 static const DWORD kMaxPatchedSlots = 32;
+/** The slots that were changed. */
 static PatchedSlot g_patchedSlots[kMaxPatchedSlots];
+/** The number of entries used in g_patchedSlots. */
 static DWORD g_patchedSlotCount = 0;
 
+/**
+ * Puts a hook into a vtable slot unless it is there already.
+ *
+ * Windows 8 and newer rebuild the surface vtable when the display mode
+ * changes (as the Flip hook in road_rash_patch.cpp notices too), so every
+ * new surface is checked again.
+ *
+ * @param [in,out] vtable The vtable.
+ * @param [in] index The slot.
+ * @param [in] hook The hook.
+ * @param [out] original Receives the function the slot held.
+ */
 static void EnsureSlot(LPVOID* vtable, DWORD index, LPVOID hook, LPVOID* original)
 {
     LPVOID current = vtable[index];
@@ -1710,7 +2176,15 @@ void NativeMenusWatchSurface(LPVOID surface)
         reinterpret_cast<LPVOID*>(&g_originalUnlock));
 }
 
-// direction 1: from the 640x480 layout into the enlarged menu; -1: back.
+/**
+ * Moves a child window of RashRoot into or out of the enlarged menu (an
+ * EnumChildWindows callback).
+ *
+ * @param [in] window The child window.
+ * @param [in] direction 1: from the 640x480 layout into the enlarged menu;
+ *             -1: back.
+ * @return TRUE to go on with the next window.
+ */
 static BOOL CALLBACK PlaceChild(HWND window, LPARAM direction)
 {
     RECT rect;

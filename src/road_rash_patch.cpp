@@ -1,5 +1,18 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
-// Copyright (C) 2026 Alexander Schmidt
+/**
+ * The widescreen patch: hooks the game's DirectDraw object and surfaces.
+ *
+ * The game renders into a virtual back buffer 480 lines high (or a
+ * multiple of that with RenderScale), as wide as the real display's aspect
+ * ratio, which is stretched or filtered to the real display mode when it
+ * flips. The HUD is centred in it, the sky panorama is tiled across it, and
+ * the frame filters, scanlines, the FPS overlay and the screenshots work on
+ * the presented frame. Also writes the log and the crash log.
+ *
+ * @file road_rash_patch.cpp
+ * @author Alexander Schmidt
+ * @copyright Copyright (C) 2026 Alexander Schmidt
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ */
 
 #include "road_rash_patch.h"
 #include "game_fixes.h"
@@ -24,17 +37,21 @@
 // Windows 95's kernel32 has no InterlockedCompareExchange.
 #pragma intrinsic(_InterlockedCompareExchange)
 
+/** IDirectDraw::SetDisplayMode. */
 typedef HRESULT (WINAPI *DirectDrawSetDisplayModeFn)(
     LPVOID,
     DWORD,
     DWORD,
     DWORD);
+/** IDirectDraw::CreateSurface. */
 typedef HRESULT (WINAPI *DirectDrawCreateSurfaceFn)(
     LPVOID,
     LPVOID,
     LPVOID*,
     LPVOID);
+/** The callback of IDirectDraw::EnumDisplayModes. */
 typedef HRESULT (WINAPI *DirectDrawEnumModesCallback)(LPVOID, LPVOID);
+/** IDirectDraw::EnumDisplayModes. */
 typedef HRESULT (WINAPI *DirectDrawEnumDisplayModesFn)(
     LPVOID,
     DWORD,
@@ -42,131 +59,250 @@ typedef HRESULT (WINAPI *DirectDrawEnumDisplayModesFn)(
     LPVOID,
     DirectDrawEnumModesCallback);
 
+/** The game's DirectDraw object and its hooked methods. */
 struct DirectDrawHookState
 {
+    /** The IDirectDraw object. */
     LPVOID object;
+    /** Its vtable. */
     LPVOID* vtable;
+    /** CreateSurface before the hook. */
     DirectDrawCreateSurfaceFn originalCreateSurface;
+    /** SetDisplayMode before the hook. */
     DirectDrawSetDisplayModeFn originalSetDisplayMode;
 };
 
+/** The PE timestamp of ROADRASH.EXE 1.0A. */
 static const DWORD kExpectedTimestamp = 0x321DCBE7;
+/** The image base of ROADRASH.EXE 1.0A. */
 static const DWORD kExpectedImageBase = 0x00400000;
+/** The image size of ROADRASH.EXE 1.0A. */
 static const DWORD kExpectedImageSize = 0x000D8000;
+/** The return address of the game's SetDisplayMode call for a race. */
 static const DWORD kGameModeSetDisplayModeReturnRva = 0x00048903;
+/** The return address of the game's SetDisplayMode call for the menus. */
 static const DWORD kMenuSetDisplayModeReturnRva = 0x000485F1;
+/**
+ * The return address of the game's 16-bit SetDisplayMode call for the
+ * menus.
+ */
 static const DWORD kMenuSetDisplayMode16ReturnRva = 0x00048609;
+/**
+ * The return address of the game's CreateSurface call for the race's
+ * primary surface.
+ */
 static const DWORD kPrimaryCreateReturnRva = 0x00048A58;
-// The HUD/cockpit draw call (E8 rel32 to the HUD function) and the JZ that
-// shrinks the message rectangle to 640 pixels when the display origin is not 0.
+/** The HUD/cockpit draw call (E8 rel32 to the HUD function). */
 static const DWORD kHudCallRva = 0x0004C7B9;
+/** The HUD/cockpit draw function. */
 static const DWORD kHudFunctionRva = 0x00046C30;
+/**
+ * The JZ that shrinks the message rectangle to 640 pixels when the display
+ * origin is not 0.
+ */
 static const DWORD kHudMessageJumpRva = 0x00047322;
+/** The width of the HUD art. */
 static const DWORD kHudCockpitWidth = 640;
-// Sky panorama: the draw call, its two half-surfaces, the destination, and
-// the period/half-width/height globals.
+/** The sky panorama draw call. */
 static const DWORD kSkyCallRva = 0x00043AD3;
+/** The sky panorama draw function. */
 static const DWORD kSkyFunctionRva = 0x0004C800;
+/** The width of the whole sky panorama. */
 static const DWORD kSkyPeriodRva = 0x0009E644;
+/** The width of each half of the sky panorama. */
 static const DWORD kSkyHalfWidthRva = 0x0009E650;
+/** The height of the sky panorama. */
 static const DWORD kSkyHeightRva = 0x000B7EC8;
+/** The surface of the first half of the sky panorama. */
 static const DWORD kSkySurfaceARva = 0x00075418;
+/** The surface of the second half of the sky panorama. */
 static const DWORD kSkySurfaceBRva = 0x0007541C;
+/** The surface the game draws a race frame into. */
 static const DWORD kGameBackBufferRva = 0x00075410;
+/** Nonzero while the game shows its loading picture. */
 static const DWORD kLoadingImageFlagRva = 0x00075390;
+/** Nonzero while the game draws the world. */
 static const DWORD kRenderingEnabledRva = 0x00066680;
+/** The game's function that restores a lost surface. */
 static const DWORD kSurfaceRestoreRva = 0x0001DF60;
+/** The vtable slot of IDirectDraw::CreateSurface. */
 static const DWORD kCreateSurfaceVtableIndex = 6;
+/** The vtable slot of IDirectDraw::EnumDisplayModes. */
 static const DWORD kEnumDisplayModesVtableIndex = 8;
+/** The vtable slot of IDirectDraw::WaitForVerticalBlank. */
 static const DWORD kWaitForVerticalBlankVtableIndex = 22;
+/** The vtable slot of IDirectDraw::SetDisplayMode. */
 static const DWORD kSetDisplayModeVtableIndex = 21;
+/** The vtable slot of IDirectDrawSurface::Release. */
 static const DWORD kSurfaceReleaseVtableIndex = 2;
+/** The vtable slot of IDirectDrawSurface::Blt. */
 static const DWORD kSurfaceBltVtableIndex = 5;
+/** The vtable slot of IDirectDrawSurface::Flip. */
 static const DWORD kSurfaceFlipVtableIndex = 11;
+/** The vtable slot of IDirectDrawSurface::GetAttachedSurface. */
 static const DWORD kSurfaceGetAttachedVtableIndex = 12;
+/** The number of surface vtable slots checked to be inside one module. */
 static const DWORD kSurfaceVtableRangeCount = 23;
+/** The vtable slot of IDirectDrawSurface::GetFlipStatus. */
 static const DWORD kSurfaceGetFlipStatusVtableIndex = 18;
+/** The vtable slot of IDirectDrawSurface::IsLost. */
 static const DWORD kSurfaceIsLostVtableIndex = 24;
+/** DDSD_CAPS. */
 static const DWORD kDdsdCaps = 0x00000001;
+/** DDSCAPS_BACKBUFFER. */
 static const DWORD kDdsCapsBackBuffer = 0x00000004;
+/** DDSCAPS_OFFSCREENPLAIN. */
 static const DWORD kDdsCapsOffscreenPlain = 0x00000040;
+/** DDSCAPS_PRIMARYSURFACE. */
 static const DWORD kDdsCapsPrimarySurface = 0x00000200;
+/** The caps of a primary flip chain: primary surface, flip and complex. */
 static const DWORD kDdsCapsPrimaryFlipChain = 0x00000218;
+/** DDSD_CAPS | DDSD_BACKBUFFERCOUNT. */
 static const DWORD kDdsdPrimaryChainFlags = 0x00000021;
+/** The size of DDSURFACEDESC in bytes. */
 static const DWORD kDdsurfaceDescSize = 0x0000006C;
+/** The offset of dwFlags in DDSURFACEDESC. */
 static const DWORD kDdsurfaceDescFlagsOffset = 0x00000004;
+/** The offset of dwBackBufferCount in DDSURFACEDESC. */
 static const DWORD kDdsurfaceDescBackBufferCountOffset = 0x00000014;
+/** The offset of ddsCaps in DDSURFACEDESC. */
 static const DWORD kDdsurfaceDescCapsOffset = 0x00000068;
+/** DDBLT_WAIT. */
 static const DWORD kDdbltWait = 0x01000000;
+/** DDWAITVB_BLOCKBEGIN. */
 static const DWORD kDdWaitVbBlockBegin = 0x00000001;
+/** DDENUMRET_OK. */
 static const HRESULT kDdEnumReturnOk = 1;
-// DDSURFACEDESC v1 places dimensions at 0x08/0x0C and RGB bit count at 0x54.
+/**
+ * DDSD_HEIGHT; DDSURFACEDESC v1 places the dimensions at 0x08 and 0x0C and
+ * the RGB bit count at 0x54.
+ */
 static const DWORD kDdsdHeight = 0x00000002;
+/** DDSD_WIDTH. */
 static const DWORD kDdsdWidth = 0x00000004;
+/** DDSD_PIXELFORMAT. */
 static const DWORD kDdsdPixelFormat = 0x00001000;
+/** The smallest DDSURFACEDESC that holds the pixel format. */
 static const DWORD kDdsurfaceDescV1MinimumSize = 0x00000058;
+/** The offset of dwHeight in DDSURFACEDESC. */
 static const DWORD kDdsurfaceDescHeightOffset = 0x00000008;
+/** The offset of dwWidth in DDSURFACEDESC. */
 static const DWORD kDdsurfaceDescWidthOffset = 0x0000000C;
+/** The offset of the RGB bit count in DDSURFACEDESC. */
 static const DWORD kDdPixelFormatRgbBitCountOffset = 0x00000054;
-// The rest of DDSURFACEDESC v1 used for the 32-bit presenter: the lock pitch and
-// pointer, and the pixel format at 0x48 (size, flags, bit count, RGB masks).
+/** The offset of lPitch in DDSURFACEDESC. */
 static const DWORD kDdsurfaceDescPitchOffset = 0x00000010;
+/** The offset of lpSurface in DDSURFACEDESC. */
 static const DWORD kDdsurfaceDescSurfaceOffset = 0x00000024;
+/** The offset of the pixel format in DDSURFACEDESC. */
 static const DWORD kDdsurfaceDescPixelFormatOffset = 0x00000048;
+/** The size of DDPIXELFORMAT in bytes. */
 static const DWORD kDdPixelFormatSize = 0x00000020;
+/** The offset of the pixel format flags in DDSURFACEDESC. */
 static const DWORD kDdPixelFormatFlagsOffset = 0x0000004C;
+/** The offset of the red mask in DDSURFACEDESC. */
 static const DWORD kDdPixelFormatRedMaskOffset = 0x00000058;
+/** The offset of the green mask in DDSURFACEDESC. */
 static const DWORD kDdPixelFormatGreenMaskOffset = 0x0000005C;
+/** The offset of the blue mask in DDSURFACEDESC. */
 static const DWORD kDdPixelFormatBlueMaskOffset = 0x00000060;
+/** DDPF_PALETTEINDEXED8. */
 static const DWORD kDdpfPaletteIndexed8 = 0x00000020;
+/** DDPF_RGB. */
 static const DWORD kDdpfRgb = 0x00000040;
+/** DDSCAPS_SYSTEMMEMORY. */
 static const DWORD kDdsCapsSystemMemory = 0x00000800;
+/** DDSCAPS_VIDEOMEMORY. */
 static const DWORD kDdsCapsVideoMemory = 0x00004000;
+/** DDLOCK_WAIT. */
 static const DWORD kDdlockWait = 0x00000001;
+/** DDLOCK_READONLY. */
 static const DWORD kDdlockReadOnly = 0x00000010;
+/** DDLOCK_WRITEONLY. */
 static const DWORD kDdlockWriteOnly = 0x00000020;
+/** The vtable slot of IDirectDraw::GetDisplayMode. */
 static const DWORD kGetDisplayModeVtableIndex = 12;
+/** The vtable slot of IDirectDrawSurface::GetPalette. */
 static const DWORD kSurfaceGetPaletteVtableIndex = 20;
+/** The vtable slot of IDirectDrawSurface::Lock. */
 static const DWORD kSurfaceLockVtableIndex = 25;
+/** The vtable slot of IDirectDrawSurface::SetPalette. */
 static const DWORD kSurfaceSetPaletteVtableIndex = 31;
+/** The vtable slot of IDirectDrawSurface::Unlock. */
 static const DWORD kSurfaceUnlockVtableIndex = 32;
+/** The vtable slot of IDirectDrawPalette::GetEntries. */
 static const DWORD kPaletteGetEntriesVtableIndex = 4;
-// The game's IDirectDrawPalette, created right after the gameplay surfaces.
+/**
+ * The game's IDirectDrawPalette, created right after the gameplay
+ * surfaces.
+ */
 static const DWORD kGamePaletteRva = 0x00075424;
 
+/** Nonzero when the game runs in HiRes (640x480). */
 static const DWORD kHighResolutionFlagRva = 0x00075380;
+/** The width of the game's 3D space (first copy). */
 static const DWORD kLogicalWidthARva = 0x00066674;
+/** The width of the game's 3D space (second copy). */
 static const DWORD kLogicalWidthBRva = 0x0006667C;
+/** The height of the game's 3D space. */
 static const DWORD kLogicalHeightRva = 0x00066678;
+/** The column where the game's view starts in the back buffer. */
 static const DWORD kDisplayOriginXRva = 0x00075394;
+/** The row where the game's view starts in the back buffer. */
 static const DWORD kDisplayOriginYRva = 0x00075398;
+/** The width of the game's view in pixels. */
 static const DWORD kDisplayWidthRva = 0x0007539C;
+/** The height of the game's view in pixels. */
 static const DWORD kDisplayHeightRva = 0x000753A0;
+/** The left edge of the game's clip rectangle. */
 static const DWORD kClipLeftRva = 0x000B7EB0;
+/** The top edge of the game's clip rectangle. */
 static const DWORD kClipTopRva = 0x000B7EB4;
+/** The right edge of the game's clip rectangle. */
 static const DWORD kClipRightRva = 0x000B7EB8;
+/** The bottom edge of the game's clip rectangle. */
 static const DWORD kClipBottomRva = 0x000B7EBC;
 
+/** The width of the original 3D space. */
 static const DWORD kOriginalLogicalWidth = 320;
+/** The height of the original 3D space. */
 static const DWORD kOriginalLogicalHeight = 240;
+/** The width of the original HiRes view. */
 static const DWORD kOriginalDisplayWidth = 640;
+/** The height of the original HiRes view. */
 static const DWORD kOriginalDisplayHeight = 480;
-// The game renders into a virtual buffer (480 lines high, width matching the
-// real display's aspect ratio) that is stretched to the real display mode
-// when it flips.
+/**
+ * The width of the 3D space for the virtual buffer.
+ *
+ * The game renders into a virtual buffer (480 lines high, width matching
+ * the real display's aspect ratio) that is stretched to the real display
+ * mode when it flips.
+ */
 static DWORD kVirtualLogicalWidth = 428;
+/** The width of the virtual buffer at 480 lines. */
 static DWORD kVirtualDisplayWidth = 856;
+/** [Display] VirtualWidth, or 0 to follow the display's aspect ratio. */
 static DWORD g_virtualWidthOverride = 0;
+/** The width of the real display mode for a race. */
 static DWORD kTargetDisplayWidth = 1920;
+/** The height of the real display mode for a race. */
 static DWORD kTargetDisplayHeight = 1080;
+/** The display width used when the desktop size is not plausible. */
 static const DWORD kSafeDisplayWidth = 1920;
+/** The display height used when the desktop size is not plausible. */
 static const DWORD kSafeDisplayHeight = 1080;
+/** The narrowest virtual buffer. */
 static const DWORD kMinVirtualWidth = 640;
+/** The widest virtual buffer. */
 static const DWORD kMaxVirtualWidth = 1280;
+/** The 3D space width of the 720x480 fallback mode. */
 static const DWORD kFallbackLogicalWidth = 360;
+/** The width of the 720x480 fallback mode. */
 static const DWORD kFallbackDisplayWidth = 720;
 
+/** IDirectDrawSurface::Release. */
 typedef ULONG (WINAPI *SurfaceReleaseFn)(LPVOID);
+/** IDirectDrawSurface::Blt. */
 typedef HRESULT (WINAPI *SurfaceBltFn)(
     LPVOID,
     LPVOID,
@@ -174,47 +310,90 @@ typedef HRESULT (WINAPI *SurfaceBltFn)(
     LPVOID,
     DWORD,
     LPVOID);
+/** IDirectDrawSurface::Flip. */
 typedef HRESULT (WINAPI *SurfaceFlipFn)(LPVOID, LPVOID, DWORD);
+/** IDirectDrawSurface::GetAttachedSurface. */
 typedef HRESULT (WINAPI *SurfaceGetAttachedFn)(LPVOID, LPVOID, LPVOID*);
+/** IDirectDraw::WaitForVerticalBlank. */
 typedef HRESULT (WINAPI *WaitForVerticalBlankFn)(LPVOID, DWORD, HANDLE);
 
+/** The game's DirectDraw object and its hooked methods. */
 static DirectDrawHookState g_hookState;
+/** Module base of ROADRASH.EXE; 0 when it is not the supported version. */
 static DWORD g_gameBase = 0;
+/** TRUE once the widescreen hooks are installed. */
 static BOOL g_widescreenActive = FALSE;
+/** TRUE while a race runs in the virtual back buffer. */
 static BOOL g_virtualDisplayActive = FALSE;
+/** The width of the real display mode of the race. */
 static DWORD g_realDisplayWidth = 0;
+/** The height of the real display mode of the race. */
 static DWORD g_realDisplayHeight = 0;
+/** The virtual primary surface the game gets for a race. */
 static LPVOID g_virtualPrimary = NULL;
+/** The virtual back buffer the game draws a race into. */
 static LPVOID g_virtualBack = NULL;
+/** The surface vtable the hooks are in. */
 static LPVOID* g_surfaceVtable = NULL;
+/** Release before the hook. */
 static SurfaceReleaseFn g_originalSurfaceRelease = NULL;
+/** Blt before the hook. */
 static SurfaceBltFn g_originalSurfaceBlt = NULL;
+/** Flip before the hook. */
 static SurfaceFlipFn g_originalSurfaceFlip = NULL;
+/** IDirectDrawSurface::GetFlipStatus. */
 typedef HRESULT (WINAPI *SurfaceQueryFn)(LPVOID, DWORD);
+/** IDirectDrawSurface::IsLost. */
 typedef HRESULT (WINAPI *SurfaceIsLostFn)(LPVOID);
+/** GetFlipStatus before the hook. */
 static SurfaceQueryFn g_originalSurfaceGetFlipStatus = NULL;
+/** IsLost before the hook. */
 static SurfaceIsLostFn g_originalSurfaceIsLost = NULL;
+/** The number of GetFlipStatus and IsLost calls written to the log. */
 static DWORD g_queryLogCount = 0;
+/** The number of GetAttachedSurface calls written to the log. */
 static DWORD g_backLogCount = 0;
+/** GetAttachedSurface before the hook. */
 static SurfaceGetAttachedFn g_originalSurfaceGetAttached = NULL;
+/** The number of flips written to the log. */
 static DWORD g_flipLogCount = 0;
+/** The number of SetDisplayMode calls written to the log. */
 static DWORD g_displayModeLogCount = 0;
+/** TRUE once the display modes were written to the log. */
 static BOOL g_nativeDisplayModesLogged = FALSE;
+/** [Display] WaitForVBlank: wait for the vertical blank before a present. */
 static BOOL g_waitForVerticalBlank = TRUE;
-// DirectPresent=1 (default): filters write straight into the primary surface.
+/**
+ * [Display] DirectPresent (default on): filters write straight into the
+ * primary surface.
+ */
 static BOOL g_directPresent = TRUE;
-// [Display] NativeMenus: the menus stay in the native resolution.
+/** [Display] NativeMenus: the menus stay in the native resolution. */
 static BOOL g_nativeMenus = FALSE;
 
-// The scale of the current race: the world is drawn at that many times the
-// 480-line resolution into a back buffer of that many times the size; the
-// sky and the HUD are enlarged into it from their 480-line art. The setting
-// is 1 to 4, or 0 (auto, the default): the largest scale whose lines fit
-// the height of the race's display mode, chosen for each race. Both become
-// 1 when the rasterizer could not be prepared.
+/**
+ * [Display] RenderScale: 1 to 4, or 0 (auto, the default).
+ *
+ * The scale of a race: the world is drawn at that many times the 480-line
+ * resolution into a back buffer of that many times the size; the sky and
+ * the HUD are enlarged into it from their 480-line art. Auto is the largest
+ * scale whose lines fit the height of the race's display mode, chosen for
+ * each race.
+ */
 static DWORD g_renderScaleSetting = 0;
+/**
+ * The scale of the current race; 1 when the rasterizer could not be
+ * prepared.
+ */
 static DWORD g_renderScale = 2;
 
+/**
+ * Chooses the scale of a race.
+ *
+ * @param [in] displayHeight The height of the race's display mode.
+ * @return The RenderScale setting, or for auto the largest scale whose
+ *         lines fit the height, 1 to kMaxRenderScale.
+ */
 static DWORD ChooseRenderScale(DWORD displayHeight)
 {
     DWORD scale = g_renderScaleSetting;
@@ -237,39 +416,65 @@ static DWORD ChooseRenderScale(DWORD displayHeight)
     return scale;
 }
 
-// The size of the game's frame in the virtual back buffer.
+/**
+ * Gives the width of the game's frame in the virtual back buffer.
+ *
+ * @return The width in pixels.
+ */
 static DWORD GetFrameWidth()
 {
     return kVirtualDisplayWidth * g_renderScale;
 }
 
+/**
+ * Gives the height of the game's frame in the virtual back buffer.
+ *
+ * @return The height in pixels.
+ */
 static DWORD GetFrameHeight()
 {
     return kOriginalDisplayHeight * g_renderScale;
 }
 
-// RenderScale above 1: the HUD is drawn into a 480-line surface and then enlarged
-// over the world; g_hudBefore holds that surface as it was before the HUD
-// was drawn, to find the pixels the HUD changed.
+/**
+ * RenderScale above 1: the 480-line surface the HUD is drawn into before
+ * it is enlarged over the world.
+ */
 static LPVOID g_hudSurface = NULL;
+/** The palette attached to g_hudSurface. */
 static LPVOID g_hudPalette = NULL;
+/**
+ * The HUD surface as it was before the HUD was drawn, to find the pixels
+ * the HUD changed.
+ */
 static BYTE* g_hudBefore = NULL;
+/** The width of the HUD surface. */
 static DWORD g_hudWidth = 0;
 
-// The sky camera; the sky scroll is -(camera >> 15) in HiRes.
+/** The sky camera; the sky scroll is -(camera >> 15) in HiRes. */
 static const DWORD kSkyCameraRva = 0x000BC7E8;
-// Frame filters. "none" keeps the game's 8-bit display mode; every other
-// filter uses the 32-bit presenter, which converts the 8-bit frame through
-// the game palette. F11 cycles through the 32-bit filters during a race.
+/**
+ * The frame filters.
+ *
+ * "none" keeps the game's 8-bit display mode; every other filter uses the
+ * 32-bit presenter, which converts the 8-bit frame through the game
+ * palette. F11 cycles through the 32-bit filters during a race.
+ */
 enum FrameFilter
 {
+    /** The game's 8-bit display mode, stretched by DirectDraw. */
     kFilterNone,
+    /** Nearest neighbor. */
     kFilterNearest,
+    /** Sharp bilinear. */
     kFilterSharpBilinear,
+    /** Bicubic (Catmull-Rom). */
     kFilterBicubic,
+    /** The number of filters. */
     kFilterCount
 };
 
+/** The names of the filters in the settings and the log. */
 static const CHAR* const kFilterNames[kFilterCount] =
 {
     "none",
@@ -278,38 +483,67 @@ static const CHAR* const kFilterNames[kFilterCount] =
     "bicubic"
 };
 
-// The filter from the ini, the filter in use (kept across races), whether
-// the 32-bit display mode is active, and filters that failed to start.
+/** [Display] Filter. */
 static DWORD g_filterSetting = kFilterNone;
+/** The filter in use, kept across races. */
 static DWORD g_activeFilter = kFilterNone;
+/** TRUE while the 32-bit display mode is active. */
 static BOOL g_presenterDisplayActive = FALSE;
+/** TRUE for each filter that failed to start. */
 static BOOL g_filterUnavailable[kFilterCount];
-// Scanline darkening in percent; 0 is off.
+/** [Display] Scanlines: the darkening in percent; 0 is off. */
 static DWORD g_scanlineStrength = 0;
-// The game palette as X8R8G8B8, refreshed every presented frame.
+/** The game palette as X8R8G8B8, refreshed every presented frame. */
 static DWORD g_paletteRgb[256];
-// The bicubic filter.
+/** The bicubic filter. */
 static Resampler g_bicubic;
-// Set when nearest cannot scale to the display size itself; the present
-// then stretches the converted frame.
+/**
+ * Set when nearest cannot scale to the display size itself; the present
+ * then stretches the converted frame.
+ */
 static BOOL g_nearestFailed = FALSE;
-// Two staging surfaces take turns, so a frame is never written into the
-// surface the previous present may still be reading.
+/**
+ * The staging surface for the filtered frame.
+ *
+ * Two staging surfaces take turns, so a frame is never written into the
+ * surface the previous present may still be reading.
+ */
 static LPVOID g_staging = NULL;
+/** The second staging surface, or NULL. */
 static LPVOID g_stagingSpare = NULL;
-// Frame timing diagnostics: the end of the previous present.
+/** Frame timing diagnostics: the end of the previous present. */
 static LARGE_INTEGER g_lastPresentEnd;
+/** TRUE when g_lastPresentEnd holds a present. */
 static BOOL g_lastPresentValid = FALSE;
+/** The palette attached to the virtual back buffer for GDI. */
 static LPVOID g_backPalette = NULL;
+/** [Display] ShowFps. */
 static BOOL g_showFps = FALSE;
+/** [Display] ShowFilter. */
 static BOOL g_showFilter = FALSE;
-// The first log message of a run replaces the previous log.
+/**
+ * TRUE until the first log message of a run, which replaces the previous
+ * log.
+ */
 static BOOL g_truncateLog = FALSE;
-// Each log line starts with the time since the first message, in seconds
-// and milliseconds (GetTickCount: 32-bit, available on Windows 95).
+/**
+ * The tick count of the first log message.
+ *
+ * Each log line starts with the time since the first message, in seconds
+ * and milliseconds (GetTickCount: 32-bit, available on Windows 95).
+ */
 static DWORD g_logStartTick = 0;
+/** TRUE when the next log text begins a line. */
 static BOOL g_logAtLineStart = TRUE;
 
+/**
+ * Writes text to the log file.
+ *
+ * @param [in] file The log file.
+ * @param [in] text The text.
+ * @param [in] length The number of bytes.
+ * @return TRUE when everything was written.
+ */
 static BOOL WriteLogText(HANDLE file, const char* text, DWORD length)
 {
     DWORD bytesWritten;
@@ -318,7 +552,14 @@ static BOOL WriteLogText(HANDLE file, const char* text, DWORD length)
         bytesWritten == length;
 }
 
-// Writes the message with a time stamp in front of each line it begins.
+/**
+ * Writes a message with a time stamp in front of each line it begins.
+ *
+ * @param [in] file The log file.
+ * @param [in] message The message.
+ * @param [in] length The number of bytes.
+ * @return TRUE when everything was written.
+ */
 static BOOL WriteStampedLog(HANDLE file, const char* message, DWORD length)
 {
     DWORD offset = 0;
@@ -366,6 +607,16 @@ static BOOL WriteStampedLog(HANDLE file, const char* message, DWORD length)
     return TRUE;
 }
 
+/**
+ * Appends a message to RoadRashWidescreen.log next to the game, or sends
+ * it to the debugger when the log cannot be written.
+ *
+ * Windows 9x only knows GENERIC_READ/GENERIC_WRITE (not FILE_APPEND_DATA),
+ * so the file is opened for writing and the pointer moved to its end.
+ *
+ * @param [in] message The message, with its line breaks.
+ * @param [in] length The number of bytes.
+ */
 static void LogMessage(const char* message, DWORD length)
 {
     CHAR path[MAX_PATH];
@@ -435,6 +686,13 @@ static void LogMessage(const char* message, DWORD length)
     CloseHandle(file);
 }
 
+/**
+ * Appends eight hex digits.
+ *
+ * @param [in,out] message The text.
+ * @param [in,out] length The length of the text.
+ * @param [in] value The value.
+ */
 static void AppendHex32(CHAR* message, DWORD* length, DWORD value)
 {
     static const CHAR digits[] = "0123456789ABCDEF";
@@ -447,6 +705,14 @@ static void AppendHex32(CHAR* message, DWORD* length, DWORD value)
     }
 }
 
+/**
+ * Logs a SetDisplayMode call.
+ *
+ * @param [in] caller The return address of the call.
+ * @param [in] width The width asked for.
+ * @param [in] height The height asked for.
+ * @param [in] bitsPerPixel The bits per pixel asked for.
+ */
 static void LogDisplayModeRequest(
     DWORD caller,
     DWORD width,
@@ -473,6 +739,13 @@ static void LogDisplayModeRequest(
     LogMessage(message, length);
 }
 
+/**
+ * Logs a result as hex after a prefix.
+ *
+ * @param [in] prefix The text before the result.
+ * @param [in] prefixLength The length of prefix.
+ * @param [in] result The result.
+ */
 static void LogHRESULTResult(
     const CHAR* prefix,
     DWORD prefixLength,
@@ -488,6 +761,11 @@ static void LogHRESULTResult(
     LogMessage(message, length);
 }
 
+/**
+ * Logs the result of SetDisplayMode.
+ *
+ * @param [in] result The result.
+ */
 static void LogDisplayModeResult(HRESULT result)
 {
     LogHRESULTResult(
@@ -496,21 +774,37 @@ static void LogDisplayModeResult(HRESULT result)
         result);
 }
 
+/** The display modes EnumDisplayModes reported. */
 struct NativeDisplayModeLogContext
 {
+    /** One display mode. */
     struct Mode
     {
+        /** The width in pixels. */
         DWORD width;
+        /** The height in pixels. */
         DWORD height;
+        /** The bits per pixel. */
         DWORD bitsPerPixel;
     };
 
+    /** The modes reported, up to 64. */
     Mode modes[64];
+    /** The number of entries used in modes. */
     DWORD loggedModes;
+    /** TRUE when the race's display mode exists with 8 bits per pixel. */
     BOOL hasTarget8BitMode;
+    /** TRUE when 720x480 exists with 8 bits per pixel. */
     BOOL hasFallback8BitMode;
 };
 
+/**
+ * Logs one display mode.
+ *
+ * @param [in] width The width.
+ * @param [in] height The height.
+ * @param [in] bitsPerPixel The bits per pixel.
+ */
 static void LogNativeDisplayMode(
     DWORD width,
     DWORD height,
@@ -533,6 +827,13 @@ static void LogNativeDisplayMode(
     LogMessage(message, length);
 }
 
+/**
+ * Records a display mode reported by EnumDisplayModes.
+ *
+ * @param [in] surfaceDescription The DDSURFACEDESC of the mode.
+ * @param [in,out] context The NativeDisplayModeLogContext.
+ * @return DDENUMRET_OK.
+ */
 static HRESULT WINAPI LogNativeDisplayModeCallback(
     LPVOID surfaceDescription,
     LPVOID context)
@@ -608,6 +909,11 @@ static HRESULT WINAPI LogNativeDisplayModeCallback(
     return kDdEnumReturnOk;
 }
 
+/**
+ * Logs the display modes DirectDraw offers, once.
+ *
+ * @param [in] directDraw The DirectDraw object.
+ */
 static void LogNativeDisplayModes(LPVOID directDraw)
 {
     DirectDrawEnumDisplayModesFn enumerateModes;
@@ -684,6 +990,16 @@ static void LogNativeDisplayModes(LPVOID directDraw)
     }
 }
 
+/**
+ * Calls the original SetDisplayMode and logs the first calls.
+ *
+ * @param [in] directDraw The DirectDraw object.
+ * @param [in] width The width.
+ * @param [in] height The height.
+ * @param [in] bitsPerPixel The bits per pixel.
+ * @param [in] caller The return address of the game's call.
+ * @return The result of SetDisplayMode.
+ */
 static HRESULT CallOriginalSetDisplayMode(
     LPVOID directDraw,
     DWORD width,
@@ -719,6 +1035,14 @@ static HRESULT CallOriginalSetDisplayMode(
     return result;
 }
 
+/**
+ * Tells whether bytes are as expected.
+ *
+ * @param [in] actual The bytes.
+ * @param [in] expected The expected bytes.
+ * @param [in] length The number of bytes.
+ * @return TRUE when all bytes match.
+ */
 static BOOL MatchesBytes(
     const BYTE* actual,
     const BYTE* expected,
@@ -737,8 +1061,13 @@ static BOOL MatchesBytes(
     return TRUE;
 }
 
-// Reads Filter= (a filter name; anything after it, such as a ; comment, is
-// ignored).
+/**
+ * Reads [Display] Filter: a filter name; anything after it, such as a
+ * ; comment, is ignored.
+ *
+ * @param [in] path The settings file.
+ * @return The filter; kFilterNone for an empty or unknown value.
+ */
 static DWORD ReadFilterSetting(const CHAR* path)
 {
     CHAR value[64];
@@ -781,8 +1110,12 @@ static DWORD ReadFilterSetting(const CHAR* path)
     return kFilterNone;
 }
 
-// The settings file next to ROADRASH.EXE. Returns FALSE when its path does
-// not fit; the defaults are used then.
+/**
+ * Gives the path of the settings file next to ROADRASH.EXE.
+ *
+ * @param [out] path Receives the path (MAX_PATH characters).
+ * @return FALSE when its path does not fit; the defaults are used then.
+ */
 static BOOL GetSettingsPath(CHAR* path)
 {
     DWORD length = GetModuleFileNameA(NULL, path, MAX_PATH);
@@ -813,6 +1146,12 @@ BOOL GetPatchSettingsPath(CHAR* path)
     return GetSettingsPath(path);
 }
 
+/**
+ * Reads the [Display] settings and the size of the race's display mode.
+ *
+ * Makes the process DPI aware first: without this, the desktop size is
+ * reported DPI-virtualized on newer Windows.
+ */
 static void ReadVirtualWidthSetting()
 {
     CHAR path[MAX_PATH];
@@ -891,7 +1230,13 @@ static void ReadVirtualWidthSetting()
     kTargetDisplayHeight = displayHeight;
 }
 
-// Picks the 480-line virtual width that best fits the display's aspect ratio.
+/**
+ * Picks the 480-line virtual width that best fits the display's aspect
+ * ratio, unless VirtualWidth sets it.
+ *
+ * @param [in] displayWidth The width of the display mode.
+ * @param [in] displayHeight The height of the display mode.
+ */
 static void SelectVirtualWidth(DWORD displayWidth, DWORD displayHeight)
 {
     DWORD width = g_virtualWidthOverride;
@@ -915,6 +1260,11 @@ static void SelectVirtualWidth(DWORD displayWidth, DWORD displayHeight)
     kVirtualLogicalWidth = width / 2;
 }
 
+/**
+ * Checks that the game is ROADRASH.EXE 1.0A with the expected code.
+ *
+ * @return The module base, or 0 (with the reason in the log).
+ */
 static DWORD FindSupportedGameBase()
 {
     HMODULE module = GetModuleHandleA(NULL);
@@ -1024,33 +1374,63 @@ static DWORD FindSupportedGameBase()
     return reinterpret_cast<DWORD>(module);
 }
 
+/**
+ * Reads a variable of the game.
+ *
+ * @param [in] rva The relative address of the variable.
+ * @return The value.
+ */
 static DWORD ReadGameDword(DWORD rva)
 {
     return *reinterpret_cast<DWORD*>(g_gameBase + rva);
 }
 
+/**
+ * Writes a variable of the game.
+ *
+ * @param [in] rva The relative address of the variable.
+ * @param [in] value The new value.
+ */
 static void WriteGameDword(DWORD rva, DWORD value)
 {
     *reinterpret_cast<DWORD*>(g_gameBase + rva) = value;
 }
 
+/** The sky panorama draw function: scroll, top. */
 typedef void (__fastcall *SkyDrawFn)(int, int);
+/** The game's function that restores a lost surface. */
 typedef void (__fastcall *SurfaceRestoreFn)(LPVOID);
+/** IDirectDrawSurface::BltFast. */
 typedef HRESULT (WINAPI *SurfaceBltFastFn)(
     LPVOID, DWORD, DWORD, LPVOID, RECT*, DWORD);
+/** IDirectDrawSurface::Lock. */
 typedef HRESULT (WINAPI *SurfaceLockFn)(LPVOID, LPVOID, LPVOID, DWORD, HANDLE);
+/** IDirectDrawSurface::Unlock. */
 typedef HRESULT (WINAPI *SurfaceUnlockFn)(LPVOID, LPVOID);
 
-// A locked 8-bit surface for direct pixel access.
+/** A locked 8-bit surface for direct pixel access. */
 struct LockedSurface
 {
+    /** The surface. */
     LPVOID surface;
+    /** Its first pixel. */
     BYTE* pixels;
+    /** Its bytes per row. */
     LONG pitch;
+    /** Its width in pixels. */
     LONG width;
+    /** Its height in pixels. */
     LONG height;
 };
 
+/**
+ * Locks a whole surface.
+ *
+ * @param [in] surface The surface.
+ * @param [in] flags DDLOCK flags besides DDLOCK_WAIT.
+ * @param [out] locked Receives the surface and its pixels.
+ * @return FALSE when it could not be locked.
+ */
 static BOOL LockWholeSurface(LPVOID surface, DWORD flags, LockedSurface* locked)
 {
     BYTE description[kDdsurfaceDescSize];
@@ -1090,6 +1470,11 @@ static BOOL LockWholeSurface(LPVOID surface, DWORD flags, LockedSurface* locked)
     return TRUE;
 }
 
+/**
+ * Unlocks a surface locked by LockWholeSurface.
+ *
+ * @param [in] locked The locked surface.
+ */
 static void UnlockWholeSurface(LockedSurface* locked)
 {
     LPVOID* vtable = *reinterpret_cast<LPVOID**>(locked->surface);
@@ -1098,8 +1483,19 @@ static void UnlockWholeSurface(LockedSurface* locked)
         vtable[kSurfaceUnlockVtableIndex])(locked->surface, NULL);
 }
 
-// RenderScale above 1: draws the sky enlarged straight into the back
-// buffer, so it covers the whole view down to the horizon.
+/**
+ * RenderScale above 1: draws the sky enlarged straight into the back
+ * buffer, so it covers the whole view down to the horizon.
+ *
+ * @param [in] back The virtual back buffer.
+ * @param [in] first The first half of the panorama.
+ * @param [in] second The second half of the panorama.
+ * @param [in] half The width of each half.
+ * @param [in] period The width of the whole panorama.
+ * @param [in] height The height of the panorama.
+ * @param [in] top The row of the sky in the 480-line view.
+ * @return FALSE when a surface could not be locked.
+ */
 static BOOL DrawScaledSky(
     LPVOID back, LPVOID first, LPVOID second,
     LONG half, LONG period, LONG height, LONG top)
@@ -1156,9 +1552,16 @@ static BOOL DrawScaledSky(
     return TRUE;
 }
 
-// The game draws the sky panorama in three pieces, which leaves a gap on
-// the right when the view is wider than 720 pixels. Draw the remaining
-// pieces after the original routine.
+/**
+ * Replaces the sky draw call: tiles the panorama across the whole view.
+ *
+ * The game draws the sky panorama in three pieces, which leaves a gap on
+ * the right when the view is wider than 720 pixels; the panorama is tiled
+ * across the whole view instead.
+ *
+ * @param [in] scroll The scroll of the panorama.
+ * @param [in] top The row of the sky.
+ */
 static void __fastcall HookedSkyDraw(int scroll, int top)
 {
     DWORD period = ReadGameDword(kSkyPeriodRva);
@@ -1260,6 +1663,7 @@ static void __fastcall HookedSkyDraw(int scroll, int top)
     }
 }
 
+/** The HUD/cockpit draw function. */
 typedef DWORD (__cdecl *HudDrawFn)(void);
 
 static void SetWidescreenGameState(
@@ -1268,8 +1672,17 @@ static void SetWidescreenGameState(
     DWORD displayWidth,
     DWORD displayHeight);
 
-// Draws the cockpit, gauges, and text with the display origin shifted so the
-// 640-pixel-wide HUD is centered in the wider virtual buffer.
+/**
+ * Replaces the HUD draw call: draws the cockpit, gauges, and text with the
+ * display origin shifted so the 640-pixel-wide HUD is centred in the wider
+ * virtual buffer.
+ *
+ * RenderScale above 1: the HUD art and text exist at 480 lines only. The
+ * game draws them into a 480-line surface, and every pixel it changed is
+ * enlarged over the world.
+ *
+ * @return The game's result.
+ */
 static DWORD __cdecl HookedHudDraw(void)
 {
     DWORD result;
@@ -1341,6 +1754,13 @@ static DWORD __cdecl HookedHudDraw(void)
     return result;
 }
 
+/**
+ * Overwrites bytes of the game's code.
+ *
+ * @param [in] rva The relative address of the first byte.
+ * @param [in] bytes The new bytes.
+ * @param [in] length The number of bytes.
+ */
 static void WriteGameCode(DWORD rva, const void* bytes, DWORD length)
 {
     BYTE* destination = reinterpret_cast<BYTE*>(g_gameBase + rva);
@@ -1367,6 +1787,11 @@ static void WriteGameCode(DWORD rva, const void* bytes, DWORD length)
     FlushInstructionCache(GetCurrentProcess(), destination, length);
 }
 
+/**
+ * Points the HUD and sky draw calls to the hooks, or back to the game.
+ *
+ * @param [in] enable TRUE for the hooks.
+ */
 static void SetHudCentering(BOOL enable)
 {
     BYTE call[5];
@@ -1389,6 +1814,14 @@ static void SetHudCentering(BOOL enable)
     WriteGameCode(kSkyCallRva, call, sizeof(call));
 }
 
+/**
+ * Sets the game's view variables for the virtual buffer.
+ *
+ * @param [in] logicalWidth The width of the 3D space.
+ * @param [in] logicalHeight The height of the 3D space.
+ * @param [in] displayWidth The width of the view in pixels.
+ * @param [in] displayHeight The height of the view in pixels.
+ */
 static void SetWidescreenGameState(
     DWORD logicalWidth,
     DWORD logicalHeight,
@@ -1408,6 +1841,10 @@ static void SetWidescreenGameState(
     WriteGameDword(kClipBottomRva, displayHeight - 1);
 }
 
+/**
+ * Sets the game's view variables back to the original 640x480 and ends the
+ * race's virtual display.
+ */
 static void RestoreOriginalGameState()
 {
     WriteGameDword(kLogicalWidthARva, kOriginalLogicalWidth);
@@ -1432,6 +1869,11 @@ static void RestoreOriginalGameState()
     g_presenterDisplayActive = FALSE;
 }
 
+/**
+ * Clears a DDSURFACEDESC.
+ *
+ * @param [out] description The DDSURFACEDESC.
+ */
 static void ZeroDescription(BYTE* description)
 {
     volatile DWORD* words = reinterpret_cast<volatile DWORD*>(description);
@@ -1445,28 +1887,58 @@ static void ZeroDescription(BYTE* description)
 
 static void InstallSurfaceHooks(LPVOID surface);
 
+/** IDirectDrawSurface::GetPalette. */
 typedef HRESULT (WINAPI *SurfaceGetPaletteFn)(LPVOID, LPVOID*);
+/** IDirectDrawSurface::SetPalette. */
 typedef HRESULT (WINAPI *SurfaceSetPaletteFn)(LPVOID, LPVOID);
+/** IDirectDrawPalette::GetEntries. */
 typedef HRESULT (WINAPI *PaletteGetEntriesFn)(
     LPVOID, DWORD, DWORD, DWORD, BYTE*);
+/** IDirectDraw::GetDisplayMode. */
 typedef HRESULT (WINAPI *DirectDrawGetDisplayModeFn)(LPVOID, LPVOID);
+/** IUnknown::Release. */
 typedef ULONG (WINAPI *ComReleaseFn)(LPVOID);
 
+/**
+ * Gives the vtable of a COM object.
+ *
+ * @param [in] object The object.
+ * @return Its vtable.
+ */
 static LPVOID* GetVtable(LPVOID object)
 {
     return *reinterpret_cast<LPVOID**>(object);
 }
 
+/**
+ * Releases a COM object.
+ *
+ * @param [in] object The object.
+ */
 static void ReleaseObject(LPVOID object)
 {
     reinterpret_cast<ComReleaseFn>(GetVtable(object)[2])(object);
 }
 
+/**
+ * Gives a DWORD field of a DDSURFACEDESC.
+ *
+ * @param [in] description The DDSURFACEDESC.
+ * @param [in] offset The offset of the field.
+ * @return The field.
+ */
 static DWORD* DescriptionDword(BYTE* description, DWORD offset)
 {
     return reinterpret_cast<DWORD*>(description + offset);
 }
 
+/**
+ * Fills a DDSURFACEDESC for an offscreen surface.
+ *
+ * @param [out] description The DDSURFACEDESC.
+ * @param [in] width The width.
+ * @param [in] height The height.
+ */
 static void BuildOffscreenDescription(
     BYTE* description,
     DWORD width,
@@ -1482,6 +1954,11 @@ static void BuildOffscreenDescription(
         kDdsCapsOffscreenPlain;
 }
 
+/**
+ * Moves a surface description to system memory.
+ *
+ * @param [in,out] description The DDSURFACEDESC.
+ */
 static void SetSystemMemoryCaps(BYTE* description)
 {
     DWORD* caps = DescriptionDword(description, kDdsurfaceDescCapsOffset);
@@ -1489,9 +1966,15 @@ static void SetSystemMemoryCaps(BYTE* description)
     *caps = (*caps | kDdsCapsSystemMemory) & ~kDdsCapsVideoMemory;
 }
 
-// While the display runs at 32 bits per pixel, every surface the game
-// renders into must stay 8-bit palettized: it writes palette indices into
-// them through Lock. System memory keeps them independent of the display.
+/**
+ * Makes a surface description 8-bit palettized in system memory.
+ *
+ * While the display runs at 32 bits per pixel, every surface the game
+ * renders into must stay 8-bit palettized: it writes palette indices into
+ * them through Lock. System memory keeps them independent of the display.
+ *
+ * @param [in,out] description The DDSURFACEDESC.
+ */
 static void SetIndexedSystemMemoryFormat(BYTE* description)
 {
     *DescriptionDword(description, kDdsurfaceDescFlagsOffset) |=
@@ -1504,8 +1987,15 @@ static void SetIndexedSystemMemoryFormat(BYTE* description)
     *DescriptionDword(description, kDdPixelFormatRgbBitCountOffset) = 8;
 }
 
-// Fills 256 PALETTEENTRY values from the game's palette object, or from the
-// palette attached to the primary surface when the game has none yet.
+/**
+ * Reads the game's palette.
+ *
+ * From the game's palette object, or from the palette attached to the
+ * primary surface when the game has none yet.
+ *
+ * @param [out] entries Receives 256 PALETTEENTRY values.
+ * @return FALSE when there is no palette yet.
+ */
 static BOOL ReadGamePalette(BYTE* entries)
 {
     LPVOID palette = reinterpret_cast<LPVOID>(ReadGameDword(kGamePaletteRva));
@@ -1537,9 +2027,15 @@ static BOOL ReadGamePalette(BYTE* entries)
     return SUCCEEDED(result);
 }
 
-// GDI draws the HUD text into the back buffer; on an 8-bit surface it maps
-// colors through the attached palette. The game attaches its palette to the
-// primary, which in 32-bit mode cannot take one, so attach it here instead.
+/**
+ * Attaches the game's palette to the virtual back buffer and the HUD
+ * surface.
+ *
+ * GDI draws the HUD text into the back buffer; on an 8-bit surface it maps
+ * colors through the attached palette. The game attaches its palette to the
+ * primary, which in 32-bit mode cannot take one, so it is attached here
+ * instead.
+ */
 static void AttachGamePaletteToBackBuffer()
 {
     LPVOID palette = reinterpret_cast<LPVOID>(ReadGameDword(kGamePaletteRva));
@@ -1573,8 +2069,15 @@ static void AttachGamePaletteToBackBuffer()
         result);
 }
 
-// The 32-bit presenter needs an X8R8G8B8 display and 8-bit system-memory
-// surfaces alongside it.
+/**
+ * Tells whether the 32-bit presenter can run in the current display mode.
+ *
+ * The 32-bit presenter needs an X8R8G8B8 display and 8-bit system-memory
+ * surfaces alongside it.
+ *
+ * @param [in] directDraw The DirectDraw object.
+ * @return TRUE when both are available.
+ */
 static BOOL ProbePresenterDisplay(LPVOID directDraw)
 {
     BYTE description[kDdsurfaceDescSize];
@@ -1618,9 +2121,18 @@ static BOOL ProbePresenterDisplay(LPVOID directDraw)
     return TRUE;
 }
 
-// Sets the real gameplay mode: 32 bits per pixel for the 32-bit presenter
-// when a filter is requested and the mode is usable, otherwise the game's
-// 8 bits per pixel.
+/**
+ * Sets the real gameplay mode.
+ *
+ * 32 bits per pixel for the 32-bit presenter when a filter is requested
+ * and the mode is usable, otherwise the game's 8 bits per pixel.
+ *
+ * @param [in] directDraw The DirectDraw object.
+ * @param [in] width The width of the display mode.
+ * @param [in] height The height of the display mode.
+ * @param [in] caller The return address of the game's call.
+ * @return The result of SetDisplayMode.
+ */
 static HRESULT SetVirtualDisplayMode(
     LPVOID directDraw,
     DWORD width,
@@ -1655,7 +2167,15 @@ static HRESULT SetVirtualDisplayMode(
     return CallOriginalSetDisplayMode(directDraw, width, height, 8, caller);
 }
 
-// The size of a filter's output in the staging surface.
+/**
+ * Gives the size of a filter's output in the staging surface.
+ *
+ * Filters that scale to the display size are presented 1:1.
+ *
+ * @param [in] filter The filter.
+ * @param [out] width Receives the width.
+ * @param [out] height Receives the height.
+ */
 static void GetFilterOutputSize(DWORD filter, DWORD* width, DWORD* height)
 {
     // Filters that scale to the display size are presented 1:1.
@@ -1671,8 +2191,13 @@ static void GetFilterOutputSize(DWORD filter, DWORD* width, DWORD* height)
     *height = GetFrameHeight();
 }
 
-// The glyph scale of the FPS overlay, so it appears at about the same size
-// whatever the filter's output size is.
+/**
+ * Gives the glyph scale of the FPS overlay, so it appears at about the
+ * same size whatever the filter's output size is.
+ *
+ * @param [in] filter The filter.
+ * @return The scale, at least 1.
+ */
 static DWORD GetFilterOverlayScale(DWORD filter)
 {
     DWORD width;
@@ -1684,6 +2209,11 @@ static DWORD GetFilterOverlayScale(DWORD filter)
     return scale == 0 ? 1 : scale;
 }
 
+/**
+ * Logs the filter in use.
+ *
+ * @param [in] prefix The text before the filter name.
+ */
 static void LogFilter(const CHAR* prefix)
 {
     CHAR message[96];
@@ -1694,8 +2224,13 @@ static void LogFilter(const CHAR* prefix)
     LogMessage(message, lstrlenA(message));
 }
 
-// The next filter for F11: cycles through the 32-bit filters, skipping
-// filters that failed to start.
+/**
+ * Gives the next filter for F11: cycles through the 32-bit filters,
+ * skipping filters that failed to start.
+ *
+ * @param [in] filter The filter in use.
+ * @return The next filter.
+ */
 static DWORD NextFilter(DWORD filter)
 {
     DWORD step;
@@ -1717,9 +2252,17 @@ static DWORD NextFilter(DWORD filter)
     return filter;
 }
 
-// 32-bit system-memory surfaces that receive the filtered frame and are
-// stretched onto the primary. They are large enough for every filter's
-// output. The second one is optional.
+/**
+ * Creates the staging surfaces and starts the worker pool for the 32-bit
+ * presenter.
+ *
+ * The staging surfaces are 32-bit system-memory surfaces that receive the
+ * filtered frame and are stretched onto the primary. They are large enough
+ * for every filter's output. The second one is optional.
+ *
+ * @param [in] directDraw The DirectDraw object.
+ * @return The result of creating the first staging surface.
+ */
 static HRESULT CreatePresenterResources(LPVOID directDraw)
 {
     BYTE description[kDdsurfaceDescSize];
@@ -1818,6 +2361,7 @@ static HRESULT CreatePresenterResources(LPVOID directDraw)
     return S_OK;
 }
 
+/** Frees the filters' buffers and stops the worker pool. */
 static void ReleasePresenterResources()
 {
     SharpBilinearShutdown();
@@ -1827,8 +2371,15 @@ static void ReleasePresenterResources()
     WorkerPoolStop();
 }
 
-// Prepares the filter's buffers on first use. A filter that cannot start is
-// skipped from then on, and the frame falls back to nearest.
+/**
+ * Prepares a filter's buffers on first use.
+ *
+ * A filter that cannot start is skipped from then on, and the frame falls
+ * back to nearest.
+ *
+ * @param [in] filter The filter.
+ * @return FALSE when the filter cannot start.
+ */
 static BOOL PrepareFilter(DWORD filter)
 {
     if (filter == kFilterSharpBilinear && !SharpBilinearIsReady())
@@ -1882,7 +2433,15 @@ static BOOL PrepareFilter(DWORD filter)
     return TRUE;
 }
 
-// The nearest filter only converts the frame; the present stretches it.
+/**
+ * Converts the 8-bit frame to X8R8G8B8 at its own size; the present
+ * stretches it (nearest when it cannot scale itself).
+ *
+ * @param [in] source The first pixel of the 8-bit frame.
+ * @param [in] sourcePitch The bytes per row of source.
+ * @param [out] destination The first pixel of the converted frame.
+ * @param [in] destinationPitch The bytes per row of destination.
+ */
 static void ConvertFrame(
     const BYTE* source,
     LONG sourcePitch,
@@ -1908,6 +2467,20 @@ static void ConvertFrame(
     }
 }
 
+/**
+ * Creates the real primary surface and the virtual back buffer for a race,
+ * in place of the game's primary flip chain.
+ *
+ * Also creates the presenter's staging surfaces and, with RenderScale above
+ * 1, the 480-line HUD surface.
+ *
+ * @param [in] directDraw The DirectDraw object.
+ * @param [in,out] surfaceDescription The game's DDSURFACEDESC of the flip
+ *                 chain; restored after the call.
+ * @param [out] surface Receives the real primary surface.
+ * @param [in] outer Passed on to DirectDraw.
+ * @return The result of creating the surfaces.
+ */
 static HRESULT CreateVirtualPrimary(
     LPVOID directDraw,
     LPVOID surfaceDescription,
@@ -2078,6 +2651,14 @@ static HRESULT CreateVirtualPrimary(
     return result;
 }
 
+/**
+ * Replaces the surface's Release: frees the virtual back buffer, the HUD
+ * and staging surfaces and the filters with the last reference to the
+ * virtual primary.
+ *
+ * @param [in] surface The surface.
+ * @return The remaining reference count.
+ */
 static ULONG WINAPI HookedSurfaceRelease(LPVOID surface)
 {
     ULONG count = g_originalSurfaceRelease(surface);
@@ -2127,6 +2708,16 @@ static ULONG WINAPI HookedSurfaceRelease(LPVOID surface)
     return count;
 }
 
+/**
+ * Replaces the surface's GetAttachedSurface: gives the game the virtual
+ * back buffer as the back buffer of the virtual primary.
+ *
+ * @param [in] surface The surface.
+ * @param [in] capabilities The DDSCAPS asked for.
+ * @param [out] attached Receives the attached surface.
+ * @return The result of GetAttachedSurface, or S_OK for the virtual back
+ *         buffer.
+ */
 static HRESULT WINAPI HookedSurfaceGetAttached(
     LPVOID surface,
     LPVOID capabilities,
@@ -2154,6 +2745,13 @@ static HRESULT WINAPI HookedSurfaceGetAttached(
 
 static void AppendDecimal(CHAR* message, DWORD* length, DWORD value);
 
+/**
+ * Logs a saved image and its size.
+ *
+ * @param [in] fileName The file name.
+ * @param [in] width The width.
+ * @param [in] height The height.
+ */
 static void LogSavedImage(const CHAR* fileName, DWORD width, DWORD height)
 {
     CHAR message[MAX_PATH + 64];
@@ -2173,8 +2771,10 @@ static void LogSavedImage(const CHAR* fileName, DWORD width, DWORD height)
     LogMessage(message, length);
 }
 
-// Diagnostic: F12 saves the game's own frame, the 8-bit virtual back buffer
-// before any filter or scaling, as RoadRashFrame.bmp.
+/**
+ * Diagnostic for F12: saves the game's own frame, the 8-bit virtual back
+ * buffer before any filter or scaling, as RoadRashFrame.bmp.
+ */
 static void DumpVirtualBackBuffer()
 {
     LPVOID* backVtable = GetVtable(g_virtualBack);
@@ -2231,9 +2831,13 @@ static void DumpVirtualBackBuffer()
         backVtable[kSurfaceUnlockVtableIndex])(g_virtualBack, NULL);
 }
 
-// F12 also saves exactly what is on screen: the primary surface after the
-// present, at the display resolution with filter, scanlines and overlay, as
-// the next free RoadRashScreen###.bmp.
+/**
+ * F12 also saves exactly what is on screen: the primary surface after the
+ * present, at the display resolution with filter, scanlines and overlay,
+ * as the next free RoadRashScreen###.bmp.
+ *
+ * @param [in] primary The real primary surface.
+ */
 static void CaptureScreen(LPVOID primary)
 {
     LPVOID* vtable = GetVtable(primary);
@@ -2306,6 +2910,11 @@ static void CaptureScreen(LPVOID primary)
         vtable[kSurfaceUnlockVtableIndex])(primary, NULL);
 }
 
+/**
+ * Waits for the vertical blank before a present, with WaitForVBlank.
+ *
+ * The result is ignored so an unsupported wait never blocks the present.
+ */
 static void WaitBeforePresent()
 {
     if (g_waitForVerticalBlank && g_hookState.object != NULL)
@@ -2320,6 +2929,13 @@ static void WaitBeforePresent()
     }
 }
 
+/**
+ * Appends a number in decimal.
+ *
+ * @param [in,out] message The text.
+ * @param [in,out] length The length of the text.
+ * @param [in] value The number.
+ */
 static void AppendDecimal(CHAR* message, DWORD* length, DWORD value)
 {
     CHAR digits[10];
@@ -2338,16 +2954,28 @@ static void AppendDecimal(CHAR* message, DWORD* length, DWORD value)
     }
 }
 
-// Points in time of one virtual present.
+/** Points in time of one virtual present. */
 struct FrameTiming
 {
+    /** The present began. */
     LARGE_INTEGER start;
+    /** The frame was converted (palette, filter, overlay). */
     LARGE_INTEGER converted;
+    /** The vertical-blank wait ended. */
     LARGE_INTEGER waited;
+    /** The present blit ended. */
     LARGE_INTEGER presented;
 };
 
-// 32-bit arithmetic only: 64-bit division would need the C runtime.
+/**
+ * Gives the time between two performance counter values.
+ *
+ * 32-bit arithmetic only: 64-bit division would need the C runtime.
+ *
+ * @param [in] from The earlier value.
+ * @param [in] to The later value.
+ * @return The microseconds between them, or 0 without a usable counter.
+ */
 static DWORD ElapsedMicroseconds(LARGE_INTEGER from, LARGE_INTEGER to)
 {
     static LARGE_INTEGER frequency;
@@ -2374,6 +3002,14 @@ static DWORD ElapsedMicroseconds(LARGE_INTEGER from, LARGE_INTEGER to)
     return microseconds > 0 ? static_cast<DWORD>(microseconds) : 0;
 }
 
+/**
+ * Appends a name and a number.
+ *
+ * @param [in,out] message The text.
+ * @param [in,out] length The length of the text.
+ * @param [in] name The name.
+ * @param [in] value The number.
+ */
 static void AppendTimingField(
     CHAR* message,
     DWORD* length,
@@ -2385,10 +3021,17 @@ static void AppendTimingField(
     AppendDecimal(message, length, value);
 }
 
-// Logs, once per filter (kFilterNone is the 8-bit path), where the time of a
-// frame goes, averaged over 300 frames (or 10 seconds): the game's own work between
-// presents, the conversion (palette, filter, overlay), the vertical-blank
-// wait, and the present blit.
+/**
+ * Records where the time of a frame goes, and logs the averages once per
+ * filter.
+ *
+ * The averages over 300 frames (or 10 seconds) of the game's own work
+ * between presents, the conversion (palette, filter, overlay), the
+ * vertical-blank wait, and the present blit.
+ *
+ * @param [in] slot The filter; kFilterNone is the 8-bit path.
+ * @param [in] timing The points in time of this present.
+ */
 static void RecordFrameTiming(DWORD slot, const FrameTiming* timing)
 {
     static const DWORD kFrames = 300;
@@ -2452,16 +3095,24 @@ static void RecordFrameTiming(DWORD slot, const FrameTiming* timing)
     LogMessage(message, length);
 }
 
-// Converts the 8-bit virtual frame to 32 bits through the game palette,
-// applies the active filter, and stretches the result onto the primary.
-//
-// With DirectPresent=1, a filter whose output has the display size writes
-// straight into the locked primary after the vertical blank, which saves
-// copying the frame from system memory to the graphics card (8 ms per
-// frame at 1920x1080 on a Windows 98 PC). Filtering top to bottom faster
-// than the display refreshes stays ahead of the beam, so it does not tear.
-// Scanlines read the frame back, which is slow from video memory, so they
-// keep the staging surface.
+/**
+ * Presents a frame through the 32-bit presenter.
+ *
+ * Converts the 8-bit virtual frame to 32 bits through the game palette,
+ * applies the active filter, and stretches the result onto the primary.
+ *
+ * With DirectPresent=1, a filter whose output has the display size writes
+ * straight into the locked primary after the vertical blank, which saves
+ * copying the frame from system memory to the graphics card (8 ms per
+ * frame at 1920x1080 on a Windows 98 PC). Filtering top to bottom faster
+ * than the display refreshes stays ahead of the beam, so it does not tear.
+ * Scanlines read the frame back, which is slow from video memory, so they
+ * keep the staging surface.
+ *
+ * @param [in] primary The real primary surface.
+ * @param [in,out] timing Receives the points in time after start.
+ * @return The result of the present.
+ */
 static HRESULT PresentFilteredFrame(LPVOID primary, FrameTiming* timing)
 {
     BYTE palette[1024];
@@ -2724,9 +3375,11 @@ static HRESULT PresentFilteredFrame(LPVOID primary, FrameTiming* timing)
     return result;
 }
 
-// 8-bit path: draws the overlay (frame rate and/or filter name) into the
-// virtual back buffer, which the game redraws completely every frame, right
-// before it is presented.
+/**
+ * 8-bit path: draws the overlay (frame rate and/or filter name) into the
+ * virtual back buffer, which the game redraws completely every frame, right
+ * before it is presented.
+ */
 static void DrawOverlayOnBackBuffer()
 {
     BYTE palette[1024];
@@ -2764,6 +3417,18 @@ static void DrawOverlayOnBackBuffer()
         backVtable[kSurfaceUnlockVtableIndex])(g_virtualBack, NULL);
 }
 
+/**
+ * Replaces the surface's Flip: presents the virtual back buffer of a race.
+ *
+ * Through the 32-bit presenter, or in the 8-bit path stretched onto the
+ * primary. Also handles F11 (the next filter) and F12 (the game's frame and
+ * the screen as BMP files), and records the frame timing.
+ *
+ * @param [in] surface The surface to flip.
+ * @param [in] target Passed on to DirectDraw.
+ * @param [in] flags Passed on to DirectDraw.
+ * @return The result of the present.
+ */
 static HRESULT WINAPI HookedSurfaceFlip(
     LPVOID surface,
     LPVOID target,
@@ -2895,6 +3560,14 @@ static HRESULT WINAPI HookedSurfaceFlip(
     return result;
 }
 
+/**
+ * Replaces the surface's GetFlipStatus and logs the first calls for the
+ * virtual primary.
+ *
+ * @param [in] surface The surface.
+ * @param [in] flags Passed on to DirectDraw.
+ * @return The result of GetFlipStatus.
+ */
 static HRESULT WINAPI HookedSurfaceGetFlipStatus(LPVOID surface, DWORD flags)
 {
     HRESULT result = g_originalSurfaceGetFlipStatus(surface, flags);
@@ -2911,6 +3584,12 @@ static HRESULT WINAPI HookedSurfaceGetFlipStatus(LPVOID surface, DWORD flags)
     return result;
 }
 
+/**
+ * Puts the Flip hook back into the surface vtable when DirectDraw rebuilt
+ * it (Windows 8 and newer do when the display mode changes).
+ *
+ * @param [in] surface The virtual primary.
+ */
 static void EnsureFlipHook(LPVOID surface)
 {
     LPVOID* vtable = *reinterpret_cast<LPVOID**>(surface);
@@ -2945,6 +3624,13 @@ static void EnsureFlipHook(LPVOID surface)
         sizeof("The surface Flip slot had been replaced; re-installed the Flip hook.\r\n") - 1);
 }
 
+/**
+ * Replaces the surface's IsLost: checks the Flip hook of the virtual
+ * primary and logs the first calls.
+ *
+ * @param [in] surface The surface.
+ * @return The result of IsLost.
+ */
 static HRESULT WINAPI HookedSurfaceIsLost(LPVOID surface)
 {
     HRESULT result = g_originalSurfaceIsLost(surface);
@@ -2974,6 +3660,13 @@ static HRESULT WINAPI HookedSurfaceIsLost(LPVOID surface)
     return result;
 }
 
+/**
+ * Hooks Release, Flip, GetAttachedSurface, GetFlipStatus and IsLost in the
+ * surface vtable (once), and passes every new surface on to the native
+ * menus.
+ *
+ * @param [in] surface The new surface, or NULL.
+ */
 static void InstallSurfaceHooks(LPVOID surface)
 {
     LPVOID* vtable;
@@ -3044,6 +3737,21 @@ static void InstallSurfaceHooks(LPVOID surface)
     NativeMenusWatchSurface(surface);
 }
 
+/**
+ * Replaces IDirectDraw::CreateSurface.
+ *
+ * The race's primary flip chain becomes the real primary and the virtual
+ * back buffer. The game's offscreen surfaces go to system memory too, next
+ * to the back buffer they are drawn into. With the 32-bit presenter they
+ * also must stay 8-bit palettized; in the 8-bit path they keep the display
+ * format.
+ *
+ * @param [in] directDraw The DirectDraw object.
+ * @param [in] surfaceDescription The game's DDSURFACEDESC.
+ * @param [out] surface Receives the surface.
+ * @param [in] outer Passed on to DirectDraw.
+ * @return The result of CreateSurface.
+ */
 static HRESULT WINAPI HookedCreateSurface(
     LPVOID directDraw,
     LPVOID surfaceDescription,
@@ -3143,10 +3851,19 @@ static HRESULT WINAPI HookedCreateSurface(
 }
 
 
-// The menus set 640x480x8 and then 640x480x16 (FUN_004485D0). With native
-// menus the first step is skipped and the second sets the native
-// resolution at 16 bits, with the menu in its middle (native_menus.cpp).
-// E_NOTIMPL: the native resolution is unavailable, use the original mode.
+/**
+ * Sets the display mode of the native menus.
+ *
+ * The menus set 640x480x8 and then 640x480x16 (FUN_004485D0). With native
+ * menus the first step is skipped and the second sets the native
+ * resolution at 16 bits, with the menu in its middle (native_menus.cpp).
+ *
+ * @param [in] directDraw The DirectDraw object.
+ * @param [in] caller The return address of the game's call.
+ * @param [in] bitsPerPixel The bits per pixel the game asked for.
+ * @return The result of SetDisplayMode, or E_NOTIMPL when the native
+ *         resolution is unavailable and the original mode is to be used.
+ */
 static HRESULT SetNativeMenuMode(
     LPVOID directDraw,
     DWORD caller,
@@ -3192,6 +3909,20 @@ static HRESULT SetNativeMenuMode(
     return E_NOTIMPL;
 }
 
+/**
+ * Replaces IDirectDraw::SetDisplayMode.
+ *
+ * For a race (640x480x8 from the game's race setup) the real display mode
+ * becomes the native one (or 1920x1080, or 720x480, or the original) with
+ * the virtual back buffer; for the menus the native menus or the original
+ * mode.
+ *
+ * @param [in] directDraw The DirectDraw object.
+ * @param [in] width The width the game asked for.
+ * @param [in] height The height the game asked for.
+ * @param [in] bitsPerPixel The bits per pixel the game asked for.
+ * @return The result of SetDisplayMode.
+ */
 static HRESULT WINAPI HookedSetDisplayMode(
     LPVOID directDraw,
     DWORD width,
@@ -3613,20 +4344,38 @@ void LogProxyAttach(HMODULE proxy)
     LogMessage(message, length);
 }
 
-// Crash diagnostics: an exception that nothing in the game handles is
-// written to the log (code, address, module, registers, top of the stack)
-// before Windows deals with it as usual. The filter is set when the DLL is
-// loaded and again when the game creates DirectDraw, in case the game set
-// its own filter in between; the previous filter is called afterwards.
+/**
+ * The exception filter that was set before LogUnhandledException.
+ *
+ * Crash diagnostics: an exception that nothing in the game handles is
+ * written to the log (code, address, module, registers, top of the stack)
+ * before Windows deals with it as usual. The filter is set when the DLL is
+ * loaded and again when the game creates DirectDraw, in case the game set
+ * its own filter in between; the previous filter is called afterwards.
+ */
 static LPTOP_LEVEL_EXCEPTION_FILTER g_previousExceptionFilter = NULL;
+/** TRUE once an exception was written to the log. */
 static BOOL g_exceptionLogged = FALSE;
 
-// The game's C++ runtime sets its own filter between the two calls and
-// keeps this one as its previous filter (0x49E80C, called at 0x45F738), so
-// the two filters call each other. Entered again, this filter returns at
-// once and the crash ends as usual instead of in a stack overflow.
+/**
+ * Nonzero while LogUnhandledException runs.
+ *
+ * The game's C++ runtime sets its own filter between the two calls and
+ * keeps this one as its previous filter (0x49E80C, called at 0x45F738), so
+ * the two filters call each other. Entered again, the filter returns at
+ * once and the crash ends as usual instead of in a stack overflow.
+ */
 static volatile LONG g_inExceptionFilter = 0;
 
+/**
+ * Gives the module that holds an address.
+ *
+ * @param [in] address The address.
+ * @param [out] name Receives the file name of the module, or
+ *              "(no module)".
+ * @param [in] size The size of name.
+ * @param [out] base Receives the module base, or 0.
+ */
 static void DescribeModule(DWORD address, CHAR* name, DWORD size, DWORD* base)
 {
     MEMORY_BASIC_INFORMATION memory;
@@ -3666,6 +4415,12 @@ static void DescribeModule(DWORD address, CHAR* name, DWORD size, DWORD* base)
     }
 }
 
+/**
+ * Writes an unhandled exception to the log and calls the previous filter.
+ *
+ * @param [in] pointers The exception and its context.
+ * @return The previous filter's result, or EXCEPTION_CONTINUE_SEARCH.
+ */
 static LONG WINAPI LogUnhandledException(EXCEPTION_POINTERS* pointers)
 {
     LONG result = EXCEPTION_CONTINUE_SEARCH;
@@ -3751,6 +4506,14 @@ void InstallCrashLog()
     }
 }
 
+/**
+ * Gives a vtable slot its original value back, unless something else
+ * changed it since.
+ *
+ * @param [in,out] slot The slot.
+ * @param [in] hook The hook that should be in it.
+ * @param [in] original The original value.
+ */
 static void RestoreSlot(LPVOID* slot, LPVOID hook, LPVOID original)
 {
     DWORD oldProtection;

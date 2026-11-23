@@ -1,5 +1,39 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
-// Copyright (C) 2026 Alexander Schmidt
+/**
+ * Fades the farthest road segments into a haze, so new segments do not pop
+ * in whole at the end of the draw distance.
+ *
+ * The road ahead is drawn slice by slice from far to near (FUN_00443AF0):
+ * FUN_00443CD0 adds the slice's world objects and FUN_00443B40 its road
+ * and scenery to the quad list (0xA8-byte quads from 0x49E66C, write
+ * pointer 0x49E660). FUN_00450420 rasterizes the list when it is full and
+ * at the end of the frame (FUN_0040FF40, then FUN_0044D300), with the
+ * current quad's list node (quad + 0x68) at 0x4C5D88. Textured quads are
+ * drawn span by span through the function at 0x484278 (destination at
+ * 0x4C5D50), flat ones through FUN_0044DB30.
+ *
+ * Wrappers around the two slice functions tag every quad they add with the
+ * haze level of its slice. The span and fill wrappers draw the pixels of
+ * hazy quads through a palette remap toward a haze color: for each level
+ * and palette entry, the entry closest to the blend of the two. The haze
+ * color is the average of the track's sky panorama (sky and distant land).
+ * The haze grows from the first of the farthest fadeSegments segments to
+ * 3/4 in the farthest one, so new segments appear out of the haze.
+ *
+ * Smooth haze (a 32-bit filter and RenderScale above 1): the remap can only
+ * pick among the 256 palette colors, so the haze shows in steps. Instead,
+ * hazy pixels keep their own color and their level goes into a plane laid
+ * out like the frame (the rasterizer's destination is base 0x4B7EC0 +
+ * y * pitch 0x4B7EC4 + x). Pixels that nearer quads draw over get level 0
+ * again; transparent texels, which a span leaves unchanged, keep the level
+ * of what lies behind them. The filter looks up each hazy pixel in a table
+ * of the palette blended toward the haze color (DistanceFadePrepareFrame),
+ * and the levels are cleared after the frame.
+ *
+ * @file distance_fade.cpp
+ * @author Alexander Schmidt
+ * @copyright Copyright (C) 2026 Alexander Schmidt
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ */
 
 #include "distance_fade.h"
 #include "draw_distance.h"
@@ -9,143 +43,210 @@
 
 #pragma intrinsic(__stosb, __movsb)
 
-// The road ahead is drawn slice by slice from far to near (FUN_00443AF0):
-// FUN_00443CD0 adds the slice's world objects and FUN_00443B40 its road
-// and scenery to the quad list (0xA8-byte quads from 0x49E66C, write
-// pointer 0x49E660). FUN_00450420 rasterizes the list when it is full and
-// at the end of the frame (FUN_0040FF40, then FUN_0044D300), with the
-// current quad's list node (quad + 0x68) at 0x4C5D88. Textured quads are
-// drawn span by span through the function at 0x484278 (destination at
-// 0x4C5D50), flat ones through FUN_0044DB30.
-//
-// Wrappers around the two slice functions tag every quad they add with the
-// haze level of its slice. The span and fill wrappers draw the pixels of
-// hazy quads through a palette remap toward a haze color: for each level
-// and palette entry, the entry closest to the blend of the two. The haze
-// color is the average of the track's sky panorama (sky and distant land).
-// The haze grows from the first of the farthest fadeSegments segments to
-// 3/4 in the farthest one, so new segments appear out of the haze.
-//
-// Smooth haze (a 32-bit filter and RenderScale above 1): the remap can only
-// pick among the 256 palette colors, so the haze shows in steps. Instead,
-// hazy pixels keep their own color and their level goes into a plane laid
-// out like the frame (the rasterizer's destination is base 0x4B7EC0 +
-// y * pitch 0x4B7EC4 + x). Pixels that nearer quads draw over get level 0
-// again; transparent texels, which a span leaves unchanged, keep the level
-// of what lies behind them. The filter looks up each hazy pixel in a table
-// of the palette blended toward the haze color (DistanceFadePrepareFrame),
-// and the levels are cleared after the frame.
-
+/**
+ * The preferred load address of ROADRASH.EXE, which its absolute addresses
+ * assume.
+ */
 static const DWORD kImageBase = 0x00400000;
+/** The size of a quad in the quad list in bytes. */
 static const DWORD kQuadSize = 0xA8;
+/** The offset of a quad's list node in the quad. */
 static const DWORD kNodeOffset = 0x68;
+/** The size of a road slice in bytes. */
 static const DWORD kSliceSize = 0x224;
+/** The largest number of quads tagged per list. */
 static const DWORD kMaxQuads = 8192;
-// The widest frame row: 1280 virtual pixels at RenderScale 4.
+/** The widest frame row: 1280 virtual pixels at RenderScale 4. */
 static const DWORD kMaxSpan = 5120;
+/** The most frame rows: 480 at RenderScale 4. */
 static const DWORD kMaxFrameRows = 1920;
+/** The number of remap levels, including the unused level 0. */
 static const DWORD kHazeSteps = 16;
+/** The haze level of the farthest segment, in sixteenths (3/4). */
 static const DWORD kMaxHaze = 12;
 
+/** The start of the quad list (0x49E66C). */
 static const DWORD kQuadListBaseVa = 0x0049E66C;
+/** The write pointer of the quad list (0x49E660). */
 static const DWORD kQuadListWriteVa = 0x0049E660;
+/** The list node of the quad being rasterized (0x4C5D88). */
 static const DWORD kCurrentNodeVa = 0x004C5D88;
+/** The pointer to the span function of textured quads (0x484278). */
 static const DWORD kSpanFunctionVa = 0x00484278;
+/** The destination of the next span (0x4C5D50). */
 static const DWORD kSpanDestinationVa = 0x004C5D50;
+/** The palette loaded for the track (0x4B8490), 256 entries of four bytes. */
 static const DWORD kLoadedPaletteVa = 0x004B8490;
+/** The surface of the first half of the sky panorama. */
 static const DWORD kSkySurfaceAVa = 0x00475418;
+/** The surface of the second half of the sky panorama. */
 static const DWORD kSkySurfaceBVa = 0x0047541C;
+/** The first pixel of the frame the rasterizer draws into (0x4B7EC0). */
 static const DWORD kFrameBaseVa = 0x004B7EC0;
+/** The bytes per row of that frame (0x4B7EC4). */
 static const DWORD kFramePitchVa = 0x004B7EC4;
 
+/** FUN_00443CD0, which adds a slice's world objects to the quad list. */
 static const DWORD kObjectsFunctionRva = 0x00043CD0;
+/** FUN_00443B40, which adds a slice's road and scenery to the quad list. */
 static const DWORD kRoadFunctionRva = 0x00043B40;
+/** FUN_0040FF40, called before the quad list is rasterized. */
 static const DWORD kListBuildFunctionRva = 0x0000FF40;
+/** FUN_0044DB30, which fills a span of a flat quad. */
 static const DWORD kFillFunctionRva = 0x0004DB30;
+/** The call dword ptr [0x484278] that draws a span of a textured quad. */
 static const DWORD kSpanCallRva = 0x000188E4;
 
-// DirectDraw interface slots and surface description fields.
+/** The vtable slot of IDirectDrawSurface::Lock. */
 static const DWORD kSurfaceLockIndex = 25;
+/** The vtable slot of IDirectDrawSurface::Unlock. */
 static const DWORD kSurfaceUnlockIndex = 32;
+/** The size of DDSURFACEDESC in bytes. */
 static const DWORD kDescriptionSize = 0x6C;
+/** The offset of dwHeight in DDSURFACEDESC. */
 static const DWORD kDescriptionHeight = 0x08;
+/** The offset of dwWidth in DDSURFACEDESC. */
 static const DWORD kDescriptionWidth = 0x0C;
+/** The offset of lPitch in DDSURFACEDESC. */
 static const DWORD kDescriptionPitch = 0x10;
+/** The offset of lpSurface in DDSURFACEDESC. */
 static const DWORD kDescriptionSurface = 0x24;
+/** DDLOCK_WAIT | DDLOCK_READONLY. */
 static const DWORD kLockWaitReadOnly = 0x00000011;
 
+/** A call in the game's code and the function it calls. */
 struct CallSite
 {
+    /** The relative address of the E8 call. */
     DWORD rva;
+    /** The relative address of the function it calls. */
     DWORD target;
 };
 
+/** The calls of FUN_00443CD0 in the slice loop. */
 static const CallSite kObjectsCalls[] = { { 0x00043B03, 0x00043CD0 }, { 0x00043B10, 0x00043CD0 } };
+/** The calls of FUN_00443B40 in the slice loop. */
 static const CallSite kRoadCalls[] = { { 0x00043B1B, 0x00043B40 }, { 0x00043B2A, 0x00043B40 } };
+/** The call of FUN_0040FF40 in FUN_00450420. */
 static const CallSite kListBuildCall = { 0x00050450, 0x0000FF40 };
+/** The calls of FUN_0044DB30 in the flat rasterizer. */
 static const CallSite kFillCalls[] = { { 0x0004D698, 0x0004DB30 }, { 0x0004DAC0, 0x0004DB30 } };
 
+/** A slice function: FUN_00443CD0 or FUN_00443B40. */
 typedef void (__fastcall *SliceFn)(BYTE* slice);
+/** FUN_0040FF40. */
 typedef DWORD (__fastcall *ListBuildFn)(DWORD list);
+/** The span function of textured quads. */
 typedef void (__fastcall *SpanFn)(int count, DWORD u, DWORD a3, DWORD a4, DWORD a5);
+/** The span fill of flat quads, FUN_0044DB30. */
 typedef void (__fastcall *FillFn)(int count, DWORD color, BYTE* destination);
+/** IDirectDrawSurface::Lock. */
 typedef HRESULT (WINAPI *LockFn)(LPVOID, LPVOID, LPVOID, DWORD, HANDLE);
+/** IDirectDrawSurface::Unlock. */
 typedef HRESULT (WINAPI *UnlockFn)(LPVOID, LPVOID);
 
+/** Module base of ROADRASH.EXE. */
 static DWORD g_base = 0;
+/** The slice array the game draws from. */
 static BYTE* g_slices = NULL;
+/** The number of segments the game draws ahead. */
 static DWORD g_segments = 0;
+/** The number of farthest segments that fade; 0 when off. */
 static DWORD g_fadeSegments = 0;
+/** The haze level of every quad in the list, by its index. */
 static BYTE g_tags[kMaxQuads];
+/** The first quad not yet tagged. */
 static BYTE* g_tagStart = NULL;
+/** The haze level of the slice being added to the list. */
 static BYTE g_currentLevel = 0;
+/** The row buffer a hazy span is drawn into. */
 static BYTE g_row[kMaxSpan];
 
-// The palette the remap was built for, the sky it took the haze from, and
-// the remap per haze level (level 0 unused).
+/** The palette the remap was built for. */
 static BYTE g_palette[1024];
+/** The first sky half the haze color was taken from. */
 static LPVOID g_hazeSkyA = NULL;
+/** The second sky half the haze color was taken from. */
 static LPVOID g_hazeSkyB = NULL;
+/** TRUE once the remap was built. */
 static BOOL g_remapReady = FALSE;
+/**
+ * The remap per haze level (level 0 unused): the palette entry closest to
+ * each entry blended toward the haze color.
+ */
 static BYTE g_remap[kHazeSteps][256];
-// How often each palette index occurs in the sky panorama, for the haze
-// color in the displayed palette.
+/**
+ * How often each palette index occurs in the sky panorama, for the haze
+ * color in the displayed palette.
+ */
 static DWORD g_skyCounts[256];
+/** The number of sky pixels counted in g_skyCounts. */
 static DWORD g_skyTotal = 0;
 
-// Smooth haze: wanted for this race, and the level plane for the frame at
-// g_frameBase (g_framePitch bytes per row, g_frameRows rows) once it is
-// known. g_hazeRows marks the rows that hold haze, from g_firstHazeRow to
-// g_lastHazeRow.
+/** TRUE when the smooth haze is wanted for this race. */
 static BOOL g_smoothWanted = FALSE;
+/** The level plane, laid out like the frame at g_frameBase, or NULL. */
 static BYTE* g_levels = NULL;
+/** The size of the level plane in bytes. */
 static DWORD g_levelBytes = 0;
+/** The frame the level plane belongs to, once it is known. */
 static const BYTE* g_frameBase = NULL;
+/** The bytes per row of the frame and the level plane. */
 static LONG g_framePitch = 0;
+/** The number of rows of the frame and the level plane. */
 static DWORD g_frameRows = 0;
+/** Nonzero for the rows that hold haze. */
 static BYTE g_hazeRows[kMaxFrameRows];
+/** The first row marked in g_hazeRows. */
 static LONG g_firstHazeRow = 0x7FFFFFFF;
+/** The last row marked in g_hazeRows, or -1 for none. */
 static LONG g_lastHazeRow = -1;
+/** The colors of each haze level and palette index for the filters. */
 static DWORD g_hazeRgb[kHazeTableSize];
+/** The haze handed to the filter for this frame. */
 static HazeFrame g_hazeFrame;
 
+/**
+ * Converts an address of the game's image to the loaded module.
+ *
+ * @param [in] va The address for the preferred image base.
+ * @return The address in the loaded module.
+ */
 static DWORD GameVa(DWORD va)
 {
     return g_base - kImageBase + va;
 }
 
+/**
+ * Gives a variable of the game.
+ *
+ * @tparam T The type of the variable.
+ * @param [in] va The address for the preferred image base.
+ * @return The variable in the loaded module.
+ */
 template <typename T>
 static T& GameVariable(DWORD va)
 {
     return *reinterpret_cast<T*>(GameVa(va));
 }
 
+/**
+ * Gives the vtable of a COM object.
+ *
+ * @param [in] object The object.
+ * @return Its vtable.
+ */
 static LPVOID* Vtable(LPVOID object)
 {
     return *reinterpret_cast<LPVOID**>(object);
 }
 
-// The haze level (0 = none, up to kMaxHaze of 16) of a slice.
+/**
+ * Gives the haze level of a slice.
+ *
+ * @param [in] slice The slice in the game's slice array.
+ * @return 0 for none, up to kMaxHaze (in sixteenths).
+ */
 static BYTE LevelForSlice(const BYTE* slice)
 {
     LONG index = static_cast<LONG>(slice - g_slices) / static_cast<LONG>(kSliceSize);
@@ -161,7 +262,7 @@ static BYTE LevelForSlice(const BYTE* slice)
         (static_cast<LONG>(kMaxHaze) * (fade + 1 - fromEnd) + fade / 2) / fade);
 }
 
-// Tags the quads added since the last call with the current level.
+/** Tags the quads added since the last call with the current level. */
 static void TagPending()
 {
     BYTE* base = GameVariable<BYTE*>(kQuadListBaseVa);
@@ -186,6 +287,11 @@ static void TagPending()
     g_tagStart = end;
 }
 
+/**
+ * Gives the haze level of the quad being rasterized.
+ *
+ * @return The level, or 0 for none or when the remap is not ready.
+ */
 static BYTE CurrentQuadLevel()
 {
     BYTE* node = GameVariable<BYTE*>(kCurrentNodeVa);
@@ -201,7 +307,17 @@ static BYTE CurrentQuadLevel()
     return index < kMaxQuads ? g_tags[index] : 0;
 }
 
-// Adds the colors of one sky panorama half to the sums.
+/**
+ * Adds the colors of one sky panorama half to the sums.
+ *
+ * Every second pixel of every second row is counted.
+ *
+ * @param [in] surface The sky surface, or NULL.
+ * @param [in] palette 256 palette entries of four bytes.
+ * @param [in,out] sums The sums of red, green and blue.
+ * @param [in,out] count The number of pixels counted.
+ * @param [in,out] counts The number of pixels counted per palette index.
+ */
 static void AddSkyColors(
     LPVOID surface, const BYTE* palette, DWORD* sums, DWORD* count, DWORD* counts)
 {
@@ -258,10 +374,13 @@ static void AddSkyColors(
     reinterpret_cast<UnlockFn>(Vtable(surface)[kSurfaceUnlockIndex])(surface, NULL);
 }
 
-// Rebuilds the remap when the track's palette or sky changed. The palette
-// is the one loaded for the track (0x4B8490), not the displayed one, which
-// the game fades in and out: a remap for the loaded palette also fits its
-// faded versions, which scale every entry alike.
+/**
+ * Rebuilds the remap when the track's palette or sky changed.
+ *
+ * The palette is the one loaded for the track (0x4B8490), not the displayed
+ * one, which the game fades in and out: a remap for the loaded palette also
+ * fits its faded versions, which scale every entry alike.
+ */
 static void UpdateRemap()
 {
     const BYTE* loaded = reinterpret_cast<const BYTE*>(GameVa(kLoadedPaletteVa));
@@ -351,6 +470,13 @@ static void UpdateRemap()
     }
 }
 
+/**
+ * Calls a slice function and tags the quads it adds with the slice's
+ * level.
+ *
+ * @param [in] rva The slice function.
+ * @param [in] slice The slice.
+ */
 static void CallSlice(DWORD rva, BYTE* slice)
 {
     TagPending();
@@ -360,19 +486,35 @@ static void CallSlice(DWORD rva, BYTE* slice)
     g_currentLevel = 0;
 }
 
+/**
+ * Replaces the calls of FUN_00443CD0: adds the slice's objects, tagged.
+ *
+ * @param [in] slice The slice.
+ */
 static void __fastcall HookedObjects(BYTE* slice)
 {
     CallSlice(kObjectsFunctionRva, slice);
 }
 
+/**
+ * Replaces the calls of FUN_00443B40: adds the slice's road, tagged.
+ *
+ * @param [in] slice The slice.
+ */
 static void __fastcall HookedRoad(BYTE* slice)
 {
     CallSlice(kRoadFunctionRva, slice);
 }
 
-// The list is about to be drawn: tag what is still untagged and make sure
-// the remap fits the palette. Afterwards the game starts the list over at
-// its base.
+/**
+ * Replaces the call of FUN_0040FF40, before the list is drawn.
+ *
+ * Tags what is still untagged and makes sure the remap fits the palette.
+ * Afterwards the game starts the list over at its base.
+ *
+ * @param [in] list Passed on to the game.
+ * @return The game's result.
+ */
 static DWORD __fastcall HookedListBuild(DWORD list)
 {
     DWORD result;
@@ -384,9 +526,16 @@ static DWORD __fastcall HookedListBuild(DWORD list)
     return result;
 }
 
-// The levels of the count pixels from destination on, when the game draws
-// into the frame of the level plane and they lie within one of its rows;
-// otherwise NULL.
+/**
+ * Gives the levels of the pixels the game draws into.
+ *
+ * @param [in] destination The first pixel drawn.
+ * @param [in] count The number of pixels drawn.
+ * @param [out] row Receives the frame row of destination.
+ * @return The levels of the pixels, when the game draws into the frame of
+ *         the level plane and they lie within one of its rows; otherwise
+ *         NULL.
+ */
 static BYTE* LevelsAt(const BYTE* destination, int count, LONG* row)
 {
     const BYTE* base;
@@ -418,6 +567,11 @@ static BYTE* LevelsAt(const BYTE* destination, int count, LONG* row)
     return g_levels + offset;
 }
 
+/**
+ * Marks a frame row as holding haze.
+ *
+ * @param [in] row The row.
+ */
 static void MarkHazeRow(LONG row)
 {
     g_hazeRows[row] = 1;
@@ -432,6 +586,13 @@ static void MarkHazeRow(LONG row)
     }
 }
 
+/**
+ * Tells whether any of some pixels has haze.
+ *
+ * @param [in] levels The levels of the pixels.
+ * @param [in] count The number of pixels.
+ * @return TRUE when a level is not 0.
+ */
 static BOOL AnyLevel(const BYTE* levels, int count)
 {
     int index;
@@ -447,9 +608,22 @@ static BOOL AnyLevel(const BYTE* levels, int count)
     return FALSE;
 }
 
-// Lets the span draw into the row buffer, which starts as a copy of the
-// frame, so the pixels it changed can be told from those it left out
-// (transparent texels).
+/**
+ * Lets a span draw into the row buffer instead of the frame.
+ *
+ * The buffer starts as a copy of the frame, so the pixels the span changed
+ * can be told from those it left out (transparent texels).
+ *
+ * @param [in] span The game's span function.
+ * @param [in] count The number of pixels.
+ * @param [in] u Passed on to the span function.
+ * @param [in] a3 Passed on to the span function.
+ * @param [in] a4 Passed on to the span function.
+ * @param [in] a5 Passed on to the span function.
+ * @param [in,out] destinationVariable The game's span destination, pointed
+ *                 to the buffer during the call.
+ * @param [in] destination The frame pixels the span draws over.
+ */
 static void DrawSpanToRow(
     SpanFn span, int count, DWORD u, DWORD a3, DWORD a4, DWORD a5,
     BYTE** destinationVariable, const BYTE* destination)
@@ -460,6 +634,16 @@ static void DrawSpanToRow(
     *destinationVariable = const_cast<BYTE*>(destination);
 }
 
+/**
+ * Replaces the span call of textured quads: draws hazy pixels through the
+ * remap, or with the smooth haze records their level.
+ *
+ * @param [in] count The number of pixels.
+ * @param [in] u Passed on to the span function.
+ * @param [in] a3 Passed on to the span function.
+ * @param [in] a4 Passed on to the span function.
+ * @param [in] a5 Passed on to the span function.
+ */
 static void __fastcall HookedSpan(int count, DWORD u, DWORD a3, DWORD a4, DWORD a5)
 {
     SpanFn span = GameVariable<SpanFn>(kSpanFunctionVa);
@@ -526,6 +710,14 @@ static void __fastcall HookedSpan(int count, DWORD u, DWORD a3, DWORD a4, DWORD 
     }
 }
 
+/**
+ * Replaces the calls of FUN_0044DB30: fills hazy spans through the remap,
+ * or with the smooth haze records their level.
+ *
+ * @param [in] count The number of pixels.
+ * @param [in] color The palette index to fill with.
+ * @param [out] destination The first pixel.
+ */
 static void __fastcall HookedFill(int count, DWORD color, BYTE* destination)
 {
     BYTE level = CurrentQuadLevel();
@@ -577,8 +769,13 @@ void DistanceFadeSetSmooth(BOOL smooth)
     g_lastHazeRow = -1;
 }
 
-// The haze color in the displayed palette rgb (which the game fades in and
-// out): the sky panorama's average.
+/**
+ * Gives the haze color in the displayed palette (which the game fades in
+ * and out): the sky panorama's average.
+ *
+ * @param [in] rgb 256 X8R8G8B8 colors, one per palette index.
+ * @return The haze color as X8R8G8B8.
+ */
 static DWORD HazeColor(const DWORD* rgb)
 {
     DWORD red = 0;
@@ -719,6 +916,12 @@ BYTE* DistanceFadeLevelsFor(const BYTE* frame, LONG pitch)
     return g_levels;
 }
 
+/**
+ * Reads an unaligned little-endian DWORD.
+ *
+ * @param [in] bytes The four bytes.
+ * @return The value.
+ */
 static DWORD ReadDword(const BYTE* bytes)
 {
     return static_cast<DWORD>(bytes[0]) |
@@ -727,6 +930,12 @@ static DWORD ReadDword(const BYTE* bytes)
         (static_cast<DWORD>(bytes[3]) << 24);
 }
 
+/**
+ * Tells whether a call site holds its original call.
+ *
+ * @param [in] site The call and its expected target.
+ * @return TRUE when the code is an E8 call to the target.
+ */
 static BOOL IsCallTo(const CallSite& site)
 {
     const BYTE* code = reinterpret_cast<const BYTE*>(g_base + site.rva);
@@ -734,6 +943,14 @@ static BOOL IsCallTo(const CallSite& site)
     return code[0] == 0xE8 && ReadDword(code + 1) == site.target - (site.rva + 5);
 }
 
+/**
+ * Overwrites bytes of the game's code.
+ *
+ * @param [in] rva The relative address of the first byte.
+ * @param [in] bytes The new bytes.
+ * @param [in] length The number of bytes.
+ * @return FALSE when the code could not be made writable.
+ */
 static BOOL WriteCode(DWORD rva, const BYTE* bytes, DWORD length)
 {
     BYTE* destination = reinterpret_cast<BYTE*>(g_base + rva);
@@ -756,7 +973,14 @@ static BOOL WriteCode(DWORD rva, const BYTE* bytes, DWORD length)
     return TRUE;
 }
 
-// Writes call <function> at rva, padded with NOPs to length bytes.
+/**
+ * Writes a call of a function into the game's code, padded with NOPs.
+ *
+ * @param [in] rva The relative address of the instruction to replace.
+ * @param [in] function The function to call.
+ * @param [in] length The number of bytes to replace, 5 or 6.
+ * @return FALSE when the code could not be made writable.
+ */
 static BOOL WriteCall(DWORD rva, const void* function, DWORD length)
 {
     BYTE code[6] = { 0xE8, 0, 0, 0, 0, 0x90 };

@@ -1,5 +1,12 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
-// Copyright (C) 2026 Alexander Schmidt
+/**
+ * Resources of ddraw.dll: the version information shown in the file
+ * properties.
+ *
+ * @file ddraw.rc
+ * @author Alexander Schmidt
+ * @copyright Copyright (C) 2026 Alexander Schmidt
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ */
 
 #include "version.h"
 

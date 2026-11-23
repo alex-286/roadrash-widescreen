@@ -1,5 +1,17 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
-// Copyright (C) 2026 Alexander Schmidt
+/**
+ * The DirectDraw proxy: the ddraw.dll the game loads in place of the
+ * system one.
+ *
+ * Every export forwards to the system DirectDraw library, or to the library
+ * named by ChainDll. DirectDrawCreate also installs the widescreen hooks
+ * into the new DirectDraw object. Loaded under another name as a plugin,
+ * the DLL takes over the game's DirectDrawCreate import instead.
+ *
+ * @file ddraw_proxy.cpp
+ * @author Alexander Schmidt
+ * @copyright Copyright (C) 2026 Alexander Schmidt
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ */
 
 #include <windows.h>
 #include <unknwn.h>
@@ -12,46 +24,82 @@
 // and NT 4 do); the intrinsic is a plain lock cmpxchg and needs no import.
 #pragma intrinsic(_InterlockedCompareExchange)
 
+/** DirectDrawCreate. */
 typedef HRESULT (WINAPI *DirectDrawCreateFn)(GUID*, LPVOID*, IUnknown*);
+/** DirectDrawCreateEx. */
 typedef HRESULT (WINAPI *DirectDrawCreateExFn)(GUID*, LPVOID*, REFIID, IUnknown*);
+/** DirectDrawEnumerateA. */
 typedef HRESULT (WINAPI *DirectDrawEnumerateAFn)(LPVOID, LPVOID);
+/** DirectDrawEnumerateW. */
 typedef HRESULT (WINAPI *DirectDrawEnumerateWFn)(LPVOID, LPVOID);
+/** DirectDrawEnumerateExA. */
 typedef HRESULT (WINAPI *DirectDrawEnumerateExAFn)(LPVOID, LPVOID, DWORD);
+/** DirectDrawEnumerateExW. */
 typedef HRESULT (WINAPI *DirectDrawEnumerateExWFn)(LPVOID, LPVOID, DWORD);
 
+/**
+ * The DirectDraw library the exports forward to: the ChainDll library or
+ * the system one.
+ */
 static HMODULE g_systemDdraw = NULL;
+/** This DLL. */
 static HMODULE g_proxyModule = NULL;
+/** Nonzero while a thread loads g_systemDdraw. */
 static volatile LONG g_loadLock = 0;
+/** The path of the system ddraw.dll. */
 static CHAR g_systemPath[MAX_PATH];
 
-// Set when another copy of the patch already is the game's DirectDraw
-// library: this copy then does nothing at all.
+/**
+ * Set when another copy of the patch already is the game's DirectDraw
+ * library: this copy then does nothing at all.
+ */
 static BOOL g_inactiveCopy = FALSE;
 
-// The game's DirectDrawCreate import, when this copy redirected it (loaded
-// as a plugin, for example an .asi of an ASI loader).
+/**
+ * The game's DirectDrawCreate import, when this copy redirected it (loaded
+ * as a plugin).
+ */
 static LPVOID* g_redirectedSlot = NULL;
+/** The function g_redirectedSlot held before. */
 static LPVOID g_redirectedOriginal = NULL;
 
+/** The name of the export that marks a copy of the patch. */
 static const CHAR kVersionExport[] = "RoadRashWidescreenVersion";
 
-// Lets a second copy of the patch, and ChainDll=, recognize this DLL.
+/**
+ * Gives the patch version; lets a second copy of the patch, and ChainDll,
+ * recognize this DLL.
+ *
+ * @return (major << 16) | (minor << 8) | patch.
+ */
 extern "C" DWORD WINAPI RoadRashWidescreenVersion()
 {
     return (RRWS_VERSION_MAJOR << 16) | (RRWS_VERSION_MINOR << 8) |
         RRWS_VERSION_PATCH;
 }
 
+/**
+ * Tells whether a module is a copy of the patch.
+ *
+ * @param [in] module The module.
+ * @return TRUE for this DLL and any DLL with kVersionExport.
+ */
 static BOOL IsPatchModule(HMODULE module)
 {
     return module == g_proxyModule ||
         GetProcAddress(module, kVersionExport) != NULL;
 }
 
-// [Display] ChainDll=: another DirectDraw library (for example a wrapper
-// renamed to wrapper.dll) that this ddraw.dll forwards to instead of the
-// system one. A relative path starts in the game's folder. Empty
-// (the default): the system DirectDraw library.
+/**
+ * Loads the DirectDraw library named by [Display] ChainDll.
+ *
+ * ChainDll names another DirectDraw library (for example a wrapper renamed
+ * to wrapper.dll) that this ddraw.dll forwards to instead of the system
+ * one. A relative path starts in the game's folder. Empty (the default):
+ * the system DirectDraw library.
+ *
+ * @return The library, or NULL when none is named or it cannot be used.
+ */
 static HMODULE LoadChainedDdraw()
 {
     static CHAR settings[MAX_PATH];
@@ -136,6 +184,12 @@ static HMODULE LoadChainedDdraw()
     return module;
 }
 
+/**
+ * Gives the library the exports forward to, loading it on the first call.
+ *
+ * @return The ChainDll library, else the system ddraw.dll, or NULL (with
+ *         the last error set).
+ */
 static HMODULE LoadSystemDdraw()
 {
     while (_InterlockedCompareExchange(&g_loadLock, 1, 0) != 0)
@@ -219,6 +273,12 @@ static HMODULE LoadSystemDdraw()
     return module;
 }
 
+/**
+ * Finds an export in the library the exports forward to.
+ *
+ * @param [in] name The name of the export.
+ * @return The function, or NULL (with the last error set).
+ */
 static FARPROC ResolveSystemExport(LPCSTR name)
 {
     HMODULE module = LoadSystemDdraw();
@@ -235,12 +295,27 @@ static FARPROC ResolveSystemExport(LPCSTR name)
     return procedure;
 }
 
+/**
+ * Gives the result of an export whose target could not be found.
+ *
+ * @return The last error as an HRESULT, or E_FAIL.
+ */
 static HRESULT ProxyFailure()
 {
     DWORD error = GetLastError();
     return error == ERROR_SUCCESS ? E_FAIL : HRESULT_FROM_WIN32(error);
 }
 
+/**
+ * Creates a DirectDraw object and installs the widescreen hooks into it.
+ *
+ * Loaded as a plugin, it calls the function the game's import held before.
+ *
+ * @param [in] lpGuid The display driver, or NULL.
+ * @param [out] lplpDD Receives the IDirectDraw object.
+ * @param [in] pUnkOuter Must be NULL.
+ * @return The result of the forwarded DirectDrawCreate.
+ */
 extern "C" HRESULT WINAPI DirectDrawCreate(
     GUID* lpGuid,
     LPVOID* lplpDD,
@@ -270,6 +345,15 @@ extern "C" HRESULT WINAPI DirectDrawCreate(
     return result;
 }
 
+/**
+ * Forwards DirectDrawCreateEx.
+ *
+ * @param [in] lpGuid The display driver, or NULL.
+ * @param [out] lplpDD Receives the object.
+ * @param [in] iid The interface wanted.
+ * @param [in] pUnkOuter Must be NULL.
+ * @return The result of the forwarded function.
+ */
 extern "C" HRESULT WINAPI DirectDrawCreateEx(
     GUID* lpGuid,
     LPVOID* lplpDD,
@@ -286,6 +370,13 @@ extern "C" HRESULT WINAPI DirectDrawCreateEx(
     return procedure(lpGuid, lplpDD, iid, pUnkOuter);
 }
 
+/**
+ * Forwards DirectDrawEnumerateA.
+ *
+ * @param [in] callback The callback for each driver.
+ * @param [in] context Passed to the callback.
+ * @return The result of the forwarded function.
+ */
 extern "C" HRESULT WINAPI DirectDrawEnumerateA(
     LPVOID callback,
     LPVOID context)
@@ -300,6 +391,13 @@ extern "C" HRESULT WINAPI DirectDrawEnumerateA(
     return procedure(callback, context);
 }
 
+/**
+ * Forwards DirectDrawEnumerateW.
+ *
+ * @param [in] callback The callback for each driver.
+ * @param [in] context Passed to the callback.
+ * @return The result of the forwarded function.
+ */
 extern "C" HRESULT WINAPI DirectDrawEnumerateW(
     LPVOID callback,
     LPVOID context)
@@ -314,6 +412,14 @@ extern "C" HRESULT WINAPI DirectDrawEnumerateW(
     return procedure(callback, context);
 }
 
+/**
+ * Forwards DirectDrawEnumerateExA.
+ *
+ * @param [in] callback The callback for each driver.
+ * @param [in] context Passed to the callback.
+ * @param [in] flags The DDENUM flags.
+ * @return The result of the forwarded function.
+ */
 extern "C" HRESULT WINAPI DirectDrawEnumerateExA(
     LPVOID callback,
     LPVOID context,
@@ -329,6 +435,14 @@ extern "C" HRESULT WINAPI DirectDrawEnumerateExA(
     return procedure(callback, context, flags);
 }
 
+/**
+ * Forwards DirectDrawEnumerateExW.
+ *
+ * @param [in] callback The callback for each driver.
+ * @param [in] context Passed to the callback.
+ * @param [in] flags The DDENUM flags.
+ * @return The result of the forwarded function.
+ */
 extern "C" HRESULT WINAPI DirectDrawEnumerateExW(
     LPVOID callback,
     LPVOID context,
@@ -344,14 +458,18 @@ extern "C" HRESULT WINAPI DirectDrawEnumerateExW(
     return procedure(callback, context, flags);
 }
 
-// The other exports of the Windows ddraw.dll. The game does not use them,
-// but Windows' own DLLs import them from the module named ddraw.dll, which
-// is this proxy: d3dim.dll and d3dim700.dll (Direct3D 1-7) need the thread
-// lock and the internal lock functions as soon as anything in the game's
-// process uses Direct3D. Each export is a jump stub that finds its target
-// on the first call: the same function in the library the proxy forwards
-// to (ChainDll or the system one), else in the system ddraw.dll. The stubs
-// jump instead of calling, so they work without knowing the parameters.
+/**
+ * The other exports of the Windows ddraw.dll, as visit(index, name).
+ *
+ * The game does not use them, but Windows' own DLLs import them from the
+ * module named ddraw.dll, which is this proxy: d3dim.dll and d3dim700.dll
+ * (Direct3D 1-7) need the thread lock and the internal lock functions as
+ * soon as anything in the game's process uses Direct3D. Each export is a
+ * jump stub that finds its target on the first call: the same function in
+ * the library the proxy forwards to (ChainDll or the system one), else in
+ * the system ddraw.dll. The stubs jump instead of calling, so they work
+ * without knowing the parameters.
+ */
 #define RRWS_FORWARDED_EXPORTS(visit) \
     visit(0, AcquireDDThreadLock) \
     visit(1, CompleteCreateSysmemSurface) \
@@ -370,19 +488,32 @@ extern "C" HRESULT WINAPI DirectDrawEnumerateExW(
     visit(14, ReleaseDDThreadLock) \
     visit(15, SetAppCompatData)
 
+/** The number of exports in RRWS_FORWARDED_EXPORTS. */
 static const DWORD kForwardedExportCount = 16;
 
+/** The name of a forwarded export, for kForwardedExportNames. */
 #define RRWS_FORWARDED_NAME(index, name) #name,
+/** The names of the forwarded exports, by index. */
 static const CHAR* const kForwardedExportNames[kForwardedExportCount] =
 {
     RRWS_FORWARDED_EXPORTS(RRWS_FORWARDED_NAME)
 };
 #undef RRWS_FORWARDED_NAME
 
+/** The target of each forwarded export, once found. */
 static FARPROC g_forwardedExports[kForwardedExportCount];
+/**
+ * The system ddraw.dll, loaded for a function the ChainDll library does
+ * not have.
+ */
 static HMODULE g_windowsDdraw = NULL;
 
-// The system ddraw.dll, for a function the ChainDll library does not have.
+/**
+ * Loads the system ddraw.dll, for a function the ChainDll library does not
+ * have.
+ *
+ * @return The library, or NULL.
+ */
 static HMODULE LoadWindowsDdraw()
 {
     static CHAR path[MAX_PATH];
@@ -416,9 +547,14 @@ static HMODULE LoadWindowsDdraw()
     return module;
 }
 
-// Called by the jump stubs: the address to jump to. 0 (the caller then
-// crashes into the crash log) only if no DirectDraw library has the
-// function, which the stub's caller could not have been loaded without.
+/**
+ * Gives the address a jump stub jumps to.
+ *
+ * @param [in] index The export in RRWS_FORWARDED_EXPORTS.
+ * @return The function, or 0 (the caller then crashes into the crash log)
+ *         only if no DirectDraw library has it, which the stub's caller
+ *         could not have been loaded without.
+ */
 extern "C" FARPROC WINAPI ResolveForwardedExport(DWORD index)
 {
     FARPROC target;
@@ -461,7 +597,11 @@ extern "C" FARPROC WINAPI ResolveForwardedExport(DWORD index)
     return target;
 }
 
-// ecx and edx are kept for the target, eax holds its address.
+/**
+ * Defines the jump stub Forward\<name\> of a forwarded export.
+ *
+ * ecx and edx are kept for the target, eax holds its address.
+ */
 #define RRWS_FORWARDED_STUB(index, name) \
     extern "C" __declspec(naked) void Forward##name() \
     { \
@@ -477,8 +617,14 @@ extern "C" FARPROC WINAPI ResolveForwardedExport(DWORD index)
 RRWS_FORWARDED_EXPORTS(RRWS_FORWARDED_STUB)
 #undef RRWS_FORWARDED_STUB
 
-// TRUE when this DLL is ddraw.dll or RRWS.dll, the names under which the
-// game imports it directly; it then works as a plain proxy.
+/**
+ * Tells whether this DLL is loaded as ddraw.dll or RRWS.dll, the names
+ * under which the game imports it directly; it then works as a plain
+ * proxy.
+ *
+ * @param [in] module This DLL.
+ * @return TRUE under those names (or when the name is not known).
+ */
 static BOOL LoadedUnderProxyName(HMODULE module)
 {
     static CHAR path[MAX_PATH];
@@ -499,7 +645,12 @@ static BOOL LoadedUnderProxyName(HMODULE module)
         lstrcmpiA(path + start, "RRWS.dll") == 0;
 }
 
-// The loaded module that holds an address, or NULL.
+/**
+ * Gives the loaded module that holds an address.
+ *
+ * @param [in] address The address.
+ * @return The module, or NULL.
+ */
 static HMODULE ModuleFromAddress(LPCVOID address)
 {
     MEMORY_BASIC_INFORMATION memory;
@@ -518,10 +669,16 @@ static HMODULE ModuleFromAddress(LPCVOID address)
     return reinterpret_cast<HMODULE>(memory.AllocationBase);
 }
 
-// Finds the game's import slot of DDRAW.dll!DirectDrawCreate, by its name
-// in the import table. The slot counts only once Windows has resolved it:
-// it then points into a loaded module, which is ddraw.dll itself or a
-// Windows compatibility shim (apphelp.dll) in front of it.
+/**
+ * Finds the game's import slot of DDRAW.dll!DirectDrawCreate, by its name
+ * in the import table.
+ *
+ * The slot counts only once Windows has resolved it: it then points into a
+ * loaded module, which is ddraw.dll itself or a Windows compatibility shim
+ * (apphelp.dll) in front of it.
+ *
+ * @return The slot, or NULL.
+ */
 static LPVOID* FindGameDirectDrawSlot()
 {
     BYTE* image = reinterpret_cast<BYTE*>(GetModuleHandleA(NULL));
@@ -609,8 +766,14 @@ static LPVOID* FindGameDirectDrawSlot()
     return NULL;
 }
 
-// TRUE when another copy of the patch is loaded as the game's DirectDraw
-// library (ddraw.dll, RRWS.dll) or receives the game's import.
+/**
+ * Tells whether another copy of the patch is loaded as the game's
+ * DirectDraw library (ddraw.dll, RRWS.dll) or receives the game's import.
+ *
+ * @param [in] self This DLL.
+ * @param [in] slot The game's DirectDrawCreate import slot, or NULL.
+ * @return TRUE when another copy is in use.
+ */
 static BOOL OtherPatchCopyLoaded(HMODULE self, LPVOID* slot)
 {
     HMODULE module = GetModuleHandleA("ddraw.dll");
@@ -630,9 +793,13 @@ static BOOL OtherPatchCopyLoaded(HMODULE self, LPVOID* slot)
     return module != NULL && module != self && IsPatchModule(module);
 }
 
-// Points the game's DirectDrawCreate import at this DLL, which calls the
-// function the import held before (the other ddraw.dll, the system one or a
-// compatibility shim in front of them).
+/**
+ * Points the game's DirectDrawCreate import at this DLL, which calls the
+ * function the import held before (the other ddraw.dll, the system one or
+ * a compatibility shim in front of them).
+ *
+ * @param [in,out] slot The game's DirectDrawCreate import slot.
+ */
 static void RedirectGameDirectDraw(LPVOID* slot)
 {
     static CHAR path[MAX_PATH];
@@ -680,6 +847,10 @@ static void RedirectGameDirectDraw(LPVOID* slot)
     }
 }
 
+/**
+ * Gives the game's DirectDrawCreate import its old value back, unless
+ * something else changed it since.
+ */
 static void RestoreGameDirectDraw()
 {
     DWORD oldProtection;
@@ -700,6 +871,16 @@ static void RestoreGameDirectDraw()
     g_redirectedSlot = NULL;
 }
 
+/**
+ * The DLL entry point: starts the log and the crash log when the DLL is
+ * loaded, and removes the hooks when it is unloaded.
+ *
+ * @param [in] instance This DLL.
+ * @param [in] reason DLL_PROCESS_ATTACH or DLL_PROCESS_DETACH.
+ * @param [in] reserved NULL when the DLL is unloaded while the game keeps
+ *             running; not NULL when the process ends.
+ * @return TRUE.
+ */
 extern "C" BOOL WINAPI DllMain(
     HINSTANCE instance,
     DWORD reason,

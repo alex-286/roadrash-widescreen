@@ -1,5 +1,14 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
-// Copyright (C) 2026 Alexander Schmidt
+/**
+ * Nearest-neighbor scaling of an 8-bit frame straight to the display size.
+ *
+ * Each part of the worker pool converts a source row once into its row
+ * buffer and copies it into every destination row that shows it.
+ *
+ * @file nearest.cpp
+ * @author Alexander Schmidt
+ * @copyright Copyright (C) 2026 Alexander Schmidt
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ */
 
 #include "nearest.h"
 #include "worker_pool.h"
@@ -8,32 +17,60 @@
 
 #pragma intrinsic(__movsd)
 
+/** The parameters of one NearestScale call, shared by all parts. */
 struct ScaleJob
 {
+    /** The first pixel of the 8-bit frame. */
     const BYTE* source;
+    /** The bytes per row of source. */
     LONG sourcePitch;
+    /** 256 X8R8G8B8 colors, one per palette index. */
     const DWORD* rgb;
+    /** The smooth distance haze, or NULL. */
     const HazeFrame* haze;
+    /** The first pixel of the X8R8G8B8 frame. */
     BYTE* destination;
+    /** The bytes per row of destination. */
     LONG destinationPitch;
 };
 
+/** The largest number of parts a frame is split into. */
 static const DWORD kMaxParts = 8;
 
+/** The width of the scaled frame in pixels; 0 when not initialized. */
 static DWORD g_destinationWidth = 0;
+/** The height of the scaled frame in pixels. */
 static DWORD g_destinationHeight = 0;
+/** The source column of each destination column. */
 static DWORD* g_columns = NULL;
+/** The source row of each destination row. */
 static DWORD* g_rows = NULL;
-// One converted row per worker part. Output rows are copied from it, never
-// from the destination, which may be video memory (slow to read).
+/**
+ * One converted row per worker part.
+ *
+ * Output rows are copied from it, never from the destination, which may be
+ * video memory (slow to read).
+ */
 static DWORD* g_rowBuffers[kMaxParts];
+/** The number of parts with a row buffer. */
 static DWORD g_partCount = 0;
 
+/**
+ * Allocates zeroed memory with VirtualAlloc.
+ *
+ * @param [in] bytes The size in bytes.
+ * @return The memory, or NULL.
+ */
 static void* Allocate(DWORD bytes)
 {
     return VirtualAlloc(NULL, bytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
 }
 
+/**
+ * Frees memory from Allocate.
+ *
+ * @param [in] pointer The memory, or NULL.
+ */
 static void Free(void* pointer)
 {
     if (pointer != NULL)
@@ -42,7 +79,14 @@ static void Free(void* pointer)
     }
 }
 
-// The source pixel under each destination pixel center.
+/**
+ * Builds the table of the source pixel under each destination pixel center
+ * along one axis.
+ *
+ * @param [in] source The size of the axis in source pixels.
+ * @param [in] destination The size of the axis in destination pixels.
+ * @return The allocated table, destination entries, or NULL.
+ */
 static DWORD* BuildAxis(DWORD source, DWORD destination)
 {
     DWORD* table = reinterpret_cast<DWORD*>(
@@ -65,6 +109,13 @@ static DWORD* BuildAxis(DWORD source, DWORD destination)
     return table;
 }
 
+/**
+ * Scales the destination rows of one part (a WorkerTask).
+ *
+ * @param [in] part The part to scale.
+ * @param [in] parts The number of parts (limited to g_partCount).
+ * @param [in] context The ScaleJob.
+ */
 static void ScaleTask(DWORD part, DWORD parts, void* context)
 {
     const ScaleJob* job = reinterpret_cast<const ScaleJob*>(context);

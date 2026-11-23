@@ -1,5 +1,16 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
-// Copyright (C) 2026 Alexander Schmidt
+/**
+ * The bicubic filter: a separable Catmull-Rom resampler from the 8-bit
+ * frame to X8R8G8B8.
+ *
+ * Each part of the worker pool filters source rows horizontally into its
+ * row buffers and combines four of them vertically into each output row.
+ * Integer arithmetic only; MMX gives the same results faster.
+ *
+ * @file resampler.cpp
+ * @author Alexander Schmidt
+ * @copyright Copyright (C) 2026 Alexander Schmidt
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ */
 
 #include "resampler.h"
 #include "cpu_features.h"
@@ -13,32 +24,57 @@
 // once with _mm_empty after all rows.
 #pragma warning(disable : 4799)
 
+/** The number of source pixels weighted per axis. */
 static const DWORD kTaps = kResamplerTaps;
-// Weights are fixed point with 10 fractional bits; they sum to kOne.
+/** The fraction bits of the fixed point weights. */
 static const LONG kWeightBits = 10;
+/** The fixed point 1.0; the weights of a pixel sum to it. */
 static const LONG kOne = 1 << kWeightBits;
 
+/** The parameters of one ResamplerScaleIndexed call, shared by all parts. */
 struct ScaleJob
 {
+    /** The tables and row buffers. */
     Resampler* resampler;
+    /** The first pixel of the 8-bit frame. */
     const BYTE* source;
+    /** The bytes per row of source. */
     LONG sourcePitch;
+    /** 256 X8R8G8B8 colors, one per palette index. */
     const DWORD* rgb;
-    // With MMX: the palette with each color's channels already in 16-bit
-    // lanes.
+    /**
+     * With MMX: rgb with each color's channels already in 16-bit lanes;
+     * otherwise NULL.
+     */
     const __m64* palette;
-    // The smooth distance haze, or NULL; with MMX, its colors unpacked.
+    /** The smooth distance haze, or NULL. */
     const HazeFrame* haze;
+    /**
+     * With MMX and haze: the haze colors unpacked like palette; otherwise NULL.
+     */
     const __m64* hazePalette;
+    /** The first pixel of the X8R8G8B8 frame. */
     BYTE* destination;
+    /** The bytes per row of destination. */
     LONG destinationPitch;
 };
 
+/**
+ * Allocates zeroed memory with VirtualAlloc.
+ *
+ * @param [in] bytes The size in bytes.
+ * @return The memory, or NULL.
+ */
 static void* Allocate(DWORD bytes)
 {
     return VirtualAlloc(NULL, bytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
 }
 
+/**
+ * Frees memory from Allocate.
+ *
+ * @param [in] pointer The memory, or NULL.
+ */
 static void Free(void* pointer)
 {
     if (pointer != NULL)
@@ -47,13 +83,21 @@ static void Free(void* pointer)
     }
 }
 
-// Catmull-Rom weights for the taps at -1, 0, +1 and +2 around a sample with
-// fraction s/256. In units of 2 * 256^3:
-//   w0 = -s^3 + 2*256*s^2 - 256^2*s
-//   w1 = 3*s^3 - 5*256*s^2 + 2*256^3
-//   w2 = -3*s^3 + 4*256*s^2 + 256^2*s
-//   w3 = s^3 - 256*s^2
-// All terms fit in 32 bits for s <= 256.
+/**
+ * Gives the Catmull-Rom weights for the taps at -1, 0, +1 and +2 around a
+ * sample.
+ *
+ * In units of 2 * 256^3:
+ * - w0 = -s^3 + 2*256*s^2 - 256^2*s
+ * - w1 = 3*s^3 - 5*256*s^2 + 2*256^3
+ * - w2 = -3*s^3 + 4*256*s^2 + 256^2*s
+ * - w3 = s^3 - 256*s^2
+ *
+ * All terms fit in 32 bits for s <= 256.
+ *
+ * @param [in] s The fraction of the sample position, in 1/256.
+ * @param [out] weights Receives kTaps weights that sum to kOne.
+ */
 static void CatmullRomWeights(LONG s, SHORT* weights)
 {
     static const LONG kUnitShift = 25 - kWeightBits;
@@ -86,8 +130,17 @@ static void CatmullRomWeights(LONG s, SHORT* weights)
         static_cast<SHORT>(weights[s < 128 ? 1 : 2] + (kOne - sum));
 }
 
-// Maps the destination pixel center to a source position in 16.16 fixed
-// point and weights the four source pixels around it.
+/**
+ * Maps a destination pixel center to a source position in 16.16 fixed
+ * point and weights the four source pixels around it.
+ *
+ * @param [in] source The size of the axis in source pixels.
+ * @param [in] destination The size of the axis in destination pixels.
+ * @param [in] position The destination pixel.
+ * @param [out] first Receives the source pixel of the first tap (may lie
+ *              outside the image).
+ * @param [out] weights Receives kTaps weights.
+ */
 static void BicubicTaps(
     DWORD source,
     DWORD destination,
@@ -104,9 +157,21 @@ static void BicubicTaps(
     CatmullRomWeights((sample & 0xFFFF) >> 8, weights);
 }
 
-// Builds the four source pixels (clamped to the image) and weights of each
-// destination pixel. An entry that takes a single source pixel is stored
-// with that pixel in the first tap, so it can be copied.
+/**
+ * Builds the four source pixels (clamped to the image) and weights of each
+ * destination pixel along one axis.
+ *
+ * An entry that takes a single source pixel is stored with that pixel in the
+ * first tap, so it can be copied.
+ *
+ * @param [in] source The size of the axis in source pixels.
+ * @param [in] destination The size of the axis in destination pixels.
+ * @param [out] indexTable Receives the allocated table of source pixels, or
+ *              NULL.
+ * @param [out] weightTable Receives the allocated table of weights, or
+ *              NULL.
+ * @return FALSE when the tables could not be allocated.
+ */
 static BOOL BuildAxis(
     DWORD source,
     DWORD destination,
@@ -168,13 +233,25 @@ static BOOL BuildAxis(
     return TRUE;
 }
 
-// True when the weights select the first tap alone. Small opposite weights
-// can cancel out, so all of them are checked.
+/**
+ * Tells whether the weights select the first tap alone.
+ *
+ * Small opposite weights can cancel out, so all of them are checked.
+ *
+ * @param [in] weights kTaps weights.
+ * @return TRUE when only the first weight is nonzero.
+ */
 static __forceinline BOOL IsCopy(const SHORT* weights)
 {
     return weights[1] == 0 && weights[2] == 0 && weights[3] == 0;
 }
 
+/**
+ * Rounds a weighted channel sum to a channel value.
+ *
+ * @param [in] value The sum, in units of kOne.
+ * @return The value, clamped to 0-255.
+ */
 static __forceinline DWORD ClampChannel(LONG value)
 {
     value = (value + kOne / 2) >> kWeightBits;
@@ -186,7 +263,16 @@ static __forceinline DWORD ClampChannel(LONG value)
     return value > 255 ? 255 : static_cast<DWORD>(value);
 }
 
-// Weighted sum of four X8R8G8B8 colors, clamped per channel.
+/**
+ * Gives the weighted sum of four X8R8G8B8 colors, clamped per channel.
+ *
+ * @param [in] c0 The color of the first tap.
+ * @param [in] c1 The color of the second tap.
+ * @param [in] c2 The color of the third tap.
+ * @param [in] c3 The color of the fourth tap.
+ * @param [in] weights kTaps weights.
+ * @return The combined color; the top byte is 0.
+ */
 static __forceinline DWORD Combine(
     DWORD c0, DWORD c1, DWORD c2, DWORD c3, const SHORT* weights)
 {
@@ -215,14 +301,24 @@ static __forceinline DWORD Combine(
         ClampChannel(blue);
 }
 
-// MMX is used when the processor has it; the results are identical.
+/** TRUE when the processor has MMX; the results are identical. */
 static BOOL g_useMmx = FALSE;
 
-// MMX: Combine for the four channels at once. pmaddwd forms the sums of
-// two taps per channel in 32 bits, which are added, rounded and shifted as
-// in ClampChannel; the signed and unsigned saturating packs then clamp to
-// 0-255 exactly like ClampChannel. Combine leaves the top byte 0.
-// The colors come with their channels in 16-bit lanes.
+/**
+ * Combine for the four channels at once, with MMX.
+ *
+ * pmaddwd forms the sums of two taps per channel in 32 bits, which are
+ * added, rounded and shifted as in ClampChannel; the signed and unsigned
+ * saturating packs then clamp to 0-255 exactly like ClampChannel. Like
+ * Combine, it leaves the top byte 0.
+ *
+ * @param [in] c0 The color of the first tap, channels in 16-bit lanes.
+ * @param [in] c1 The color of the second tap, channels in 16-bit lanes.
+ * @param [in] c2 The color of the third tap, channels in 16-bit lanes.
+ * @param [in] c3 The color of the fourth tap, channels in 16-bit lanes.
+ * @param [in] weights The weights from SplitWeights.
+ * @return The combined color.
+ */
 static __forceinline DWORD CombineMmxLanes(
     const __m64* c0, const __m64* c1, const __m64* c2, const __m64* c3,
     const __m64* weights)
@@ -248,12 +344,28 @@ static __forceinline DWORD CombineMmxLanes(
         _mm_packs_pi32(blueGreen, redTop), zero))) & 0x00FFFFFF;
 }
 
+/**
+ * Spreads the channels of an X8R8G8B8 color into 16-bit lanes.
+ *
+ * @param [in] color The color.
+ * @return The channels, blue in the lowest lane.
+ */
 static __forceinline __m64 Unpack(DWORD color)
 {
     return _mm_unpacklo_pi8(
         _mm_cvtsi32_si64(static_cast<int>(color)), _mm_setzero_si64());
 }
 
+/**
+ * CombineMmxLanes for packed X8R8G8B8 colors.
+ *
+ * @param [in] c0 The color of the first tap.
+ * @param [in] c1 The color of the second tap.
+ * @param [in] c2 The color of the third tap.
+ * @param [in] c3 The color of the fourth tap.
+ * @param [in] weights The weights from SplitWeights.
+ * @return The combined color.
+ */
 static __forceinline DWORD CombineMmx(
     DWORD c0, DWORD c1, DWORD c2, DWORD c3, const __m64* weights)
 {
@@ -267,7 +379,12 @@ static __forceinline DWORD CombineMmx(
         &lanes[0], &lanes[1], &lanes[2], &lanes[3], weights);
 }
 
-// The tap pairs (w0, w1, w0, w1) and (w2, w3, w2, w3) for pmaddwd.
+/**
+ * Arranges four weights as the tap pairs pmaddwd needs.
+ *
+ * @param [in] weights kTaps weights.
+ * @param [out] split Receives (w0, w1, w0, w1) and (w2, w3, w2, w3).
+ */
 static __forceinline void SplitWeights(const SHORT* weights, __m64* split)
 {
     __m64 all = *reinterpret_cast<const __m64*>(weights);
@@ -276,15 +393,29 @@ static __forceinline void SplitWeights(const SHORT* weights, __m64* split)
     split[1] = _mm_unpackhi_pi32(all, all);
 }
 
-// The color table index of a source pixel: the palette index, or with
-// haze the haze level and palette index.
+/**
+ * Gives the color table index of a source pixel.
+ *
+ * @tparam Hazy TRUE to read the haze level as well.
+ * @param [in] line The source row.
+ * @param [in] levels The haze level row of line; unused without Hazy.
+ * @param [in] column The column of the pixel.
+ * @return The palette index, or with Hazy the haze level and palette index.
+ */
 template <bool Hazy>
 static __forceinline DWORD PixelKey(const BYTE* line, const BYTE* levels, DWORD column)
 {
     return Hazy ? HazeKey(line, levels, column) : line[column];
 }
 
-// Filters source row `sourceRow` horizontally into output (X8R8G8B8).
+/**
+ * Filters a source row horizontally into X8R8G8B8.
+ *
+ * @tparam Hazy TRUE when the row holds haze.
+ * @param [in] job The frame and the tables.
+ * @param [in] sourceRow The source row.
+ * @param [out] output Receives destinationWidth pixels.
+ */
 template <bool Hazy>
 static void FilterRowWith(const ScaleJob* job, DWORD sourceRow, DWORD* output)
 {
@@ -345,6 +476,13 @@ static void FilterRowWith(const ScaleJob* job, DWORD sourceRow, DWORD* output)
     }
 }
 
+/**
+ * Filters a source row horizontally, with the haze when the row holds any.
+ *
+ * @param [in] job The frame and the tables.
+ * @param [in] sourceRow The source row.
+ * @param [out] output Receives destinationWidth pixels.
+ */
 static void FilterRow(const ScaleJob* job, DWORD sourceRow, DWORD* output)
 {
     if (job->haze != NULL && job->haze->rows[sourceRow] != 0)
@@ -357,9 +495,18 @@ static void FilterRow(const ScaleJob* job, DWORD sourceRow, DWORD* output)
     }
 }
 
-// Each part keeps the last four horizontally filtered source rows, in slot
-// row % 4. The rows a destination row needs are consecutive (or repeat the
-// edge row), so they never share a slot.
+/**
+ * Gives a horizontally filtered source row, filtering it when needed.
+ *
+ * Each part keeps the last four filtered source rows, in slot row % 4. The
+ * rows a destination row needs are consecutive (or repeat the edge row), so
+ * they never share a slot.
+ *
+ * @param [in] job The frame and the tables.
+ * @param [in,out] part The row buffers of the part.
+ * @param [in] row The source row.
+ * @return The filtered row, destinationWidth pixels.
+ */
 static const DWORD* GetRow(const ScaleJob* job, ResamplerRows* part, DWORD row)
 {
     DWORD slot = row & (kTaps - 1);
@@ -373,6 +520,14 @@ static const DWORD* GetRow(const ScaleJob* job, ResamplerRows* part, DWORD row)
     return part->rows[slot];
 }
 
+/**
+ * Scales the destination rows of one part (a WorkerTask).
+ *
+ * The number of parts is unused; the resampler keeps its own part count.
+ *
+ * @param [in] part The part to scale.
+ * @param [in] context The ScaleJob.
+ */
 static void ScaleTask(DWORD part, DWORD, void* context)
 {
     const ScaleJob* job = reinterpret_cast<const ScaleJob*>(context);

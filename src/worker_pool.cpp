@@ -1,27 +1,64 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
-// Copyright (C) 2026 Alexander Schmidt
+/**
+ * A small pool of worker threads for splitting a frame filter into parts.
+ *
+ * Each worker waits for its start event, runs its part of the current task
+ * and sets its done event; the calling thread runs part 0 and then waits
+ * for all done events.
+ *
+ * @file worker_pool.cpp
+ * @author Alexander Schmidt
+ * @copyright Copyright (C) 2026 Alexander Schmidt
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ */
 
 #include "worker_pool.h"
 
+/** The largest pool size, including the calling thread. */
 static const DWORD kMaxThreads = 8;
+/** The stack size of a worker thread in bytes. */
 static const DWORD kWorkerStackSize = 64 * 1024;
 
+/** One worker thread. */
 struct Worker
 {
+    /** The thread, or NULL. */
     HANDLE thread;
+    /**
+     * Auto-reset event that starts the thread on the current task (or ends it
+     * when g_quit is set).
+     */
     HANDLE start;
 };
 
+/** The worker threads; entry 0 (the calling thread) is unused. */
 static Worker g_workers[kMaxThreads];
+/**
+ * Auto-reset events, set by each worker when its part is done; entry 0 is
+ * unused.
+ */
 static HANDLE g_doneEvents[kMaxThreads];
+/** The number of parts, including the calling thread. */
 static DWORD g_size = 1;
+/** Nonzero while WorkerPoolStop ends the threads. */
 static volatile LONG g_quit = 0;
 
-// The current task. It is written before the start events are set, which
-// orders the writes before the workers read them.
+/**
+ * The current task.
+ *
+ * It is written before the start events are set, which orders the writes
+ * before the workers read them.
+ */
 static WorkerTask g_task = NULL;
+/** The context of the current task; written like g_task. */
 static void* g_context = NULL;
 
+/**
+ * The thread function of a worker: runs its part of every task until
+ * g_quit is set.
+ *
+ * @param [in] parameter The part the worker runs, as a pointer-sized value.
+ * @return 0.
+ */
 static DWORD WINAPI WorkerMain(LPVOID parameter)
 {
     DWORD part = static_cast<DWORD>(reinterpret_cast<DWORD_PTR>(parameter));

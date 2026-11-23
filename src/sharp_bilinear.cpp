@@ -1,5 +1,15 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
-// Copyright (C) 2026 Alexander Schmidt
+/**
+ * Sharp bilinear scaling of an 8-bit frame straight to the display size.
+ *
+ * Each part of the worker pool filters source rows horizontally into its two
+ * row buffers and blends them vertically into each output row, with MMX when
+ * the processor has it (the results are identical).
+ *
+ * @file sharp_bilinear.cpp
+ * @author Alexander Schmidt
+ * @copyright Copyright (C) 2026 Alexander Schmidt
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ */
 
 #include "sharp_bilinear.h"
 #include "cpu_features.h"
@@ -13,53 +23,90 @@
 // once with _mm_empty after all rows.
 #pragma warning(disable : 4799)
 
+/** The largest number of parts a frame is split into. */
 static const DWORD kMaxParts = 8;
 
-// Per output column or row: the first source pixel and the weight (0-255)
-// of the next one.
+/** The source pixels of each output column or row. */
 struct AxisTable
 {
+    /** The first source pixel of each output pixel. */
     DWORD* index;
+    /** The weight (0-255) of the source pixel after index, per output pixel. */
     BYTE* weight;
 };
 
-// Each part keeps the last two horizontally filtered source rows.
+/** The last two horizontally filtered source rows one part keeps. */
 struct PartRows
 {
+    /** Two X8R8G8B8 rows, destinationWidth pixels each. */
     DWORD* rows[2];
+    /** The source row held in each of rows, or -1 for none. */
     LONG tags[2];
 };
 
+/** The parameters of one SharpBilinearScale call, shared by all parts. */
 struct ScaleJob
 {
+    /** The first pixel of the 8-bit frame. */
     const BYTE* source;
+    /** The bytes per row of source. */
     LONG sourcePitch;
+    /** 256 X8R8G8B8 colors, one per palette index. */
     const DWORD* rgb;
-    // With MMX: the palette with each color's channels in 16-bit lanes.
+    /**
+     * With MMX: rgb with each color's channels in 16-bit lanes; otherwise NULL.
+     */
     const __m64* palette;
-    // The smooth distance haze, or NULL; with MMX, its colors unpacked.
+    /** The smooth distance haze, or NULL. */
     const HazeFrame* haze;
+    /**
+     * With MMX and haze: the haze colors unpacked like palette; otherwise NULL.
+     */
     const __m64* hazePalette;
+    /** The first pixel of the X8R8G8B8 frame. */
     BYTE* destination;
+    /** The bytes per row of destination. */
     LONG destinationPitch;
 };
 
+/** The width of the 8-bit frame in pixels. */
 static DWORD g_sourceWidth = 0;
+/** The height of the 8-bit frame in pixels. */
 static DWORD g_sourceHeight = 0;
+/** The width of the scaled frame in pixels. */
 static DWORD g_destinationWidth = 0;
+/** The height of the scaled frame in pixels. */
 static DWORD g_destinationHeight = 0;
+/** The source columns of each destination column. */
 static AxisTable g_columns;
+/** The source rows of each destination row. */
 static AxisTable g_rows;
+/** The filtered rows of each part. */
 static PartRows g_parts[kMaxParts];
+/** The number of parts with buffers; 0 when not initialized. */
 static DWORD g_partCount = 0;
-// With MMX: each column's weight in all four 16-bit lanes.
+/**
+ * With MMX: each column's weight in all four 16-bit lanes; NULL without
+ * MMX, which also selects the plain row functions.
+ */
 static __m64* g_columnWeights = NULL;
 
+/**
+ * Allocates zeroed memory with VirtualAlloc.
+ *
+ * @param [in] bytes The size in bytes.
+ * @return The memory, or NULL.
+ */
 static void* Allocate(DWORD bytes)
 {
     return VirtualAlloc(NULL, bytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
 }
 
+/**
+ * Frees memory from Allocate.
+ *
+ * @param [in] pointer The memory, or NULL.
+ */
 static void Free(void* pointer)
 {
     if (pointer != NULL)
@@ -68,11 +115,21 @@ static void Free(void* pointer)
     }
 }
 
-// Maps each destination pixel center to a source position in 16.16 fixed
-// point (source pixel centers at k + 0.5). Within a source pixel, positions
-// closer than half a prescaled pixel to its center snap to the center; the
-// rest ramps to the neighbor, as the prescaled image would under bilinear
-// filtering.
+/**
+ * Builds the source pixels and weights of each destination pixel along one
+ * axis.
+ *
+ * Maps each destination pixel center to a source position in 16.16 fixed
+ * point (source pixel centers at k + 0.5). Within a source pixel, positions
+ * closer than half a prescaled pixel to its center snap to the center; the
+ * rest ramps to the neighbor, as the prescaled image would under bilinear
+ * filtering.
+ *
+ * @param [in] source The size of the axis in source pixels.
+ * @param [in] destination The size of the axis in destination pixels.
+ * @param [out] table Receives the allocated tables.
+ * @return FALSE when the tables could not be allocated.
+ */
 static BOOL BuildAxis(DWORD source, DWORD destination, AxisTable* table)
 {
     DWORD prescale = (destination + source / 2) / source;
@@ -126,6 +183,11 @@ static BOOL BuildAxis(DWORD source, DWORD destination, AxisTable* table)
     return TRUE;
 }
 
+/**
+ * Frees the tables of an axis.
+ *
+ * @param [in,out] table The tables, left empty.
+ */
 static void FreeAxis(AxisTable* table)
 {
     Free(table->index);
@@ -134,7 +196,14 @@ static void FreeAxis(AxisTable* table)
     table->weight = NULL;
 }
 
-// Blends two X8R8G8B8 colors; weight is the share of second (0-256).
+/**
+ * Blends two X8R8G8B8 colors.
+ *
+ * @param [in] first The first color.
+ * @param [in] second The second color.
+ * @param [in] weight The share of second (0-256).
+ * @return The blended color; the top byte is 0.
+ */
 static __forceinline DWORD Blend(DWORD first, DWORD second, DWORD weight)
 {
     DWORD inverse = 256 - weight;
@@ -146,14 +215,29 @@ static __forceinline DWORD Blend(DWORD first, DWORD second, DWORD weight)
     return (redBlue & 0x00FF00FF) | (green & 0x0000FF00);
 }
 
-// The color table index of a source pixel: the palette index, or with
-// haze the haze level and palette index.
+/**
+ * Gives the color table index of a source pixel.
+ *
+ * @tparam Hazy TRUE to read the haze level as well.
+ * @param [in] line The source row.
+ * @param [in] levels The haze level row of line; unused without Hazy.
+ * @param [in] column The column of the pixel.
+ * @return The palette index, or with Hazy the haze level and palette index.
+ */
 template <bool Hazy>
 static __forceinline DWORD PixelKey(const BYTE* line, const BYTE* levels, DWORD column)
 {
     return Hazy ? HazeKey(line, levels, column) : line[column];
 }
 
+/**
+ * Gives the haze level row of a source row.
+ *
+ * @tparam Hazy TRUE when the row holds haze.
+ * @param [in] job The frame and its haze.
+ * @param [in] sourceRow The source row.
+ * @return The level row, or NULL without Hazy.
+ */
 template <bool Hazy>
 static const BYTE* LevelRow(const ScaleJob* job, DWORD sourceRow)
 {
@@ -162,6 +246,14 @@ static const BYTE* LevelRow(const ScaleJob* job, DWORD sourceRow)
         NULL;
 }
 
+/**
+ * Filters a source row horizontally into X8R8G8B8.
+ *
+ * @tparam Hazy TRUE when the row holds haze.
+ * @param [in] job The frame.
+ * @param [in] sourceRow The source row.
+ * @param [out] output Receives destinationWidth pixels.
+ */
 template <bool Hazy>
 static void FilterRowWith(const ScaleJob* job, DWORD sourceRow, DWORD* output)
 {
@@ -182,11 +274,19 @@ static void FilterRowWith(const ScaleJob* job, DWORD sourceRow, DWORD* output)
     }
 }
 
-// MMX: the blend of Blend for the four channels at once, as
-// (a * 256 + (b - a) * weight) >> 8 = (a * (256 - weight) + b * weight) >> 8.
-// The intermediate (b - a) * weight may leave the 16-bit range, but the
-// final sum lies in 0-65280, so the wrapping 16-bit arithmetic is exact and
-// the result equals Blend's.
+/**
+ * The blend of Blend for the four channels at once, with MMX.
+ *
+ * Computed as (a * 256 + (b - a) * weight) >> 8, which equals
+ * (a * (256 - weight) + b * weight) >> 8. The intermediate (b - a) * weight
+ * may leave the 16-bit range, but the final sum lies in 0-65280, so the
+ * wrapping 16-bit arithmetic is exact and the result equals Blend's.
+ *
+ * @param [in] first The first color, channels in 16-bit lanes.
+ * @param [in] second The second color, channels in 16-bit lanes.
+ * @param [in] weight The share of second (0-256) in every lane.
+ * @return The blended channels in 16-bit lanes.
+ */
 static __forceinline __m64 BlendMmx(__m64 first, __m64 second, __m64 weight)
 {
     return _mm_srli_pi16(
@@ -196,6 +296,14 @@ static __forceinline __m64 BlendMmx(__m64 first, __m64 second, __m64 weight)
         8);
 }
 
+/**
+ * FilterRowWith with MMX.
+ *
+ * @tparam Hazy TRUE when the row holds haze.
+ * @param [in] job The frame.
+ * @param [in] sourceRow The source row.
+ * @param [out] output Receives destinationWidth pixels.
+ */
 template <bool Hazy>
 static void FilterRowMmxWith(const ScaleJob* job, DWORD sourceRow, DWORD* output)
 {
@@ -229,11 +337,25 @@ static void FilterRowMmxWith(const ScaleJob* job, DWORD sourceRow, DWORD* output
     }
 }
 
+/**
+ * Tells whether a source row holds any haze.
+ *
+ * @param [in] job The frame and its haze.
+ * @param [in] sourceRow The source row.
+ * @return TRUE when the row must be filtered with the haze.
+ */
 static BOOL RowHasHaze(const ScaleJob* job, DWORD sourceRow)
 {
     return job->haze != NULL && job->haze->rows[sourceRow] != 0;
 }
 
+/**
+ * Filters a source row horizontally, with the haze when the row holds any.
+ *
+ * @param [in] job The frame.
+ * @param [in] sourceRow The source row.
+ * @param [out] output Receives destinationWidth pixels.
+ */
 static void FilterRow(const ScaleJob* job, DWORD sourceRow, DWORD* output)
 {
     if (RowHasHaze(job, sourceRow))
@@ -246,6 +368,13 @@ static void FilterRow(const ScaleJob* job, DWORD sourceRow, DWORD* output)
     }
 }
 
+/**
+ * FilterRow with MMX.
+ *
+ * @param [in] job The frame.
+ * @param [in] sourceRow The source row.
+ * @param [out] output Receives destinationWidth pixels.
+ */
 static void FilterRowMmx(const ScaleJob* job, DWORD sourceRow, DWORD* output)
 {
     if (RowHasHaze(job, sourceRow))
@@ -258,6 +387,15 @@ static void FilterRowMmx(const ScaleJob* job, DWORD sourceRow, DWORD* output)
     }
 }
 
+/**
+ * Blends two filtered rows into an output row, two pixels at a time with
+ * MMX.
+ *
+ * @param [in] upper The upper row.
+ * @param [in] lower The lower row.
+ * @param [in] weight The share of lower (0-256).
+ * @param [out] output Receives destinationWidth pixels.
+ */
 static void BlendRowsMmx(
     const DWORD* upper, const DWORD* lower, DWORD weight, DWORD* output)
 {
@@ -287,8 +425,16 @@ static void BlendRowsMmx(
     }
 }
 
-// Returns the filtered source row, computing it into a slot that does not
-// hold keep.
+/**
+ * Gives a horizontally filtered source row, filtering it into a slot that
+ * does not hold keep when needed.
+ *
+ * @param [in] job The frame.
+ * @param [in,out] part The row buffers of the part.
+ * @param [in] row The source row.
+ * @param [in] keep The source row that must stay in its slot.
+ * @return The filtered row, destinationWidth pixels.
+ */
 static DWORD* GetRow(const ScaleJob* job, PartRows* part, LONG row, LONG keep)
 {
     DWORD slot;
@@ -316,6 +462,14 @@ static DWORD* GetRow(const ScaleJob* job, PartRows* part, LONG row, LONG keep)
     return part->rows[slot];
 }
 
+/**
+ * Scales the destination rows of one part (a WorkerTask).
+ *
+ * The number of parts is unused; g_partCount applies.
+ *
+ * @param [in] part The part to scale.
+ * @param [in] context The ScaleJob.
+ */
 static void ScaleTask(DWORD part, DWORD, void* context)
 {
     const ScaleJob* job = reinterpret_cast<const ScaleJob*>(context);

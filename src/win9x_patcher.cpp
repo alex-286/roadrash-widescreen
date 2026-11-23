@@ -1,33 +1,56 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
-// Copyright (C) 2026 Alexander Schmidt
-
-// RRWSPatch.exe: makes ROADRASH.EXE load the widescreen patch on Windows
-// 95/98/ME.
-//
-// Windows 9x keeps using the system ddraw.dll even when a ddraw.dll is next
-// to the game (its dsound.dll depends on the system copy, and the 9x loader
-// shares modules by name). This tool renames the game's DDRAW.dll import to
-// RRWS.dll, which is the patch DLL under another name. Running it again
-// restores the original import. Only the 9 bytes of the import name change.
+/**
+ * RRWSPatch.exe: makes ROADRASH.EXE load the widescreen patch on Windows
+ * 95/98/ME.
+ *
+ * Windows 9x keeps using the system ddraw.dll even when a ddraw.dll is next
+ * to the game (its dsound.dll depends on the system copy, and the 9x loader
+ * shares modules by name). This tool renames the game's DDRAW.dll import to
+ * RRWS.dll, which is the patch DLL under another name. Running it again
+ * restores the original import. Only the 9 bytes of the import name change.
+ *
+ * @file win9x_patcher.cpp
+ * @author Alexander Schmidt
+ * @copyright Copyright (C) 2026 Alexander Schmidt
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ */
 
 #include <windows.h>
 
 #include "version.h"
 
+/** The PE timestamp of ROADRASH.EXE 1.0A. */
 static const DWORD kExpectedTimestamp = 0x321DCBE7;
+/** The title of the tool's message boxes. */
 static const CHAR kTitle[] =
     "Road Rash Widescreen " RRWS_VERSION_STRING " - Windows 9x setup";
+/** The game's original DirectDraw import name. */
 static const CHAR kOriginalName[] = "DDRAW.dll";
+/** The import name after the change. */
 static const CHAR kPatchedName[] = "RRWS.dll";
+/** The game executable, next to the tool. */
 static const CHAR kGameFile[] = "ROADRASH.EXE";
+/** The copy of the unchanged game executable. */
 static const CHAR kBackupFile[] = "ROADRASH.BAK";
+/** The patch DLL under the name the changed game imports. */
 static const CHAR kDllFile[] = "RRWS.dll";
 
+/**
+ * Shows a message box with the tool's title.
+ *
+ * @param [in] text The message.
+ * @param [in] type The MB_ button and icon flags.
+ */
 static void ShowMessage(const CHAR* text, UINT type)
 {
     MessageBoxA(NULL, text, kTitle, type | MB_SETFOREGROUND);
 }
 
+/**
+ * Shows an error message with a Windows error code.
+ *
+ * @param [in] text The message.
+ * @param [in] error The Windows error code.
+ */
 static void ShowError(const CHAR* text, DWORD error)
 {
     CHAR message[512];
@@ -36,8 +59,14 @@ static void ShowError(const CHAR* text, DWORD error)
     ShowMessage(message, MB_OK | MB_ICONERROR);
 }
 
-// Writes the folder of this program, with a trailing backslash, and the file
-// name into path. Returns FALSE if it does not fit.
+/**
+ * Builds the path of a file in the folder of this program.
+ *
+ * @param [out] path Receives the folder, with a trailing backslash, and the
+ *              file name (MAX_PATH characters).
+ * @param [in] fileName The file name.
+ * @return FALSE if it does not fit.
+ */
 static BOOL BuildPath(CHAR* path, const CHAR* fileName)
 {
     DWORD length = GetModuleFileNameA(NULL, path, MAX_PATH);
@@ -61,8 +90,18 @@ static BOOL BuildPath(CHAR* path, const CHAR* fileName)
     return TRUE;
 }
 
-// Maps an RVA to a file offset through the section table. Returns FALSE if
-// the RVA plus size is not inside one section's file data.
+/**
+ * Maps an RVA to a file offset through the section table.
+ *
+ * @param [in] image The file.
+ * @param [in] fileSize The size of the file.
+ * @param [in] nt The PE header in the file.
+ * @param [in] rva The RVA.
+ * @param [in] size The number of bytes that must follow.
+ * @param [out] offset Receives the file offset.
+ * @return FALSE if the RVA plus size is not inside one section's file
+ *         data.
+ */
 static BOOL RvaToOffset(
     const BYTE* image,
     DWORD fileSize,
@@ -102,8 +141,15 @@ static BOOL RvaToOffset(
     return FALSE;
 }
 
-// Compares a string in the file with name, case-insensitively, and requires
-// the terminating zero. maxLength bounds the bytes that may be read.
+/**
+ * Compares a string in the file with a name, case-insensitively, and
+ * requires the terminating zero.
+ *
+ * @param [in] text The string in the file.
+ * @param [in] maxLength The bytes that may be read.
+ * @param [in] name The name.
+ * @return TRUE when they are equal.
+ */
 static BOOL NameEquals(const BYTE* text, DWORD maxLength, const CHAR* name)
 {
     DWORD index;
@@ -137,15 +183,28 @@ static BOOL NameEquals(const BYTE* text, DWORD maxLength, const CHAR* name)
     return FALSE;
 }
 
+/** The state of the game's DirectDraw import. */
 enum ImportState
 {
+    /** Not found, or not the supported executable. */
     kImportUnknown,
+    /** The original DDRAW.dll. */
     kImportOriginal,
+    /** Changed to RRWS.dll. */
     kImportPatched
 };
 
-// Finds the DirectDraw import of the game and returns the file offset of its
-// name. The name area must hold "DDRAW.dll" and its zero (10 bytes).
+/**
+ * Finds the DirectDraw import of the game.
+ *
+ * The name area must hold "DDRAW.dll" and its zero (10 bytes).
+ *
+ * @param [in] image The file.
+ * @param [in] fileSize The size of the file.
+ * @param [out] nameOffset Receives the file offset of the import name.
+ * @param [out] problem Receives the message for kImportUnknown.
+ * @return The state of the import.
+ */
 static ImportState FindDirectDrawImport(
     const BYTE* image,
     DWORD fileSize,
@@ -233,6 +292,14 @@ static ImportState FindDirectDrawImport(
     return kImportUnknown;
 }
 
+/**
+ * Reads a whole file (up to 64 MB) into memory.
+ *
+ * @param [in] path The file.
+ * @param [out] data Receives the contents, to be freed with VirtualFree.
+ * @param [out] size Receives the size of the file.
+ * @return FALSE (with the last error set) when it could not be read.
+ */
 static BOOL ReadWholeFile(const CHAR* path, BYTE** data, DWORD* size)
 {
     HANDLE file = CreateFileA(
@@ -278,8 +345,17 @@ static BOOL ReadWholeFile(const CHAR* path, BYTE** data, DWORD* size)
     return TRUE;
 }
 
-// Writes the new import name over the old one. A copy of the game from a CD
-// can be read-only, so that attribute is lifted for the write and restored.
+/**
+ * Writes the new import name over the old one.
+ *
+ * A copy of the game from a CD can be read-only, so that attribute is
+ * lifted for the write and restored.
+ *
+ * @param [in] path The game executable.
+ * @param [in] offset The file offset of the import name.
+ * @param [in] name The new name.
+ * @return FALSE (with the last error set) when it could not be written.
+ */
 static BOOL WriteImportName(const CHAR* path, DWORD offset, const CHAR* name)
 {
     DWORD attributes = GetFileAttributesA(path);
@@ -331,6 +407,7 @@ static BOOL WriteImportName(const CHAR* path, DWORD offset, const CHAR* name)
     return ok;
 }
 
+/** Asks the player and changes or restores the game's DirectDraw import. */
 static void Run()
 {
     CHAR gamePath[MAX_PATH];
@@ -459,6 +536,7 @@ static void Run()
         MB_OK | MB_ICONINFORMATION);
 }
 
+/** The entry point of RRWSPatch.exe (no C runtime). */
 extern "C" void WINAPI PatcherMain()
 {
     Run();

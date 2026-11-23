@@ -1,5 +1,32 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
-// Copyright (C) 2026 Alexander Schmidt
+/**
+ * Lets the game's own world rasterizer draw at 2, 3 or 4 times the HiRes
+ * resolution.
+ *
+ * The game computes the 3D world in a 320x240 space with 16.16 fixed point
+ * and converts every quad corner to pixels in FUN_0040FFC0:
+ * (corner >> shift) & mask. FUN_00410160 sets shift 15 for HiRes (640x480);
+ * nothing else reads the shift. Shift 14 puts the corners into a 1280x960
+ * space (twice the virtual width in widescreen) and shift 13 into 2560x1920,
+ * so the game's own rasterizer draws the world at 2x or 4x. 3x is no power
+ * of two: FUN_0040FFC0 (called only from 0x40FF5A and 0x40FF87, the quad
+ * list walk) then jumps to HookedCorners, which multiplies by 3 instead.
+ *
+ * The textured quad rasterizer (FUN_004180B0) builds the left and right edge
+ * of each quad in two fixed tables of 480 rows x 12 bytes (x, u, v) at
+ * 0x482BF8 and 0x484280, and FUN_004184A0 clamps every edge to row 479. The
+ * tables move into this DLL with 1920 rows, and the clamp follows the scale
+ * of each race. The flat-colour rasterizer (FUN_0044D620) has no per-row
+ * tables and only clips against the clip rectangle.
+ *
+ * The scale is set for each race (RenderScaleSetActive), when its display
+ * mode is known; the install prepares everything up to the largest scale
+ * the race may use.
+ *
+ * @file render_scale.cpp
+ * @author Alexander Schmidt
+ * @copyright Copyright (C) 2026 Alexander Schmidt
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ */
 
 #include "render_scale.h"
 #include "road_rash_patch.h"
@@ -10,57 +37,62 @@
 // memcpy, which this DLL does not have (no C runtime).
 #pragma intrinsic(__stosb, __movsb)
 
-// The game computes the 3D world in a 320x240 space with 16.16 fixed point
-// and converts every quad corner to pixels in FUN_0040FFC0:
-// (corner >> shift) & mask. FUN_00410160 sets shift 15 for HiRes (640x480);
-// nothing else reads the shift. Shift 14 puts the corners into a 1280x960
-// space (twice the virtual width in widescreen) and shift 13 into 2560x1920,
-// so the game's own rasterizer draws the world at 2x or 4x. 3x is no power
-// of two: FUN_0040FFC0 (called only from 0x40FF5A and 0x40FF87, the quad
-// list walk) then jumps to HookedCorners, which multiplies by 3 instead.
-//
-// The textured quad rasterizer (FUN_004180B0) builds the left and right edge
-// of each quad in two fixed tables of 480 rows x 12 bytes (x, u, v) at
-// 0x482BF8 and 0x484280, and FUN_004184A0 clamps every edge to row 479. The
-// tables move into this DLL with 1920 rows, and the clamp follows the scale
-// of each race. The flat-colour rasterizer (FUN_0044D620) has no per-row
-// tables and only clips against the clip rectangle.
-//
-// The scale is set for each race (RenderScaleSetActive), when its display
-// mode is known; the install prepares everything up to the largest scale
-// the race may use.
-
+/**
+ * The preferred load address of ROADRASH.EXE, which its absolute addresses
+ * assume.
+ */
 static const DWORD kImageBase = 0x00400000;
+/** The rows of the HiRes frame. */
 static const DWORD kOriginalRows = 480;
+/** The rows of the moved edge tables, for the largest scale. */
 static const DWORD kMaxRows = kOriginalRows * kMaxRenderScale;
+/** The bytes per row of an edge table (x, u, v). */
 static const DWORD kEdgeRowSize = 12;
 
+/** The game's left edge table (0x482BF8). */
 static const DWORD kLeftEdgesVa = 0x00482BF8;
+/** The game's right edge table (0x484280). */
 static const DWORD kRightEdgesVa = 0x00484280;
+/** The mov edx, 479 in FUN_004184A0 that clamps every edge to the last row. */
 static const DWORD kEdgeClampRva = 0x00018584;
 
+/** The mov dword ptr [shift], 15 in the HiRes setup, FUN_00410160. */
 static const DWORD kShiftStoreRva = 0x000101BC;
+/** The corner shift (0x481FA8). */
 static const DWORD kShiftRva = 0x00081FA8;
+/** The corner mask (0x481FF4). */
 static const DWORD kMaskRva = 0x00081FF4;
+/** The corner shift of HiRes: 16.16 in 320x240 to pixels in 640x480. */
 static const DWORD kHiResShift = 15;
 
-// FUN_0040FFC0 (fastcall: quad list node, quad) and the function it ends
-// with, FUN_00410080 (fastcall: quad, node).
+/** The corner conversion FUN_0040FFC0 (fastcall: quad list node, quad). */
 static const DWORD kCornersRva = 0x0000FFC0;
+/**
+ * The function FUN_0040FFC0 ends with, FUN_00410080 (fastcall: quad,
+ * node).
+ */
 static const DWORD kCornersTailRva = 0x00010080;
+/** The offset of the eight corner coordinates in a quad. */
 static const DWORD kQuadCornersOffset = 0x44;
+/** The offset of the eight corner pixels in a quad list node. */
 static const DWORD kNodeCornersOffset = 0x18;
+/** The number of corner coordinates of a quad (x and y of four corners). */
 static const DWORD kCornerCount = 8;
 
+/** An instruction of the rasterizer that addresses an edge table. */
 struct EdgeSite
 {
+    /** The relative address of the instruction. */
     DWORD rva;
+    /** The opcode (and ModR/M byte) before the address. */
     BYTE prefix[2];
+    /** The number of bytes used in prefix, 1 or 2. */
     BYTE prefixLength;
+    /** The address the instruction holds in the original game. */
     DWORD target;
 };
 
-// Every instruction of the rasterizer that addresses the edge tables.
+/** Every instruction of the rasterizer that addresses the edge tables. */
 static const EdgeSite kEdgeSites[] =
 {
     { 0x000183B9, { 0xB9, 0x00 }, 1, 0x00484280 },  // mov ecx, right
@@ -77,23 +109,41 @@ static const EdgeSite kEdgeSites[] =
     { 0x0001886E, { 0x8B, 0x86 }, 2, 0x00482C00 },  // mov eax, [esi + left.v]
 };
 
+/** The number of entries in kEdgeSites. */
 static const DWORD kEdgeSiteCount = sizeof(kEdgeSites) / sizeof(kEdgeSites[0]);
 
+/** The function the corner conversion ends with, FUN_00410080. */
 typedef void (__fastcall *CornersTailFn)(BYTE* quad, BYTE* node);
 
+/** The moved left edge table, kMaxRows rows. */
 static DWORD g_leftEdges[kMaxRows * kEdgeRowSize / sizeof(DWORD)];
+/** The moved right edge table, kMaxRows rows. */
 static DWORD g_rightEdges[kMaxRows * kEdgeRowSize / sizeof(DWORD)];
+/** Module base of ROADRASH.EXE. */
 static DWORD g_scaleBase = 0;
+/** The largest scale the install prepared. */
 static DWORD g_maxScale = 1;
+/** TRUE after a successful RenderScaleInstall. */
 static BOOL g_scaleInstalled = FALSE;
-// 3x: HookedCorners multiplies while the HiRes shift is set.
+/** 3x: HookedCorners multiplies while the HiRes shift is set. */
 static BOOL g_tripled = FALSE;
 
+/**
+ * Writes a line to the log.
+ *
+ * @param [in] text The line, without line break.
+ */
 static void LogScale(const CHAR* text)
 {
     LogProxyMessage(text, NULL, 0);
 }
 
+/**
+ * Reads an unaligned little-endian DWORD.
+ *
+ * @param [in] bytes The four bytes.
+ * @return The value.
+ */
 static DWORD ReadDword(const BYTE* bytes)
 {
     return static_cast<DWORD>(bytes[0]) |
@@ -102,6 +152,14 @@ static DWORD ReadDword(const BYTE* bytes)
         (static_cast<DWORD>(bytes[3]) << 24);
 }
 
+/**
+ * Overwrites bytes of the game's code.
+ *
+ * @param [in] rva The relative address of the first byte.
+ * @param [in] bytes The new bytes.
+ * @param [in] length The number of bytes.
+ * @return FALSE when the code could not be made writable.
+ */
 static BOOL WriteCode(DWORD rva, const BYTE* bytes, DWORD length)
 {
     BYTE* destination = reinterpret_cast<BYTE*>(g_scaleBase + rva);
@@ -124,6 +182,13 @@ static BOOL WriteCode(DWORD rva, const BYTE* bytes, DWORD length)
     return TRUE;
 }
 
+/**
+ * Overwrites a DWORD of the game's code.
+ *
+ * @param [in] rva The relative address of the DWORD.
+ * @param [in] value The new value.
+ * @return FALSE when the code could not be made writable.
+ */
 static BOOL WriteCodeDword(DWORD rva, DWORD value)
 {
     BYTE bytes[4];
@@ -135,7 +200,12 @@ static BOOL WriteCodeDword(DWORD rva, DWORD value)
     return WriteCode(rva, bytes, sizeof(bytes));
 }
 
-// The address an edge site should use instead of its original target.
+/**
+ * Gives the address an edge site uses instead of its original target.
+ *
+ * @param [in] target The address in the game's edge tables.
+ * @return The same place in the moved tables.
+ */
 static DWORD RelocatedTarget(DWORD target)
 {
     DWORD tableBytes = kOriginalRows * kEdgeRowSize;
@@ -148,8 +218,14 @@ static DWORD RelocatedTarget(DWORD target)
     return reinterpret_cast<DWORD>(g_rightEdges) + (target - kRightEdgesVa);
 }
 
-// The shift that converts HiRes corners at a power-of-two scale (3x keeps
-// the HiRes shift and multiplies in HookedCorners).
+/**
+ * Gives the corner shift for a scale.
+ *
+ * 3x keeps the HiRes shift and multiplies in HookedCorners.
+ *
+ * @param [in] scale The render scale.
+ * @return The shift that converts HiRes corners at that scale.
+ */
 static DWORD ShiftForScale(DWORD scale)
 {
     switch (scale)
@@ -172,9 +248,16 @@ LONG RenderScaleFixed(LONG value, DWORD scale)
         static_cast<LONG>(((static_cast<DWORD>(value) & 0x7FFF) * scale) >> kHiResShift);
 }
 
-// Replaces FUN_0040FFC0 (whose first instruction jumps here) for 3x: the
-// eight corner coordinates of the quad become pixels, then FUN_00410080
-// runs as at the end of the original.
+/**
+ * Converts the corners of a quad to pixels, also at 3x.
+ *
+ * Replaces FUN_0040FFC0 (whose first instruction jumps here): the eight
+ * corner coordinates of the quad become pixels, then FUN_00410080 runs as
+ * at the end of the original.
+ *
+ * @param [in,out] node The quad list node that receives the corner pixels.
+ * @param [in] quad The quad.
+ */
 static void __fastcall HookedCorners(BYTE* node, BYTE* quad)
 {
     const LONG* corners = reinterpret_cast<const LONG*>(quad + kQuadCornersOffset);

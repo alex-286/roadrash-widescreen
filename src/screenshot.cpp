@@ -1,5 +1,11 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
-// Copyright (C) 2026 Alexander Schmidt
+/**
+ * Screenshots of locked surfaces as BMP files in the game folder.
+ *
+ * @file screenshot.cpp
+ * @author Alexander Schmidt
+ * @copyright Copyright (C) 2026 Alexander Schmidt
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ */
 
 #include "screenshot.h"
 
@@ -7,11 +13,21 @@
 
 #pragma intrinsic(__movsb)
 
+/** The size of BITMAPFILEHEADER in bytes. */
 static const DWORD kFileHeaderSize = 14;
+/** The size of BITMAPINFOHEADER in bytes. */
 static const DWORD kInfoHeaderSize = 40;
+/** The size of the 256-color table of an 8-bit BMP in bytes. */
 static const DWORD kPaletteSize = 256 * 4;
+/** The highest number of a numbered screenshot. */
 static const DWORD kMaxNumber = 999;
 
+/**
+ * Stores a DWORD in little-endian byte order.
+ *
+ * @param [out] destination The four bytes to write.
+ * @param [in] value The value to store.
+ */
 static void PutDword(BYTE* destination, DWORD value)
 {
     destination[0] = static_cast<BYTE>(value);
@@ -20,7 +36,12 @@ static void PutDword(BYTE* destination, DWORD value)
     destination[3] = static_cast<BYTE>(value >> 24);
 }
 
-// The folder of the game executable, with a trailing backslash.
+/**
+ * Gives the folder of the game executable, with a trailing backslash.
+ *
+ * @param [out] path Receives the folder (MAX_PATH characters).
+ * @return The length of the folder, or 0 when it is not known.
+ */
 static DWORD GetGameFolder(CHAR* path)
 {
     DWORD length = GetModuleFileNameA(NULL, path, MAX_PATH);
@@ -39,6 +60,15 @@ static DWORD GetGameFolder(CHAR* path)
     return length;
 }
 
+/**
+ * Creates the BMP file in the game folder.
+ *
+ * @param [in] name The file name, or with numbered the prefix.
+ * @param [in] numbered TRUE to use the first free name from prefix001.bmp to
+ *             prefix999.bmp; FALSE to replace the file name.
+ * @param [out] savedName Receives the file name that is created.
+ * @return The file, open for writing, or INVALID_HANDLE_VALUE.
+ */
 static HANDLE CreateBmpFile(const CHAR* name, BOOL numbered, CHAR* savedName)
 {
     CHAR path[MAX_PATH];

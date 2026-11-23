@@ -1,105 +1,187 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
-// Copyright (C) 2026 Alexander Schmidt
+/**
+ * Keeps the road from jumping by a few pixels while riding.
+ *
+ * FUN_00443D70 (called once per frame at 0x443A5C) projects the road ahead
+ * segment by segment. The camera stands at frac = position & 0xFF within
+ * its segment, so the first segment boundary lies 0x100 - frac ahead. For
+ * each road (one, or two where the road splits) it keeps a block of ten
+ * values p[0..9] and calls FUN_00444630 once per segment, which turns the
+ * block into screen coordinates (16.16 in the 320x240 space) and steps it
+ * on:
+ *
+ * @verbatim
+ *   p[0] height step (section + 0xBC)   p[1] height, p[1] += p[0]
+ *   p[2] side step                      p[3] side offset, p[3] += p[2]
+ *   p[4] depth, += 0x100                p[5], p[6] camera side and height
+ *   p[7] out: top of the road           p[8], p[9] the previous segment
+ *   screen y = (p[6] - p[1]) * scale + 0x5A0000
+ *   screen x = (p[3] - p[5] + edge) * scale + centre, scale = 1 / depth
+ * @endverbatim
+ *
+ * The first block is started in whole units:
+ *
+ * @verbatim
+ *   p[1] = -((frac * slope) >> 8)          drops rem = (frac * slope) & 0xFF
+ *   p[2] = (curve * (0x100 - frac)) / 256  drops eps = the rest of the division
+ * @endverbatim
+ *
+ * Every later segment inherits both: the road is rem / 256 units too high,
+ * and segment k lies k * eps / 256 units to the side. When frac grows, the
+ * whole parts change in steps, so the road and its edges jump by up to a
+ * few pixels near the camera (twice as many at 960 lines).
+ *
+ * After each plain segment (section type + 0x3C = 0) this adds
+ * rem * scale / 256 to its screen y values and k * eps * scale / 256 to its
+ * screen x values, and the same to the far edge of the previous segment,
+ * which the game copies from this one. eps is the same for both roads (the
+ * second one is started from the first one's side step, or the other way
+ * round); rem is per road, and a block that the game copies from the other
+ * road takes that road's rem. Anything unexpected is left as the game
+ * computed it.
+ *
+ * @file smooth_road.cpp
+ * @author Alexander Schmidt
+ * @copyright Copyright (C) 2026 Alexander Schmidt
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ */
 
 #include "smooth_road.h"
 #include "road_rash_patch.h"
 
-// FUN_00443D70 (called once per frame at 0x443A5C) projects the road ahead
-// segment by segment. The camera stands at frac = position & 0xFF within
-// its segment, so the first segment boundary lies 0x100 - frac ahead. For
-// each road (one, or two where the road splits) it keeps a block of ten
-// values p[0..9] and calls FUN_00444630 once per segment, which turns the
-// block into screen coordinates (16.16 in the 320x240 space) and steps it on:
-//   p[0] height step (section + 0xBC)   p[1] height, p[1] += p[0]
-//   p[2] side step                      p[3] side offset, p[3] += p[2]
-//   p[4] depth, += 0x100                p[5], p[6] camera side and height
-//   p[7] out: top of the road           p[8], p[9] the previous segment
-// screen y = (p[6] - p[1]) * scale + 0x5A0000 and
-// screen x = (p[3] - p[5] + edge) * scale + centre, scale = 1 / depth.
-//
-// The first block is started in whole units:
-//   p[1] = -((frac * slope) >> 8)               drops rem = (frac * slope) & 0xFF
-//   p[2] = (curve * (0x100 - frac)) / 256       drops eps = the rest of the division
-// Every later segment inherits both: the road is rem / 256 units too high,
-// and segment k lies k * eps / 256 units to the side. When frac grows, the
-// whole parts change in steps, so the road and its edges jump by up to a
-// few pixels near the camera (twice as many at 960 lines).
-//
-// After each plain segment (section type + 0x3C = 0) this adds
-// rem * scale / 256 to its screen y values and k * eps * scale / 256 to its
-// screen x values, and the same to the far edge of the previous segment,
-// which the game copies from this one. eps is the same for both roads (the
-// second one is started from the first one's side step, or the other way
-// round); rem is per road, and a block that the game copies from the other
-// road takes that road's rem. Anything unexpected is left as the game
-// computed it.
+/** The call of the road projection, FUN_00443D70, once per frame. */
 static const DWORD kSetupCallRva = 0x00043A5C;
+/** The road projection, FUN_00443D70. */
 static const DWORD kSetupRva = 0x00043D70;
+/** The projection of one segment, FUN_00444630. */
 static const DWORD kSectionRva = 0x00044630;
+/** The calls of FUN_00444630 in the road projection. */
 static const DWORD kSectionCalls[] =
 {
     0x00043E99, 0x0004406B, 0x0004407B, 0x00044266, 0x00044276, 0x000444A0
 };
+/** The number of entries in kSectionCalls. */
 static const DWORD kSectionCallCount = sizeof(kSectionCalls) / sizeof(kSectionCalls[0]);
 
-// The ring of the 128 segments around the camera; a node holds its road
-// state (byte + 0x1C: 1 = one road, 2 = split) and the course sections of
-// both roads (+ 0x0C, + 0x10).
+/**
+ * The ring of the 128 segments around the camera.
+ *
+ * A node holds its road state (byte + 0x1C: 1 = one road, 2 = split) and the
+ * course sections of both roads (+ 0x0C, + 0x10).
+ */
 static const DWORD kNodeRingRva = 0x0009E820;
 
-// FUN_00443940 (lea edi, [eax * 2 + table] at 0x443950): the depth
-// reciprocal table, which DrawDistance may have moved.
+/**
+ * The lea edi, [eax * 2 + table] in FUN_00443940 that names the depth
+ * reciprocal table, which DrawDistance may have moved.
+ */
 static const DWORD kReciprocalLeaRva = 0x00043950;
+/** The game's own address of the depth reciprocal table. */
 static const DWORD kReciprocalVa = 0x0046F098;
 
-// Screen fields of a segment record (FUN_00444630, type 0).
+/** The offset of the scale (1 / depth) in a segment record. */
 static const DWORD kScaleOffset = 0x20;
+/**
+ * The offsets of the screen y values in a segment record (FUN_00444630,
+ * type 0).
+ */
 static const DWORD kYOffsets[] = { 0x38, 0x4C, 0x54, 0x5C, 0x64, 0x6C };
+/**
+ * The offsets of the screen x values in a segment record (FUN_00444630,
+ * type 0).
+ */
 static const DWORD kXOffsets[] = { 0x40, 0x44, 0x48, 0x50, 0x58, 0x60, 0x68 };
 
+/** The road projection, FUN_00443D70. */
 typedef void (__fastcall *SetupFn)(DWORD, LONG*, int, LONG*, int);
+/** The projection of one segment, FUN_00444630: section, record, block. */
 typedef void (__fastcall *SectionFn)(BYTE*, BYTE*, LONG*);
 
+/** What is known about the block of values the game keeps for one road. */
 struct RoadBlock
 {
+    /** The game's block p[0..9]. */
     LONG* block;
+    /** TRUE once a segment of the block was projected this frame. */
     BOOL seen;
+    /**
+     * TRUE when the block was started as expected, so the correction applies.
+     */
     BOOL valid;
+    /** The height fraction the game dropped, in 1/256 units. */
     LONG rem;
+    /** p[1] before the last projected segment. */
     LONG entryHeight;
+    /** p[4] before the last projected segment. */
     LONG entryDepth;
+    /** p[1] after the last projected segment, expected for the next one. */
     LONG nextHeight;
+    /** p[4] after the last projected segment, expected for the next one. */
     LONG nextDepth;
+    /** The segment record projected last. */
     BYTE* lastRecord;
+    /** The side correction applied to lastRecord, in 1/256 units. */
     LONG lastX;
+    /** The height correction applied to lastRecord, in 1/256 units. */
     LONG lastY;
 };
 
+/** Module base of ROADRASH.EXE. */
 static DWORD g_base = 0;
+/** The road projection that HookedSetup calls. */
 static SetupFn g_setupNext = NULL;
+/**
+ * The segment projection that HookedSection calls: the game's, or
+ * DrawDistance's hook in front of it.
+ */
 static SectionFn g_sectionNext = NULL;
+/** TRUE while the game projects the road of a frame. */
 static BOOL g_active = FALSE;
+/** The camera's position within its segment, 0-255. */
 static LONG g_frac = 0;
+/** The depth of the first segment boundary, 0x100 - g_frac. */
 static LONG g_firstDepth = 0;
+/** The rest the game dropped when it divided the first side step. */
 static LONG g_eps = 0;
+/** The first side step as the game computes it. */
 static LONG g_firstSideStep = 0;
+/** TRUE when g_eps applies to this frame. */
 static BOOL g_epsValid = FALSE;
+/** The road (0 or 1) whose curve the game used for the first side step. */
 static int g_epsBlock = 0;
+/** The blocks of the one or two roads of this frame. */
 static RoadBlock g_blocks[2];
+/** The number of entries used in g_blocks. */
 static DWORD g_blockCount = 0;
 
+/**
+ * Writes a line to the log.
+ *
+ * @param [in] text The line, without line break.
+ */
 static void LogSmooth(const CHAR* text)
 {
     LogProxyMessage(text, NULL, 0);
 }
 
+/**
+ * Reads an unaligned little-endian DWORD.
+ *
+ * @param [in] bytes The four bytes.
+ * @return The value.
+ */
 static DWORD ReadDword(const BYTE* bytes)
 {
     return bytes[0] | (bytes[1] << 8) | (bytes[2] << 16) |
         (static_cast<DWORD>(bytes[3]) << 24);
 }
 
-// The absolute target of the call at rva, or 0 when it is no call.
+/**
+ * Gives the target of a call in the game's code.
+ *
+ * @param [in] rva The relative address of the instruction.
+ * @return The absolute target of the E8 call at rva, or 0 when it is no
+ *         call.
+ */
 static DWORD CallTarget(DWORD rva)
 {
     const BYTE* code = reinterpret_cast<const BYTE*>(g_base + rva);
@@ -112,6 +194,13 @@ static DWORD CallTarget(DWORD rva)
     return g_base + rva + 5 + ReadDword(code + 1);
 }
 
+/**
+ * Points a call in the game's code to a hook.
+ *
+ * @param [in] rva The relative address of the E8 call.
+ * @param [in] hook The new target.
+ * @return FALSE when the code could not be made writable.
+ */
 static BOOL RedirectCall(DWORD rva, const void* hook)
 {
     BYTE* code = reinterpret_cast<BYTE*>(g_base + rva);
@@ -136,11 +225,24 @@ static BOOL RedirectCall(DWORD rva, const void* hook)
     return TRUE;
 }
 
+/**
+ * Converts a world correction to screen units.
+ *
+ * @param [in] fraction The correction, in 1/256 units.
+ * @param [in] scale The scale of the segment (1 / depth).
+ * @return fraction * scale / 256.
+ */
 static LONG Scaled(LONG fraction, LONG scale)
 {
     return fraction != 0 ? MulDiv(fraction, scale, 256) : 0;
 }
 
+/**
+ * Reads the depth reciprocal table, wherever DrawDistance put it.
+ *
+ * @param [in] depth The depth.
+ * @return The scale (1 / depth).
+ */
 static LONG Reciprocal(LONG depth)
 {
     const BYTE* table = reinterpret_cast<const BYTE*>(
@@ -149,6 +251,13 @@ static LONG Reciprocal(LONG depth)
     return *reinterpret_cast<const LONG*>(table + (depth & ~1) * 2);
 }
 
+/**
+ * Finds the entry of a block of the game's values.
+ *
+ * @param [in] block The game's block p[0..9].
+ * @param [in] add TRUE to add an empty entry when there is none.
+ * @return The entry, or NULL when there is none and none can be added.
+ */
 static RoadBlock* FindBlock(LONG* block, BOOL add)
 {
     DWORD index;
@@ -177,8 +286,14 @@ static RoadBlock* FindBlock(LONG* block, BOOL add)
     return &g_blocks[g_blockCount++];
 }
 
-// The world corrections (1/256 units) applied to a record, if it is the
-// last one a block handled.
+/**
+ * Gives the world corrections applied to a record, if it is the last one a
+ * block handled.
+ *
+ * @param [in] record The segment record, or NULL.
+ * @param [out] x Receives the side correction, in 1/256 units, or 0.
+ * @param [out] y Receives the height correction, in 1/256 units, or 0.
+ */
 static void LastCorrection(const BYTE* record, LONG* x, LONG* y)
 {
     DWORD index;
@@ -196,11 +311,21 @@ static void LastCorrection(const BYTE* record, LONG* x, LONG* y)
     }
 }
 
-// Where the road width changes within the previous segment (its section is
-// plain, flags + 0x37 & 0x18), FUN_00444630 projects one more point on its
-// left (+ 0xA0, at angle + 0x138) or right edge (+ 0xA8, angle + 0x13C),
-// between that segment and this one at t / 256 of the way (0x100 - t with
-// flag 8), from their uncorrected world values.
+/**
+ * Corrects the extra point projected where the road width changes.
+ *
+ * Where the road width changes within the previous segment (its section is
+ * plain, flags + 0x37 & 0x18), FUN_00444630 projects one more point on its
+ * left (+ 0xA0, at angle + 0x138) or right edge (+ 0xA8, angle + 0x13C),
+ * between that segment and this one at t / 256 of the way (0x100 - t with
+ * flag 8), from their uncorrected world values.
+ *
+ * @param [in,out] previous The record of the previous segment, or NULL.
+ * @param [in] angleOffset The offset of t in the section.
+ * @param [in] pointOffset The offset of the point in previous.
+ * @param [in] x The side correction of this segment, in 1/256 units.
+ * @param [in] y The height correction of this segment, in 1/256 units.
+ */
 static void CorrectWidthPoint(
     BYTE* previous,
     DWORD angleOffset,
@@ -246,6 +371,15 @@ static void CorrectWidthPoint(
     *reinterpret_cast<LONG*>(previous + pointOffset + 4) += Scaled(pointY, scale);
 }
 
+/**
+ * Projects one segment with the game's function and corrects its screen
+ * values; replaces the calls of FUN_00444630.
+ *
+ * @param [in] section The course section of the segment.
+ * @param [in,out] record The segment record that receives the screen
+ *                 values.
+ * @param [in,out] p The block p[0..9] of the road.
+ */
 static void __fastcall HookedSection(BYTE* section, BYTE* record, LONG* p)
 {
     BYTE* previousLeft = reinterpret_cast<BYTE*>(p[8]);
@@ -353,6 +487,16 @@ static void __fastcall HookedSection(BYTE* section, BYTE* record, LONG* p)
     block->lastY = y;
 }
 
+/**
+ * Finds frac and eps for the frame and projects the road with the game's
+ * function; replaces the call of FUN_00443D70.
+ *
+ * @param [in] position The camera position on the course.
+ * @param [in,out] slices Passed on to the game.
+ * @param [in] count Passed on to the game.
+ * @param [in,out] camera Passed on to the game.
+ * @param [in] mode The road the camera is on where the road splits (0 or 1).
+ */
 static void __fastcall HookedSetup(
     DWORD position,
     LONG* slices,

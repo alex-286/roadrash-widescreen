@@ -1,115 +1,121 @@
-// SPDX-License-Identifier: GPL-3.0-or-later
-// Copyright (C) 2026 Alexander Schmidt
+/**
+ * Fixes for faults in the original game, independent of the widescreen
+ * view.
+ *
+ * Every fix checks the original bytes before it changes anything and logs
+ * why it stays off when they differ. Addresses are RVAs in ROADRASH.EXE
+ * 1.0A. Absolute addresses inside instructions are compared after adding
+ * the actual module base, in case the executable was relocated.
+ *
+ * @file game_fixes.cpp
+ * @author Alexander Schmidt
+ * @copyright Copyright (C) 2026 Alexander Schmidt
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ */
 
 #include "game_fixes.h"
 #include "alt_tab.h"
 #include "road_rash_patch.h"
 
-// Every fix checks the original bytes before it changes anything and logs
-// why it stays off when they differ. Addresses are RVAs in ROADRASH.EXE
-// 1.0A. Absolute addresses inside instructions are compared after
-// adding the actual module base, in case the executable was relocated.
-
-// Bike colours: in a race every bike is drawn from one template and
-// recoloured through a 256-byte palette remap, one per bike model
-// (15 tables, read only at 0x44384C as [model * 256 + 0x46E158]). The
-// tables of models 0-4 and 5-9 are swapped in the original data, so the
-// Rat and Super bikes race in each other's colours while the shop shows
-// them correctly. Swapping the two groups back fixes it.
+/**
+ * The bike colour remaps, read only at 0x44384C as
+ * [model * 256 + 0x46E158].
+ */
 static const DWORD kBikeRemapTablesRva = 0x0006E158;
+/** The bytes of one remap table. */
 static const DWORD kBikeRemapTableSize = 256;
+/** The number of remap tables, one per bike model. */
 static const DWORD kBikeRemapTableCount = 15;
+/** The number of tables in each of the two swapped groups. */
 static const DWORD kBikeRemapGroupSize = 5;
+/** The checksum of all remap tables in the original game. */
 static const DWORD kBikeRemapTablesChecksum = 0x6C2053F7;
 
-// Sprite snapping: FUN_00410160 sets how FUN_0040FFC0 converts the 16.16
-// corners of every world quad into pixels: (corner >> shift) & mask. In
-// HiRes it writes shift 15 and mask 0xFFFFFFFE, which keeps every corner on
-// an even pixel, so objects move in steps of 2 pixels. The mask 0xFFFFFFFF
-// (as in low resolution) keeps the full 640x480 precision.
+/** The mov dword ptr [0x481FF4], 0xFFFFFFFE in the HiRes setup. */
 static const DWORD kHiResMaskStoreRva = 0x000101C6;
+/** The corner mask (0x481FF4). */
 static const DWORD kCornerMaskRva = 0x00081FF4;
+/** The game's HiRes corner mask, which keeps every corner on an even pixel. */
 static const DWORD kSnappingCornerMask = 0xFFFFFFFE;
+/** The corner mask with the full 640x480 precision. */
 static const DWORD kFullCornerMask = 0xFFFFFFFF;
 
-// Music volume: when a song starts, FUN_00433BB0 sets the MIDI volume to
-// master x music from the Sound Mix screen with midiOutSetVolume. Since
-// Windows Vista that call changes the volume of the whole game in the
-// Windows volume mixer, and Windows remembers it: a music volume of 0 left
-// the game without any sound, even after a restart. A song that would
-// play silently now takes the game's own path for muted music instead, so
-// midiOutSetVolume(0) is never called.
+/** The call of the music start FUN_00433BB0. */
 static const DWORD kMusicStartCallRva = 0x00035E3F;
+/** FUN_00433BB0, which starts a song. */
 static const DWORD kMusicStartFunctionRva = 0x00033BB0;
+/** The master volume of the Sound Mix screen (0-100). */
 static const DWORD kMasterVolumeRva = 0x00063048;
+/** The music volume of the Sound Mix screen (0-100). */
 static const DWORD kMusicVolumeRva = 0x000630A8;
+/** The flag the game clears for muted music. */
 static const DWORD kMusicPlayingFlagRva = 0x000C4174;
 
+/** FUN_00433BB0: song, track. */
 typedef DWORD (__fastcall *MusicStartFn)(DWORD, DWORD);
 
-// Object update rate: FUN_00438170 walks the world nodes (riders, cars,
-// pedestrians, cops) every game tick and updates each one through
-// FUN_00437E60 once its next-update tick [node + 0x0C] has come. That
-// function runs the node's think and move handlers with the time since its
-// last update ([node + 0x18]), then picks a new interval [node + 0x14] from
-// the distance to the camera: 1 tick close by, up to 8 for riders 30
-// segments ahead (0x1E for nodes off the road). Far riders and cars
-// therefore move in visible jumps. At 0x438108 it computes
-// next = [node + 0x14] + tick. Within the range where the original game
-// draws nodes (FUN_00438450: up to camera + 0x2000), next becomes tick + 1,
-// so they move every tick; their movement still follows the elapsed time as
-// before. Nodes further away, behind the camera or off the road keep their
-// interval, and [node + 0x14] stays as the game computed it. (With
-// DrawDistance, nodes are drawn up to 48 segments ahead; updating those
-// every tick as well more than doubled the game time per frame, so they keep
-// the game's interval.)
+/** The next = [node + 0x14] + tick at 0x438108 in FUN_00437E60. */
 static const DWORD kNextUpdateRva = 0x00038108;
+/** The camera's course position. */
 static const DWORD kCameraPositionRva = 0x000B6E5C;
+/**
+ * The course distance behind the camera from which nodes update every
+ * tick.
+ */
 static const LONG kFullRateBehind = -0x400;
+/**
+ * The course distance ahead of the camera up to which nodes update every
+ * tick (the original draw distance).
+ */
 static const LONG kFullRateAhead = 0x2100;
 
+/** The address of the camera's course position, for HookedNextUpdate. */
 static DWORD g_cameraPositionVa = 0;
 
-// Punch shadow: FUN_00443610 (called once per HiRes setup, from 0x4101AA)
-// loads the rider's shadow frames (DATA\BIKERS\HISHADOW.DAT, LOSHADOW.DAT
-// in low resolution) into a table of 326 entries at 0x49BFE0: pixel
-// pointer, width byte, height byte. Every frame is drawn centred on its
-// box. Frame 176, the first frame of the punch, has two stray pixels in the
-// top corner of a 118x168 box (59x84 in low resolution), while the shadow
-// itself is the band of 13 (6) rows at the bottom, so the shadow jumps far
-// away from the bike. After loading, the entry points at a copy of the
-// shadow alone.
+/** The call of the shadow loader FUN_00443610 in the HiRes setup. */
 static const DWORD kShadowLoaderCallRva = 0x000101AA;
+/** FUN_00443610, which loads the rider's shadow frames. */
 static const DWORD kShadowLoaderRva = 0x00043610;
+/**
+ * The shadow frames: 326 entries of pixel pointer, width byte, height
+ * byte.
+ */
 static const DWORD kShadowTableRva = 0x0009BFE0;
+/** The first frame of the punch. */
 static const DWORD kPunchShadowFrame = 176;
+/** The most stray pixels expected above the shadow. */
 static const DWORD kMaxStrayPixels = 8;
+/** The largest shadow that fits in g_punchShadow. */
 static const DWORD kMaxShadowBytes = 2048;
 
+/** The shadow loader FUN_00443610. */
 typedef int (__cdecl *ShadowLoaderFn)();
 
+/** The punch frame's shadow without the stray pixels. */
 static BYTE g_punchShadow[kMaxShadowBytes];
 
-// Floating buildings: the pictures of the red barn (BARN12), the brown shop
-// with the sign (RUSTICA2) and the white house (HOUSEB2) in FAMILIES.RSC end
-// in empty rows (2, 5 and 10), and the game places them as if their
-// picture reached the bottom of the texture, so they hover above the
-// ground. Every quad is turned into pixels by FUN_0040FFC0 (called at
-// 0x40FF5A and 0x40FF87); a quad whose texture (quad + 8, a texture header
-// with the name at + 0x10) is one of these is drawn that many rows lower,
-// scaled to its height on screen. Only the drawing changes.
+/** The corner conversion FUN_0040FFC0. */
 static const DWORD kQuadToPixelsRva = 0x0000FFC0;
+/** The calls of FUN_0040FFC0 in the quad list walk. */
 static const DWORD kQuadToPixelsCalls[] = { 0x0000FF5A, 0x0000FF87 };
+/** The first DWORD of a texture header. */
 static const DWORD kTextureMagic = 0x00BC614E;
 
+/** A building picture that ends in empty rows. */
 struct FloatingBuilding
 {
+    /** The texture name, padded with zeros. */
     CHAR name[8];
+    /** The rows it is drawn lower. */
     LONG rows;
 };
 
-// The shop is lowered by 3 of its 5 empty rows, which looks best (it has a
-// porch at its bottom edge).
+/**
+ * The floating buildings.
+ *
+ * The shop is lowered by 3 of its 5 empty rows, which looks best (it has a
+ * porch at its bottom edge).
+ */
 static const FloatingBuilding kFloatingBuildings[] =
 {
     { { 'B', 'A', 'R', 'N', '1', '2', 0, 0 }, 2 },
@@ -117,37 +123,49 @@ static const FloatingBuilding kFloatingBuildings[] =
     { { 'H', 'O', 'U', 'S', 'E', 'B', '2', 0 }, 10 }
 };
 
+/** The number of entries in kFloatingBuildings. */
 static const DWORD kFloatingBuildingCount =
     sizeof(kFloatingBuildings) / sizeof(kFloatingBuildings[0]);
 
+/** The corner conversion FUN_0040FFC0. */
 typedef void (__fastcall *QuadToPixelsFn)(BYTE* node, BYTE* quad);
 
+/** TRUE for each floating building once it was written to the log. */
 static BOOL g_buildingLogged[kFloatingBuildingCount];
 
-// Odometer: FUN_00446A40 computes the distance shown in the HUD in tenths
-// of a mile from the player's track position, ((position >> 8) - 50) / 33,
-// or in tenths of a kilometre with metric units, ((position >> 5) - 400) /
-// 165, and stores only the low byte (mov [0x49E115], al at 0x446A61 and
-// 0x446A75). The HUD reads it unsigned at 0x446DA1 (xor edx, edx /
-// mov dl, [0x49E115]) and prints value / 10 and value % 10, so the display
-// wraps to 0 after 25.5 (most courses in kilometres are longer) and shows
-// 25.x before the start line, where the value is negative. Nothing else
-// reads the byte. Both stores now keep the whole value in this DLL, and
-// the HUD reads it back limited to 0..9999.
+/** The low byte of the HUD distance the game stores (0x49E115). */
 static const DWORD kOdometerByteRva = 0x0009E115;
+/** The mov [0x49E115], al at 0x446A61 and 0x446A75. */
 static const DWORD kOdometerStoreRvas[] = { 0x00046A61, 0x00046A75 };
+/** The xor edx, edx / mov dl, [0x49E115] of the HUD at 0x446DA1. */
 static const DWORD kOdometerReadRva = 0x00046DA1;
+/** The largest distance shown, in tenths. */
 static const LONG kOdometerMaximum = 9999;
 
+/** The whole HUD distance, in tenths of a mile or kilometre. */
 static LONG g_odometerTenths = 0;
 
+/** Module base of ROADRASH.EXE. */
 static DWORD g_fixesBase = 0;
 
+/**
+ * Writes a line to the log.
+ *
+ * @param [in] text The line, without line break.
+ */
 static void LogFix(const CHAR* text)
 {
     LogProxyMessage(text, NULL, 0);
 }
 
+/**
+ * Tells whether the game's code is as in the original.
+ *
+ * @param [in] rva The relative address of the code.
+ * @param [in] expected The expected bytes.
+ * @param [in] length The number of bytes.
+ * @return TRUE when all bytes match.
+ */
 static BOOL MatchesGameBytes(DWORD rva, const BYTE* expected, DWORD length)
 {
     const BYTE* actual = reinterpret_cast<const BYTE*>(g_fixesBase + rva);
@@ -164,6 +182,14 @@ static BOOL MatchesGameBytes(DWORD rva, const BYTE* expected, DWORD length)
     return TRUE;
 }
 
+/**
+ * Overwrites bytes of the game's code.
+ *
+ * @param [in] rva The relative address of the first byte.
+ * @param [in] bytes The new bytes.
+ * @param [in] length The number of bytes.
+ * @return FALSE when the code could not be made writable.
+ */
 static BOOL WriteGameBytes(DWORD rva, const void* bytes, DWORD length)
 {
     BYTE* destination = reinterpret_cast<BYTE*>(g_fixesBase + rva);
@@ -191,6 +217,12 @@ static BOOL WriteGameBytes(DWORD rva, const void* bytes, DWORD length)
     return TRUE;
 }
 
+/**
+ * Stores a DWORD in little-endian byte order.
+ *
+ * @param [out] bytes The four bytes to write.
+ * @param [in] value The value to store.
+ */
 static void StoreDword(BYTE* bytes, DWORD value)
 {
     bytes[0] = static_cast<BYTE>(value);
@@ -199,7 +231,15 @@ static void StoreDword(BYTE* bytes, DWORD value)
     bytes[3] = static_cast<BYTE>(value >> 24);
 }
 
-// FNV-1a, 32 bits (64-bit arithmetic would need the C runtime).
+/**
+ * Gives the FNV-1a checksum (32 bits) of some bytes.
+ *
+ * 64-bit arithmetic would need the C runtime.
+ *
+ * @param [in] bytes The bytes.
+ * @param [in] length The number of bytes.
+ * @return The checksum.
+ */
 static DWORD Checksum(const BYTE* bytes, DWORD length)
 {
     DWORD hash = 0x811C9DC5;
@@ -213,6 +253,16 @@ static DWORD Checksum(const BYTE* bytes, DWORD length)
     return hash;
 }
 
+/**
+ * Lets the Rat and Super bikes race in their own colours.
+ *
+ * In a race every bike is drawn from one template and recoloured through a
+ * 256-byte palette remap, one per bike model (15 tables, read only at
+ * 0x44384C as [model * 256 + 0x46E158]). The tables of models 0-4 and 5-9
+ * are swapped in the original data, so the Rat and Super bikes race in each
+ * other's colours while the shop shows them correctly. Swapping the two
+ * groups back fixes it.
+ */
 static void FixBikeColors()
 {
     BYTE* tables = reinterpret_cast<BYTE*>(
@@ -247,6 +297,15 @@ static void FixBikeColors()
     LogFix("Bike colour fix: the Rat and Super bikes race in their own colours.");
 }
 
+/**
+ * Lets objects move in 1-pixel steps in HiRes.
+ *
+ * FUN_00410160 sets how FUN_0040FFC0 converts the 16.16 corners of every
+ * world quad into pixels: (corner >> shift) & mask. In HiRes it writes
+ * shift 15 and mask 0xFFFFFFFE, which keeps every corner on an even pixel,
+ * so objects move in steps of 2 pixels. The mask 0xFFFFFFFF (as in low
+ * resolution) keeps the full 640x480 precision.
+ */
 static void SmoothSprites()
 {
     BYTE expected[10] = { 0xC7, 0x05 };
@@ -279,23 +338,24 @@ static void SmoothSprites()
     LogFix("Smooth sprites: objects move in 1-pixel steps in HiRes.");
 }
 
-// Race music diagnostics. FUN_00433BB0 plays Audio\Music\GRUNGE<n>.MID
-// (SBKGRNG<n> with an AWE card, flag 0x46D900), RIFF "MIDS" files of
-// ready-made stream buffers, on the MIDI mapper: midiStreamOpen(device -1),
-// midiStreamProperty, midiOutPrepareHeader and midiStreamOut per buffer,
-// midiStreamRestart (FUN_00433E30), then midiOutSetVolume on the mapper.
-// Any failure leaves the race silent, with an error box that is hidden in
-// fullscreen. The results of these calls are logged (failures always,
-// within a limit), and so is each music start.
+/** The flag of the AWE SoundFont music (0x46D900). */
 static const DWORD kAweMusicFlagRva = 0x0006D900;
+/** The most music lines written to the log. */
 static const DWORD kMaxMidiLogLines = 24;
 
+/** A MIDI function the game imports. */
 struct MidiImport
 {
+    /** The address of its import slot. */
     DWORD iatVa;
+    /** The name of the function in winmm.dll. */
     const CHAR* name;
 };
 
+/**
+ * The MIDI functions whose results are logged, in the order of
+ * g_midiOriginal.
+ */
 static const MidiImport kMidiImports[] =
 {
     { 0x004CA978, "midiStreamOpen" },
@@ -306,24 +366,45 @@ static const MidiImport kMidiImports[] =
     { 0x004CA968, "midiOutSetVolume" }
 };
 
+/** midiStreamOpen. */
 typedef MMRESULT (WINAPI *MidiStreamOpenFn)(
     LPHMIDISTRM, LPUINT, DWORD, DWORD_PTR, DWORD_PTR, DWORD);
+/** midiStreamProperty. */
 typedef MMRESULT (WINAPI *MidiStreamPropertyFn)(HMIDISTRM, LPBYTE, DWORD);
+/** midiOutPrepareHeader or midiStreamOut. */
 typedef MMRESULT (WINAPI *MidiHeaderFn)(HMIDIOUT, LPMIDIHDR, UINT);
+/** midiStreamRestart. */
 typedef MMRESULT (WINAPI *MidiStreamRestartFn)(HMIDISTRM);
+/** midiOutSetVolume. */
 typedef MMRESULT (WINAPI *MidiOutSetVolumeFn)(HMIDIOUT, DWORD);
 
+/** The original functions of the import slots, as listed in kMidiImports. */
 static LPVOID g_midiOriginal[sizeof(kMidiImports) / sizeof(kMidiImports[0])];
+/** The number of music lines written to the log. */
 static DWORD g_midiLogLines = 0;
+/**
+ * TRUE with MidiVolumeGuard: a failing midiOutSetVolume does not stop the
+ * music.
+ */
 static BOOL g_midiVolumeTolerant = FALSE;
 
-// [Fixes] MusicDevice: -1 = the MIDI mapper (as the game does), otherwise
-// the number of a MIDI output from the list in the log.
+/**
+ * [Fixes] MusicDevice: -1 = the MIDI mapper (as the game does), otherwise
+ * the number of a MIDI output from the list in the log.
+ */
 static LONG g_musicDevice = -1;
 
+/** midiOutGetNumDevs, looked up at run time. */
 typedef UINT (WINAPI *MidiOutGetNumDevsFn)(void);
+/** midiOutGetDevCapsA, looked up at run time. */
 typedef MMRESULT (WINAPI *MidiOutGetDevCapsFn)(UINT_PTR, LPMIDIOUTCAPSA, UINT);
 
+/**
+ * Gives the name of a MIDI output technology.
+ *
+ * @param [in] technology The wTechnology of MIDIOUTCAPS.
+ * @return The name, for the log.
+ */
 static const CHAR* MidiTechnologyName(WORD technology)
 {
     switch (technology)
@@ -347,8 +428,11 @@ static const CHAR* MidiTechnologyName(WORD technology)
     }
 }
 
-// The MIDI outputs Windows offers, once (the mapper plays on one of them,
-// as set in the Control Panel).
+/**
+ * Writes the MIDI outputs Windows offers to the log, once.
+ *
+ * The mapper plays on one of them, as set in the Control Panel.
+ */
 static void LogMidiDevices()
 {
     static BOOL logged = FALSE;
@@ -407,6 +491,12 @@ static void LogMidiDevices()
     }
 }
 
+/**
+ * Writes the result of a MIDI call to the log, within kMaxMidiLogLines.
+ *
+ * @param [in] call The name of the call.
+ * @param [in] result Its result.
+ */
 static void LogMidi(const CHAR* call, MMRESULT result)
 {
     CHAR message[96];
@@ -421,6 +511,18 @@ static void LogMidi(const CHAR* call, MMRESULT result)
     LogFix(message);
 }
 
+/**
+ * Replaces the game's midiStreamOpen: opens the MusicDevice output instead
+ * of the mapper when one is set, and logs the result.
+ *
+ * @param [out] stream Receives the stream.
+ * @param [in,out] device The device; the mapper in the game.
+ * @param [in] count Passed on to Windows.
+ * @param [in] callback Passed on to Windows.
+ * @param [in] instance Passed on to Windows.
+ * @param [in] flags Passed on to Windows.
+ * @return The result of midiStreamOpen.
+ */
 static MMRESULT WINAPI HookedMidiStreamOpen(
     LPHMIDISTRM stream,
     LPUINT device,
@@ -448,6 +550,14 @@ static MMRESULT WINAPI HookedMidiStreamOpen(
     return result;
 }
 
+/**
+ * Replaces the game's midiStreamProperty and logs a failure.
+ *
+ * @param [in] stream Passed on to Windows.
+ * @param [in,out] data Passed on to Windows.
+ * @param [in] property Passed on to Windows.
+ * @return The result of midiStreamProperty.
+ */
 static MMRESULT WINAPI HookedMidiStreamProperty(
     HMIDISTRM stream,
     LPBYTE data,
@@ -464,6 +574,14 @@ static MMRESULT WINAPI HookedMidiStreamProperty(
     return result;
 }
 
+/**
+ * Replaces the game's midiOutPrepareHeader and logs a failure.
+ *
+ * @param [in] out Passed on to Windows.
+ * @param [in,out] header Passed on to Windows.
+ * @param [in] size Passed on to Windows.
+ * @return The result of midiOutPrepareHeader.
+ */
 static MMRESULT WINAPI HookedMidiOutPrepareHeader(
     HMIDIOUT out,
     LPMIDIHDR header,
@@ -480,6 +598,14 @@ static MMRESULT WINAPI HookedMidiOutPrepareHeader(
     return result;
 }
 
+/**
+ * Replaces the game's midiStreamOut and logs a failure.
+ *
+ * @param [in] stream Passed on to Windows.
+ * @param [in,out] header Passed on to Windows.
+ * @param [in] size Passed on to Windows.
+ * @return The result of midiStreamOut.
+ */
 static MMRESULT WINAPI HookedMidiStreamOut(
     HMIDISTRM stream,
     LPMIDIHDR header,
@@ -496,6 +622,12 @@ static MMRESULT WINAPI HookedMidiStreamOut(
     return result;
 }
 
+/**
+ * Replaces the game's midiStreamRestart and logs a failure.
+ *
+ * @param [in] stream Passed on to Windows.
+ * @return The result of midiStreamRestart.
+ */
 static MMRESULT WINAPI HookedMidiStreamRestart(HMIDISTRM stream)
 {
     MMRESULT result = reinterpret_cast<MidiStreamRestartFn>(g_midiOriginal[4])(
@@ -509,9 +641,19 @@ static MMRESULT WINAPI HookedMidiStreamRestart(HMIDISTRM stream)
     return result;
 }
 
-// With MidiVolumeGuard on, a MIDI driver that cannot set the volume
-// through the mapper no longer stops the music: the song keeps playing at
-// the driver's own volume.
+/**
+ * Replaces the game's midiOutSetVolume.
+ *
+ * The game sets the volume of the mapper (device -1); with MusicDevice it
+ * belongs to the chosen output. With MidiVolumeGuard on, a MIDI driver that
+ * cannot set the volume through the mapper no longer stops the music: the
+ * song keeps playing at the driver's own volume.
+ *
+ * @param [in] out The output; the mapper in the game.
+ * @param [in] volume The volume of both channels.
+ * @return The result of midiOutSetVolume, or with MidiVolumeGuard
+ *         MMSYSERR_NOERROR.
+ */
 static MMRESULT WINAPI HookedMidiOutSetVolume(HMIDIOUT out, DWORD volume)
 {
     MMRESULT result;
@@ -539,6 +681,18 @@ static MMRESULT WINAPI HookedMidiOutSetVolume(HMIDIOUT out, DWORD volume)
     return result;
 }
 
+/**
+ * Hooks the game's MIDI imports, so the race music can be diagnosed.
+ *
+ * FUN_00433BB0 plays Audio\\Music\\GRUNGE\<n\>.MID (SBKGRNG\<n\> with an
+ * AWE card, flag 0x46D900), RIFF "MIDS" files of ready-made stream buffers,
+ * on the MIDI mapper: midiStreamOpen(device -1), midiStreamProperty,
+ * midiOutPrepareHeader and midiStreamOut per buffer, midiStreamRestart
+ * (FUN_00433E30), then midiOutSetVolume on the mapper. Any failure leaves
+ * the race silent, with an error box that is hidden in fullscreen. The
+ * results of these calls are logged (failures always, within a limit), and
+ * so is each music start.
+ */
 static void InstallMidiLogging()
 {
     static const LPVOID hooks[] =
@@ -584,6 +738,14 @@ static void InstallMidiLogging()
     }
 }
 
+/**
+ * Replaces the call of FUN_00433BB0: a song that would play silently takes
+ * the game's own path for muted music.
+ *
+ * @param [in] song Passed on to the game.
+ * @param [in] track The number of the song.
+ * @return The game's result: 0 when the song started.
+ */
 static DWORD __fastcall HookedMusicStart(DWORD song, DWORD track)
 {
     DWORD master = *reinterpret_cast<DWORD*>(g_fixesBase + kMasterVolumeRva);
@@ -628,6 +790,17 @@ static DWORD __fastcall HookedMusicStart(DWORD song, DWORD track)
     return result;
 }
 
+/**
+ * Keeps a music volume of 0 from muting the whole game.
+ *
+ * When a song starts, FUN_00433BB0 sets the MIDI volume to master x music
+ * from the Sound Mix screen with midiOutSetVolume. Since Windows Vista that
+ * call changes the volume of the whole game in the Windows volume mixer,
+ * and Windows remembers it: a music volume of 0 left the game without any
+ * sound, even after a restart. A song that would play silently now takes
+ * the game's own path for muted music instead, so midiOutSetVolume(0) is
+ * never called.
+ */
 static void GuardMidiVolume()
 {
     BYTE call[5] = { 0xE8 };
@@ -652,19 +825,21 @@ static void GuardMidiVolume()
     LogFix("MIDI volume guard: a music volume of 0 no longer mutes the game.");
 }
 
-// MIDI errors: when the race music cannot start, FUN_00433BB0 reports it
-// through FUN_00443120, a modal MessageBoxA ("Warning") with a warning
-// sound that can stay hidden behind the race in fullscreen, so the game
-// seems to hang until Enter is pressed. At 0x433C6E it reports a missing song file ("Bad or
-// missing file", with name and extension as arguments) and then falls
-// through to 0x433C8B, which reports every failure of the MIDI stream
-// ("MIDI Error"). Both calls now write the log instead; the caller removes
-// the arguments (add esp), and the race starts without music as after the
-// box.
+/** The report of a missing song file at 0x433C6E. */
 static const DWORD kMusicFileErrorCallRva = 0x00033C6E;
+/** The report of a failure of the MIDI stream at 0x433C8B. */
 static const DWORD kMusicStartErrorCallRva = 0x00033C8B;
+/** FUN_00443120, the game's modal warning box. */
 static const DWORD kErrorBoxRva = 0x00043120;
 
+/**
+ * Replaces the box for a missing song file with a line in the log.
+ *
+ * @param [in] caption Unused.
+ * @param [in] text Unused.
+ * @param [in] name The name of the song file.
+ * @param [in] extension The extension of the song file.
+ */
 static void __cdecl HookedMusicFileError(
     LPCSTR caption,
     const CHAR* text,
@@ -694,6 +869,13 @@ static void __cdecl HookedMusicFileError(
     LogFix(message);
 }
 
+/**
+ * Replaces the box for a failure of the MIDI stream with a line in the
+ * log.
+ *
+ * @param [in] caption Unused.
+ * @param [in] text Unused.
+ */
 static void __cdecl HookedMusicStartError(LPCSTR caption, const CHAR* text)
 {
     if (g_midiLogLines >= kMaxMidiLogLines)
@@ -705,6 +887,19 @@ static void __cdecl HookedMusicStartError(LPCSTR caption, const CHAR* text)
     LogFix("Race music: the game reports a MIDI error (written here instead of a message box); the failed MIDI calls are listed above.");
 }
 
+/**
+ * Writes the race music errors to the log instead of a message box.
+ *
+ * When the race music cannot start, FUN_00433BB0 reports it through
+ * FUN_00443120, a modal MessageBoxA ("Warning") with a warning sound that
+ * can stay hidden behind the race in fullscreen, so the game seems to hang
+ * until Enter is pressed. At 0x433C6E it reports a missing song file ("Bad
+ * or missing file", with name and extension as arguments) and then falls
+ * through to 0x433C8B, which reports every failure of the MIDI stream
+ * ("MIDI Error"). Both calls now write the log instead; the caller removes
+ * the arguments (add esp), and the race starts without music as after the
+ * box.
+ */
 static void LogMidiErrors()
 {
     static const DWORD sites[2] =
@@ -749,10 +944,14 @@ static void LogMidiErrors()
     LogFix("MIDI errors to the log: a race music error no longer opens a message box.");
 }
 
-// Replaces mov eax, [esi + 0x14] / mov cl, [esp + 0x10] / add eax, edi
-// with call + mov cl, [esp + 0x10]: esi is the node, edi the tick, and eax
-// returns the next-update tick. Flags are set again by the test that
-// follows; ecx and edx are kept.
+/**
+ * Gives the next-update tick of a node, every tick for the nodes in view.
+ *
+ * Replaces mov eax, [esi + 0x14] / mov cl, [esp + 0x10] / add eax, edi
+ * with call + mov cl, [esp + 0x10]: esi is the node, edi the tick, and eax
+ * returns the next-update tick. Flags are set again by the test that
+ * follows; ecx and edx are kept.
+ */
 static __declspec(naked) void HookedNextUpdate()
 {
     __asm
@@ -780,6 +979,26 @@ static __declspec(naked) void HookedNextUpdate()
     }
 }
 
+/**
+ * Lets the riders and cars in view move every game tick.
+ *
+ * FUN_00438170 walks the world nodes (riders, cars, pedestrians, cops)
+ * every game tick and updates each one through FUN_00437E60 once its
+ * next-update tick [node + 0x0C] has come. That function runs the node's
+ * think and move handlers with the time since its last update
+ * ([node + 0x18]), then picks a new interval [node + 0x14] from the
+ * distance to the camera: 1 tick close by, up to 8 for riders 30 segments
+ * ahead (0x1E for nodes off the road). Far riders and cars therefore move
+ * in visible jumps. At 0x438108 it computes next = [node + 0x14] + tick.
+ * Within the range where the original game draws nodes (FUN_00438450: up
+ * to camera + 0x2000), next becomes tick + 1, so they move every tick;
+ * their movement still follows the elapsed time as before. Nodes further
+ * away, behind the camera or off the road keep their interval, and
+ * [node + 0x14] stays as the game computed it. (With DrawDistance, nodes
+ * are drawn up to 48 segments ahead; updating those every tick as well
+ * more than doubled the game time per frame, so they keep the game's
+ * interval.)
+ */
 static void FullRateObjects()
 {
     static const BYTE expected[9] =
@@ -810,6 +1029,13 @@ static void FullRateObjects()
     LogFix("Full-rate objects: riders and cars in view move every game tick.");
 }
 
+/**
+ * Tells whether a row of a shadow frame has pixels.
+ *
+ * @param [in] row The row.
+ * @param [in] width The number of pixels in the row.
+ * @return TRUE when a pixel is not 0.
+ */
 static BOOL RowHasPixels(const BYTE* row, LONG width)
 {
     LONG x;
@@ -825,6 +1051,10 @@ static BOOL RowHasPixels(const BYTE* row, LONG width)
     return FALSE;
 }
 
+/**
+ * Points the punch frame at a copy of its shadow alone, without the stray
+ * pixels above it.
+ */
 static void CutPunchShadow()
 {
     BYTE* entry = reinterpret_cast<BYTE*>(
@@ -933,6 +1163,12 @@ static void CutPunchShadow()
     LogFix(message);
 }
 
+/**
+ * Replaces the call of the shadow loader FUN_00443610 and cuts the punch
+ * shadow after loading.
+ *
+ * @return The game's result: nonzero when the shadows were loaded.
+ */
 static int __cdecl HookedShadowLoader()
 {
     int result = reinterpret_cast<ShadowLoaderFn>(
@@ -946,6 +1182,18 @@ static int __cdecl HookedShadowLoader()
     return result;
 }
 
+/**
+ * Keeps the shadow of the first punch frame under the bike.
+ *
+ * FUN_00443610 (called once per HiRes setup, from 0x4101AA) loads the
+ * rider's shadow frames (DATA\\BIKERS\\HISHADOW.DAT, LOSHADOW.DAT in low
+ * resolution) into a table of 326 entries at 0x49BFE0: pixel pointer,
+ * width byte, height byte. Every frame is drawn centred on its box. Frame
+ * 176, the first frame of the punch, has two stray pixels in the top corner
+ * of a 118x168 box (59x84 in low resolution), while the shadow itself is
+ * the band of 13 (6) rows at the bottom, so the shadow jumps far away from
+ * the bike. After loading, the entry points at a copy of the shadow alone.
+ */
 static void FixPunchShadow()
 {
     BYTE call[5] = { 0xE8 };
@@ -972,6 +1220,12 @@ static void FixPunchShadow()
     LogFix("Punch shadow fix: the first punch frame keeps its shadow under the bike.");
 }
 
+/**
+ * Finds the floating building a texture shows.
+ *
+ * @param [in] texture The texture header of a quad, or NULL.
+ * @return The building, or NULL for any other texture.
+ */
 static const FloatingBuilding* FindFloatingBuilding(const BYTE* texture)
 {
     const DWORD* name;
@@ -1021,9 +1275,17 @@ static const FloatingBuilding* FindFloatingBuilding(const BYTE* texture)
     return NULL;
 }
 
-// quad + 0x44..0x60: four corners x, y (16.16, y grows downward); quad + 8:
-// its texture. The texture's rows y0 + 1 to y1 - 1 (shorts at + 6 and + 10)
-// span the quad from its top to its bottom (FUN_0044D300).
+/**
+ * Replaces the calls of FUN_0040FFC0: draws a floating building lower,
+ * scaled to its height on screen.
+ *
+ * quad + 0x44..0x60 holds four corners x, y (16.16, y grows downward);
+ * quad + 8 its texture. The texture's rows y0 + 1 to y1 - 1 (shorts at + 6
+ * and + 10) span the quad from its top to its bottom (FUN_0044D300).
+ *
+ * @param [in,out] node The quad list node; passed on to the game.
+ * @param [in,out] quad The quad; its corners are restored after the call.
+ */
 static void __fastcall HookedQuadToPixels(BYTE* node, BYTE* quad)
 {
     QuadToPixelsFn original = reinterpret_cast<QuadToPixelsFn>(
@@ -1084,6 +1346,19 @@ static void __fastcall HookedQuadToPixels(BYTE* node, BYTE* quad)
     }
 }
 
+/**
+ * Lets the red barn, the brown shop and the white house stand on the
+ * ground.
+ *
+ * The pictures of the red barn (BARN12), the brown shop with the sign
+ * (RUSTICA2) and the white house (HOUSEB2) in FAMILIES.RSC end in empty
+ * rows (2, 5 and 10), and the game places them as if their picture reached
+ * the bottom of the texture, so they hover above the ground. Every quad is
+ * turned into pixels by FUN_0040FFC0 (called at 0x40FF5A and 0x40FF87); a
+ * quad whose texture (quad + 8, a texture header with the name at + 0x10)
+ * is one of these is drawn that many rows lower, scaled to its height on
+ * screen. Only the drawing changes.
+ */
 static void LowerFloatingBuildings()
 {
     BYTE calls[2][5];
@@ -1118,9 +1393,13 @@ static void LowerFloatingBuildings()
     LogFix("Floating buildings: the red barn, the brown shop and the white house stand on the ground.");
 }
 
-// Replaces xor edx, edx / mov dl, [0x49E115] (8 bytes) with a call and 3
-// nops. Returns the distance in edx; only edx and the flags change, and the
-// code that follows sets no condition on the flags.
+/**
+ * Gives the HUD the whole distance, limited to 0..kOdometerMaximum.
+ *
+ * Replaces xor edx, edx / mov dl, [0x49E115] (8 bytes) with a call and 3
+ * nops. Returns the distance in edx; only edx and the flags change, and the
+ * code that follows sets no condition on the flags.
+ */
 static __declspec(naked) void HookedOdometerRead()
 {
     __asm
@@ -1138,6 +1417,20 @@ static __declspec(naked) void HookedOdometerRead()
     }
 }
 
+/**
+ * Keeps the HUD distance from wrapping to 0 after 25.5.
+ *
+ * FUN_00446A40 computes the distance shown in the HUD in tenths of a mile
+ * from the player's track position, ((position >> 8) - 50) / 33, or in
+ * tenths of a kilometre with metric units, ((position >> 5) - 400) / 165,
+ * and stores only the low byte (mov [0x49E115], al at 0x446A61 and
+ * 0x446A75). The HUD reads it unsigned at 0x446DA1 (xor edx, edx /
+ * mov dl, [0x49E115]) and prints value / 10 and value % 10, so the display
+ * wraps to 0 after 25.5 (most courses in kilometres are longer) and shows
+ * 25.x before the start line, where the value is negative. Nothing else
+ * reads the byte. Both stores now keep the whole value in this DLL, and
+ * the HUD reads it back limited to 0..9999.
+ */
 static void FixOdometer()
 {
     BYTE stores[2][5];
