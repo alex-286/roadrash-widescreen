@@ -3185,7 +3185,7 @@ static HRESULT SetNativeMenuMode(
         }
     }
 
-    NativeMenusLeave();
+    NativeMenusLeave(FALSE);
     LogMessage(
         "Native menus: the display mode is unavailable; the menus use 640x480.\r\n",
         sizeof("Native menus: the display mode is unavailable; the menus use 640x480.\r\n") - 1);
@@ -3237,7 +3237,7 @@ static HRESULT WINAPI HookedSetDisplayMode(
             }
         }
 
-        NativeMenusLeave();
+        NativeMenusLeave(FALSE);
         return CallOriginalSetDisplayMode(
             directDraw,
             width,
@@ -3254,7 +3254,7 @@ static HRESULT WINAPI HookedSetDisplayMode(
         HRESULT result;
         DWORD attempt;
 
-        NativeMenusLeave();
+        NativeMenusLeave(TRUE);
         if (g_widescreenActive)
         {
             RestoreOriginalGameState();

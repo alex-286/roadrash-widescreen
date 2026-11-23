@@ -1754,7 +1754,7 @@ void NativeMenusEnter(DWORD width, DWORD height)
         width < static_cast<DWORD>(kMenuWidth) ||
         height < static_cast<DWORD>(kMenuHeight))
     {
-        NativeMenusLeave();
+        NativeMenusLeave(FALSE);
         return;
     }
 
@@ -1764,7 +1764,7 @@ void NativeMenusEnter(DWORD width, DWORD height)
         return;
     }
 
-    NativeMenusLeave();
+    NativeMenusLeave(FALSE);
 
     // As large as the screen allows: the full height on wide screens.
     if (static_cast<LONG>(width) * kMenuHeight >=
@@ -1827,7 +1827,7 @@ void NativeMenusEnter(DWORD width, DWORD height)
     }
 }
 
-void NativeMenusLeave()
+void NativeMenusLeave(BOOL keepScreenSize)
 {
     HWND root;
 
@@ -1842,6 +1842,14 @@ void NativeMenusLeave()
     if (root != NULL)
     {
         EnumChildWindows(root, PlaceChild, -1);
+    }
+
+    // Before a race, RashRoot stays as large as the screen: changing the
+    // display mode can take seconds, and a 640x480 window would show the
+    // desktop around it meanwhile. SetDisplayMode makes the window of an
+    // exclusive DirectDraw cover the screen anyway.
+    if (root != NULL && !keepScreenSize)
+    {
         SetWindowPos(
             root, NULL, 0, 0, kMenuWidth, kMenuHeight,
             SWP_NOZORDER | SWP_NOACTIVATE);

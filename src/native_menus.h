@@ -17,11 +17,14 @@
 // every new DirectDraw surface, to hook the drawing into the menu's screen
 // surface.
 // NativeMenusEnter is called after the menu's display mode (width x height)
-// was set, NativeMenusLeave before the race's mode is set.
+// was set, NativeMenusLeave before the race's mode is set (keepScreenSize:
+// the main window keeps covering the screen while the mode changes, so the
+// desktop does not show around it) or before the menus fall back to
+// 640x480.
 BOOL NativeMenusInstall(DWORD gameBase, BOOL background);
 void NativeMenusWatchSurface(LPVOID surface);
 void NativeMenusEnter(DWORD width, DWORD height);
-void NativeMenusLeave();
+void NativeMenusLeave(BOOL keepScreenSize);
 
 // When the game ends: removes the window hook and, on Windows 95/98/ME
 // (sharedSystem), puts the shared DirectDraw vtable slots back.
