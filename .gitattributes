@@ -1,3 +1,8 @@
+# Every text file is checked out with CRLF line endings (the repository
+# stores LF), whatever core.autocrlf is set to; binary files such as the
+# screenshots are detected and left alone.
+* text=auto eol=crlf
+
 # Files shipped in the release package are read on Windows (down to
 # Windows 98 Notepad), so they always use CRLF line endings.
 dist/*.txt text eol=crlf
