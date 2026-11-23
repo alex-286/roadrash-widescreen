@@ -3,10 +3,13 @@
 **Native resolution, higher resolution, a longer view and fixes for the
 original 1996 PC version of Road Rash, from Windows 95 to Windows 11.**
 
+[Features](#features) · [Fixes](#fixes) · [Requirements](#requirements) · [Installation](#installation) · [Configuration](#configuration) · [Hotkeys](#hotkeys) · [Troubleshooting](#troubleshooting) · [Building](#building) · [Known limitations](#known-limitations) · [Credits](#credits) · [License](#license)
+
 A widescreen patch for the Windows 95 version of **Road Rash**. It runs the
 game at your monitor's native resolution with a view that matches its aspect
 ratio, so you see more of the road instead of a stretched 4:3 picture.
 Optional filters smooth the classic graphics on modern displays.
+**[Download the latest release](https://github.com/alex-286/roadrash-widescreen/releases/latest).**
 
 On Windows XP and newer, the patch is a drop-in `ddraw.dll` placed next to the
 game. It changes nothing on disk: delete the file and the game is back to
@@ -48,22 +51,11 @@ the menu.</sub>
   enlarged by a whole factor.
 - **Display filters:** optional `nearest`, `sharp-bilinear` and `bicubic`
   filters, switchable during a race with **F11**.
-- **Scanlines:** an optional CRT-style scanline effect on top of any filter.
+- **Scanlines:** an optional CRT-style scanline effect with `sharp-bilinear`
+  and `bicubic`.
 - **No tearing:** waits for the vertical blank before each frame (can be
   turned off).
 - **FPS and filter display:** optional on-screen frame rate and filter name.
-- **Game fixes:** the Rat and Super bikes race in their own colors; objects
-  move smoothly in 1-pixel steps, and riders and cars in the distance no
-  longer move in jumps; the rider's shadow stays under the bike when
-  punching; three hovering buildings stand on the ground; the road and its
-  edges no longer jump while riding; the distance in the cockpit no longer
-  wraps to 0 after 25.5; a music volume of 0 no longer mutes the whole game
-  on newer Windows. Each fix can be turned off. Optionally, Alt+Tab and the
-  Windows key work while the game runs.
-- **Race music on any MIDI output:** if the races stay silent because the
-  MIDI mapper leads to the wrong output, `MusicDevice` picks another one. A
-  MIDI driver that cannot set the volume no longer stops the race music, and
-  a MIDI error no longer seems to freeze the game at the start of a race.
 - **Screenshots:** **F12** saves exactly what is on screen, at full
   resolution with the filter applied, in races and in the menus.
 - **Multi-core:** filters spread their work across up to 8 CPU cores.
@@ -72,6 +64,35 @@ the menu.</sub>
   ends, because DirectDraw is shared by all programs there.
 - **Lightweight and retro-friendly:** a small DLL without runtime
   dependencies, built for Windows 95 up to Windows 11.
+
+## Fixes
+
+The patch also repairs faults of the original game. Each fix has a setting
+in the `[Fixes]` section of `RoadRashWidescreen.ini` (see
+[Configuration](#configuration)); its default is in parentheses.
+
+- `FixBikeColors` (on): the Rat and Super bikes race in their own colors, as
+  the shop shows them.
+- `SmoothSprites` (on): buildings, riders and cars move in 1-pixel steps
+  instead of 2-pixel steps in High Resolution mode.
+- `FullRateObjects` (on): riders and cars in the distance move smoothly
+  instead of in jumps.
+- `FixPunchShadow` (on): the rider's shadow stays under the bike when
+  punching.
+- `GroundBuildings` (on): three hovering buildings stand on the ground.
+- `FixOdometer` (on): the distance in the cockpit no longer wraps to 0 after
+  25.5.
+- `SmoothRoad` (on): the road and its edges no longer jump by a few pixels
+  while riding.
+- `MidiVolumeGuard` (on): a music volume of 0 no longer mutes the whole game
+  on Windows Vista and newer, and a MIDI driver that cannot set the volume no
+  longer stops the race music.
+- `MidiErrorsToLog` (on): a race music error goes to the log instead of a
+  message box that can hide behind the race and seem to freeze the game.
+- `MusicDevice` (the MIDI mapper): plays the race music on another MIDI
+  output when the races stay silent.
+- `AllowAltTab` (off): Alt+Tab and the Windows key switch away from the game
+  while it keeps running.
 
 ## Requirements
 
@@ -192,11 +213,11 @@ AllowAltTab=0     ; 0 (default) = Alt+Tab and the Windows key blocked, 1 = Alt+T
 | `DisplayWidth`, `DisplayHeight` | The screen resolution used during races. If it is not available, 1920x1080 is tried, then 720x480, then the game's original 640x480. |
 | `VirtualWidth` | The width the game renders at (multiple of 8). By default it matches your display's aspect ratio; other values change the aspect ratio. |
 | `WaitForVBlank` | Prevents tearing, but limits the frame rate to the monitor's refresh rate. |
-| `Filter` | The display filter, see [Filters](#filters). `none` keeps the game's original 8-bit display mode. |
+| `Filter` | How the frame is scaled to the screen: `nearest` (sharp, blocky pixels), `sharp-bilinear` (crisp pixels of even size, also at non-integer scales) or `bicubic` (smooth). **F11** cycles through them during a race. `none` keeps the game's original 8-bit display mode; switching to or from it requires restarting the game. |
 | `DrawDistance` | How many road segments ahead the game draws, 48 by default. The original draws 32, although it loads 80 ahead; up to 48 shows the road further into the distance (48 is also what the 30th Anniversary Edition draws). The scenery beside the road (walls, rock faces, trees, buildings, signs) is drawn out to the full distance once the game has loaded its pictures, which it does for the original distance; until then, a far segment shows only the road. Riders, cars and pedestrians appear out to the same distance; the list of objects the game draws holds proportionally more of them for it (75 at 48 segments instead of 50). The road arrays, the crest thresholds and the depth table are enlarged in memory for it. |
 | `DistanceFade` | How many of the farthest road segments fade into a haze (16 by default), so new segments appear out of it instead of popping in whole. The haze grows toward the far end to 3/4 and takes its color from the track's sky panorama. With a filter other than `none` and `RenderScale` above 1, the filter blends the haze into each pixel in full color, so it is smooth. Otherwise the game's 256-color palette is remapped for it, so the steps may show slight color shifts. 0 turns it off. |
 | `DirectPresent` | Only for the filters other than `none`. With `1`, a filter whose output has the screen size writes straight into the screen surface after the vertical blank, instead of into system memory that is then copied to the graphics card. On older PCs that copy can take several milliseconds per frame. While `Scanlines` are on (which read the frame back), frames are still copied, except with `nearest`. If the screen surface cannot be locked, the frame is copied as with `0`. |
-| `Scanlines` | Strength of the scanline effect; 30 to 50 is a good start. |
+| `Scanlines` | Strength of the scanline effect with `sharp-bilinear` and `bicubic`; 30 to 50 is a good start. |
 | `ShowFps`, `ShowFilter` | On-screen display in the top-left corner, for example `60 FPS  BICUBIC`. |
 | `RenderScale` | How many times the original 480 lines the game's own rasterizer draws the race world at, so roads, scenery and riders are sharper; the sky and the cockpit are enlarged from their 480-line art. `0` (default) picks for each race the most lines that fit the height of its display mode: 2 (960 lines, 1712x960 at 16:9) at 1080 lines, 3 (1440 lines) at 1440 lines, 4 (1920 lines) at 2160 lines or more, and 1 below 960 lines. `1` keeps the original 480 lines, for very slow PCs; `2`, `3` and `4` draw 960, 1440 or 1920 lines on every screen. Each step draws more pixels and costs speed; on older PCs, use `1` or `2`, and with a filter other than `none` try `WaitForVBlank=0` for a higher frame rate. |
 | `NativeMenus` | The game's menus are a Windows interface of 640x480: a main window with the buttons as windows of their own, dialogs and a video window. Windows 98 cannot enlarge such windows, so with `1` the screen stays at the resolution of the races (in 16-bit color), the menu fills the screen height in the middle (2.25x at 1920x1080, 3x at 2560x1440; with a factor that is not a whole number, some rows and columns of pixels are one screen pixel wider than others, and the mouse, the windows and the drawing all use the same mapping), and the videos are enlarged by the largest whole factor of their own size that fits (320x192 videos: 5x at 1920x1080, 7x at 2560x1440), on black. Everything visible in the menus is drawn by copying rectangles into the screen, so the patch enlarges those copies; the game's main window covers the whole screen as in the original, its invisible button windows are enlarged the same way, and the positions the game reads (window rectangles, the mouse, paint areas) come back in its 640x480 coordinates. Windows dialogs (the save dialog, message boxes) keep their size and are centred. With `0`, the screen switches to 640x480 for the menus as in the original game. |
@@ -213,35 +234,6 @@ AllowAltTab=0     ; 0 (default) = Alt+Tab and the Windows key blocked, 1 = Alt+T
 | `FixOdometer` | The game computes the distance in the cockpit in tenths of a mile (of a kilometer with metric units) but keeps only one byte of it, so the display wraps to 0 after 25.5, which most courses in kilometers pass, and shows 25.x before the start line. The fix keeps the whole value; the display starts at 0.0 and goes up to 999.9. |
 | `SmoothRoad` | The game projects the road ahead segment by segment, starting from the camera's position within its segment. It starts the height and the bend of the first segment in whole units and drops the rest, so the road is up to one unit too high and every segment further ahead a little further to the side. Whenever the whole parts change, the road and its edges jump by a few pixels near the camera (twice as many at 960 lines). The fix adds the dropped parts back to the screen positions of every plain road segment; segments of other kinds are left as the game computes them. |
 | `AllowAltTab` | The compatibility database of Windows (`sysmain.sdb`) applies its IgnoreAltTab fix to `ROADRASH.EXE`. That fix runs a keyboard hook in the game that swallows Alt+Tab, Alt+Esc, Ctrl+Esc and the Windows and menu keys. With `1`, the patch ends the thread of that hook when the game starts DirectDraw, and Windows removes the hook with it; the log says whether it worked. Windows 95/98/ME do not have the fix, but there the game blocks the keys itself: a keyboard hook of its own discards Tab while Alt is held, and its windows keep Alt+Tab, Alt+Esc and the commands for switching from Windows. With `1`, the patch removes that hook and gives these keys and commands of the game's windows to Windows. In both cases the game keeps running in the background, and Alt+Tab brings it back. Tested on Windows 98 SE, and on Windows 11 with the Windows DirectDraw library and with DDrawCompat. |
-
-## Filters
-
-The game draws at 480, 960, 1440 or 1920 lines (`RenderScale`), so the
-picture is usually enlarged, or shrunk when it has more lines than the
-screen. A filter decides how:
-
-| Filter | Look | Best for |
-|---|---|---|
-| `none` | Original look, the game's 8-bit display mode. | Maximum compatibility, slow PCs. |
-| `nearest` | Sharp, blocky pixels. | The authentic pixel look. |
-| `sharp-bilinear` | Crisp pixels of even size, also at non-integer scales such as 1080p. | A clean pixel look on any resolution. |
-| `bicubic` | Smooth, photo-like enlargement; also softens the game's blocky near sprites. | A soft, modern look. |
-
-The same frame at 2560x1440 with `RenderScale=2`: a 320x240
-crop of the rider, enlarged 2x by doubling the pixels:
-
-| `nearest` | `sharp-bilinear` | `bicubic` |
-|---|---|---|
-| ![Rider with the nearest filter](docs/screenshots/filter-nearest.png) | ![Rider with the sharp-bilinear filter](docs/screenshots/filter-sharp-bilinear.png) | ![Rider with the bicubic filter](docs/screenshots/filter-bicubic.png) |
-
-With any filter except `none`, press **F11** during a race to cycle through
-`nearest`, `sharp-bilinear` and `bicubic`; the choice is kept for later
-races. Switching to or from `none` requires restarting the game.
-`Scanlines` apply to every filter except `nearest`.
-
-On a modern CPU every filter takes only a few milliseconds per frame. On a
-single-core CPU such as a Pentium 4, `sharp-bilinear` is the fastest choice;
-`bicubic` is only practical at low resolutions there.
 
 ## Hotkeys
 
@@ -313,30 +305,6 @@ documentation and default settings from [`dist/`](dist/) (`README.txt`,
 `RoadRashWidescreen.ini`), and the license as `LICENSE.txt`. Zip the files
 in that folder for a release, named after the version in [`src/version.h`](src/version.h)
 (for example `RoadRashWidescreen-1.3.0.zip`).
-
-## How it works
-
-- The proxy forwards all DirectDraw calls to the system's `ddraw.dll` (or to
-  the library named by `ChainDll`) and patches only the supported Road Rash
-  executable, in memory. Loaded under another name, it points
-  the game's `DDRAW.dll!DirectDrawCreate` import at itself and forwards to
-  the function the import held before.
-- When a race starts, the display is set to the native resolution while the
-  game renders into a wider buffer of 480 lines times the render scale,
-  which is scaled to the screen on every frame. For more than 480 lines, the
-  game's own rasterizer gets larger edge tables and converts its 3D
-  coordinates at the render scale (a finer shift at 2x and 4x, a
-  multiplication at 3x); the sky and the HUD exist as 480-line art and are
-  enlarged into the frame. Two game routines are redirected while racing: the HUD is
-  drawn centered, and the sky panorama is tiled across the whole width. Both
-  are restored when returning to the menu.
-- With a filter, the display runs at 32 bits per pixel. The game keeps
-  rendering 8-bit frames, which are converted through the game palette,
-  filtered and then presented.
-- The menus are Windows windows of 640x480 whose pictures are copied into
-  the screen. With `NativeMenus=1` the patch enlarges those copies and maps
-  window positions, the mouse and paint areas between the 640x480
-  coordinates and the screen.
 
 ## Known limitations
 
