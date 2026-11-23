@@ -1419,6 +1419,88 @@ static const DWORD kImportHookCount =
     sizeof(g_importHooks) / sizeof(g_importHooks[0]);
 static BOOL g_importHooksInstalled = FALSE;
 
+// Whether the game's import table names `name` from `module` for the import
+// slot at `iatVa`, read from the name list the linker kept beside the slots
+// (the executable has one for every DLL). A wrapper loaded by ChainDll may
+// have written its own function into the slot already (dd2d9 does as it
+// loads); the name still says which function the slot is for.
+static BOOL ImportSlotNames(DWORD iatVa, const CHAR* module, const CHAR* name)
+{
+    const BYTE* base = reinterpret_cast<const BYTE*>(GameVa(kImageBase));
+    const IMAGE_DOS_HEADER* dos =
+        reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+    const IMAGE_NT_HEADERS* nt;
+    const IMAGE_DATA_DIRECTORY* directory;
+    const IMAGE_IMPORT_DESCRIPTOR* descriptor;
+    DWORD slotRva = iatVa - kImageBase;
+    DWORD descriptorIndex;
+
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE)
+    {
+        return FALSE;
+    }
+
+    nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(base + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE)
+    {
+        return FALSE;
+    }
+
+    directory = &nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    if (directory->VirtualAddress == 0)
+    {
+        return FALSE;
+    }
+
+    descriptor = reinterpret_cast<const IMAGE_IMPORT_DESCRIPTOR*>(
+        base + directory->VirtualAddress);
+
+    // (The game imports from 13 DLLs; the limit only ends a broken table.)
+    for (descriptorIndex = 0;
+         descriptorIndex < 64 && descriptor->Name != 0;
+         ++descriptorIndex, ++descriptor)
+    {
+        const IMAGE_THUNK_DATA* names;
+        DWORD slotIndex;
+        DWORD index;
+
+        if (descriptor->OriginalFirstThunk == 0 ||
+            slotRva < descriptor->FirstThunk ||
+            (slotRva - descriptor->FirstThunk) % sizeof(DWORD) != 0 ||
+            lstrcmpiA(reinterpret_cast<const CHAR*>(base + descriptor->Name),
+                module) != 0)
+        {
+            continue;
+        }
+
+        slotIndex = (slotRva - descriptor->FirstThunk) / sizeof(DWORD);
+        names = reinterpret_cast<const IMAGE_THUNK_DATA*>(
+            base + descriptor->OriginalFirstThunk);
+
+        // The list ends with a zero entry; the slot must come before it.
+        for (index = 0; index < slotIndex; ++index)
+        {
+            if (names[index].u1.AddressOfData == 0)
+            {
+                return FALSE;
+            }
+        }
+
+        if (names[slotIndex].u1.AddressOfData == 0 ||
+            IMAGE_SNAP_BY_ORDINAL(names[slotIndex].u1.Ordinal))
+        {
+            return FALSE;
+        }
+
+        return lstrcmpA(reinterpret_cast<const CHAR*>(
+            reinterpret_cast<const IMAGE_IMPORT_BY_NAME*>(
+                base + names[slotIndex].u1.AddressOfData)->Name),
+            name) == 0;
+    }
+
+    return FALSE;
+}
+
 // A DirectDraw wrapper behind ChainDll can write its own functions into the
 // same import slots after the hooks are in, again whenever a DLL is loaded
 // (cnc-ddraw does, also when the video DLLs load). The hook then goes back
@@ -1458,6 +1540,7 @@ BOOL NativeMenusInstall(DWORD gameBase, BOOL background)
 {
     const ImportHook* hooks = g_importHooks;
     const DWORD hookCount = kImportHookCount;
+    BOOL replaced = FALSE;
     DWORD index;
 
     if (g_importHooksInstalled)
@@ -1468,7 +1551,10 @@ BOOL NativeMenusInstall(DWORD gameBase, BOOL background)
     g_menusBase = gameBase;
     g_backgroundEnabled = background;
 
-    // Check every import first, so nothing changes on a mismatch.
+    // Check every import first, so nothing changes on a mismatch. A slot
+    // that holds another DLL's function counts when the import table names
+    // the expected one for it: the hook then goes in front of that function
+    // and passes its calls on to it, as ReassertImportHooks does later.
     for (index = 0; index < hookCount; ++index)
     {
         LPVOID* slot = reinterpret_cast<LPVOID*>(GameVa(hooks[index].iatVa));
@@ -1476,11 +1562,20 @@ BOOL NativeMenusInstall(DWORD gameBase, BOOL background)
         FARPROC expected = module != NULL ?
             GetProcAddress(module, hooks[index].name) : NULL;
 
-        if (expected == NULL || *slot != reinterpret_cast<LPVOID>(expected))
+        if (expected != NULL && *slot == reinterpret_cast<LPVOID>(expected))
+        {
+            continue;
+        }
+
+        if (expected == NULL || *slot == NULL ||
+            !ImportSlotNames(hooks[index].iatVa, hooks[index].module,
+                hooks[index].name))
         {
             LogMenus("Native menus stay off: the game's window imports are not as expected.");
             return FALSE;
         }
+
+        replaced = TRUE;
     }
 
     g_lockCopy = reinterpret_cast<BYTE*>(VirtualAlloc(
@@ -1496,6 +1591,10 @@ BOOL NativeMenusInstall(DWORD gameBase, BOOL background)
     }
 
     g_importHooksInstalled = TRUE;
+    if (replaced)
+    {
+        LogMenus("Native menus: another DLL had replaced the game's window imports; the menu hooks run in front of it.");
+    }
     LogMenus("Native menus: the menus are shown enlarged in the middle of the native display mode.");
     return TRUE;
 }

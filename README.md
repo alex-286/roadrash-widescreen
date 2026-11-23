@@ -347,8 +347,7 @@ for a release, named after the version in [`src/version.h`](src/version.h)
 - DirectDraw wrappers other than DDrawCompat and cnc-ddraw (see
   [Together with another DirectDraw wrapper](#together-with-another-directdraw-wrapper))
   are untested; the patch changes the DirectDraw objects that such a wrapper
-  creates. If a wrapper changes the game's window functions, the menus stay
-  at 640x480 (the log says `Native menus stay off`).
+  creates.
 
 ## Credits
 
