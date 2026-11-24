@@ -240,6 +240,11 @@ static const DWORD kGamePaletteRva = 0x00075424;
 
 /** Nonzero when the game runs in HiRes (640x480). */
 static const DWORD kHighResolutionFlagRva = 0x00075380;
+/**
+ * Nonzero in the game's Inset mode: a 320x240 race in the middle of a
+ * 640x480x8 display mode (registry value Inset).
+ */
+static const DWORD kInsetFlagRva = 0x00075390;
 /** The width of the game's 3D space (first copy). */
 static const DWORD kLogicalWidthARva = 0x00066674;
 /** The width of the game's 3D space (second copy). */
@@ -370,6 +375,10 @@ static BOOL g_waitForVerticalBlank = TRUE;
 static BOOL g_directPresent = TRUE;
 /** [Display] NativeMenus: the menus stay in the native resolution. */
 static BOOL g_nativeMenus = FALSE;
+/** TRUE once the display refused 320x240x8 for a race. */
+static BOOL g_lowResolutionUnavailable = FALSE;
+/** TRUE while a 320x240 race runs in the Inset mode instead. */
+static BOOL g_insetFallbackActive = FALSE;
 
 /**
  * [Display] RenderScale: 1 to 4, or 0 (auto, the default).
@@ -3910,12 +3919,98 @@ static HRESULT SetNativeMenuMode(
 }
 
 /**
+ * Sets the display mode of a race in the game's 320x240 mode.
+ *
+ * Many displays offer no 320x240 mode, which is common on Windows Vista
+ * and newer. The game's race setup (FUN_00448870) then fails, but the game
+ * starts the race anyway (FUN_00448200 ignores the result) without its
+ * surfaces and crashes in the first frame (0x41DF62). Without 320x240x8
+ * the race uses the game's own Inset mode instead: 640x480x8 with the
+ * 320x240 view at 160,120. Everything the setup decides after
+ * SetDisplayMode then follows the Inset flag. Only the fonts of the
+ * network chat were already chosen for 320x240 while the race loaded.
+ * RestoreInsetFallback clears the flag again when the menus return, so the
+ * game's setting stays unchanged. After the first refusal, later races go
+ * straight to 640x480x8.
+ *
+ * @param [in] directDraw The DirectDraw object.
+ * @param [in] caller The return address of the game's call.
+ * @return The result of SetDisplayMode.
+ */
+static HRESULT SetLowResolutionRaceMode(LPVOID directDraw, DWORD caller)
+{
+    HRESULT result;
+
+    NativeMenusLeave(TRUE);
+    if (!g_lowResolutionUnavailable)
+    {
+        result = CallOriginalSetDisplayMode(
+            directDraw,
+            kOriginalLogicalWidth,
+            kOriginalLogicalHeight,
+            8,
+            caller);
+        if (SUCCEEDED(result))
+        {
+            return result;
+        }
+
+        g_lowResolutionUnavailable = TRUE;
+        LogMessage(
+            "Low resolution: the display has no 320x240 mode; the races use the Inset mode (640x480, the picture in the middle).\r\n",
+            sizeof("Low resolution: the display has no 320x240 mode; the races use the Inset mode (640x480, the picture in the middle).\r\n") - 1);
+    }
+
+    result = CallOriginalSetDisplayMode(
+        directDraw,
+        kOriginalDisplayWidth,
+        kOriginalDisplayHeight,
+        8,
+        caller);
+    if (FAILED(result))
+    {
+        LogMessage(
+            "Low resolution: 640x480 failed as well.\r\n",
+            sizeof("Low resolution: 640x480 failed as well.\r\n") - 1);
+        return result;
+    }
+
+    *reinterpret_cast<BYTE*>(g_gameBase + kInsetFlagRva) = 1;
+    WriteGameDword(
+        kDisplayOriginXRva,
+        (kOriginalDisplayWidth - kOriginalLogicalWidth) / 2);
+    WriteGameDword(
+        kDisplayOriginYRva,
+        (kOriginalDisplayHeight - kOriginalLogicalHeight) / 2);
+    g_insetFallbackActive = TRUE;
+    return result;
+}
+
+/**
+ * Ends the Inset mode of SetLowResolutionRaceMode: the game is back in its
+ * 320x240 mode, as its setting says.
+ */
+static void RestoreInsetFallback()
+{
+    if (!g_insetFallbackActive)
+    {
+        return;
+    }
+
+    *reinterpret_cast<BYTE*>(g_gameBase + kInsetFlagRva) = 0;
+    WriteGameDword(kDisplayOriginXRva, 0);
+    WriteGameDword(kDisplayOriginYRva, 0);
+    g_insetFallbackActive = FALSE;
+}
+
+/**
  * Replaces IDirectDraw::SetDisplayMode.
  *
  * For a race (640x480x8 from the game's race setup) the real display mode
  * becomes the native one (or 1920x1080, or 720x480, or the original) with
- * the virtual back buffer; for the menus the native menus or the original
- * mode.
+ * the virtual back buffer; a 320x240 race falls back to the Inset mode when
+ * the display has no 320x240 (SetLowResolutionRaceMode); for the menus the
+ * native menus or the original mode.
  *
  * @param [in] directDraw The DirectDraw object.
  * @param [in] width The width the game asked for.
@@ -3949,6 +4044,7 @@ static HRESULT WINAPI HookedSetDisplayMode(
     if (caller == g_gameBase + kMenuSetDisplayModeReturnRva ||
         caller == g_gameBase + kMenuSetDisplayMode16ReturnRva)
     {
+        RestoreInsetFallback();
         if (g_widescreenActive)
         {
             RestoreOriginalGameState();
@@ -4119,6 +4215,14 @@ static HRESULT WINAPI HookedSetDisplayMode(
         }
 
         return result;
+    }
+
+    if (caller == g_gameBase + kGameModeSetDisplayModeReturnRva &&
+        width == kOriginalLogicalWidth &&
+        height == kOriginalLogicalHeight &&
+        bitsPerPixel == 8)
+    {
+        return SetLowResolutionRaceMode(directDraw, caller);
     }
 
     return CallOriginalSetDisplayMode(

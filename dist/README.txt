@@ -127,8 +127,9 @@ RoadRashScreen001.bmp, ... and RoadRashFrame.bmp.
 Game fixes
 ----------
 
-The patch also repairs some faults of the original game. Each can be
-turned off in the [Fixes] section of RoadRashWidescreen.ini.
+The patch also repairs some faults of the original game. Each one except
+the fix for 320x240 races can be turned off in the [Fixes] section of
+RoadRashWidescreen.ini.
 
 - The Rat and Super bikes race in their own colors, as in the shop.
 - Buildings, riders and cars move smoothly in High Resolution mode instead
@@ -144,6 +145,9 @@ turned off in the [Fixes] section of RoadRashWidescreen.ini.
 - The road and its edges move smoothly instead of jumping by a few pixels.
 - When the race music cannot start, the error goes to the log instead of a
   message box that can stay hidden behind the race.
+- Most screens of newer PCs have no 320x240 mode, and the game crashed at
+  the start of a race in its 320x240 full-screen mode. The race now runs
+  as a 320x240 picture in the middle of a 640x480 screen.
 
 Optional (AllowAltTab=1, off by default): Alt+Tab and the Windows key work
 while the game runs.

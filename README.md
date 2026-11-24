@@ -67,8 +67,8 @@ the menu.</sub>
 
 ## Fixes
 
-The patch also repairs faults of the original game. Each fix can be turned
-off in [Configuration](#configuration).
+The patch also repairs faults of the original game. Each fix except the one
+for 320x240 races can be turned off in [Configuration](#configuration).
 
 - **Bike colors:** the Rat and Super bikes race in their own colors, as the
   shop shows them.
@@ -89,6 +89,9 @@ off in [Configuration](#configuration).
   music.
 - **Silent races:** if the races have no music while the menus do, the race
   music can play on another MIDI output.
+- **320x240 races:** most screens of newer PCs have no 320x240 mode, and the
+  game crashed at the start of a race in its 320x240 full-screen mode. The
+  race now runs as a 320x240 picture in the middle of a 640x480 screen.
 - **Alt+Tab (optional):** Alt+Tab and the Windows key switch away from the
   game while it keeps running.
 
