@@ -238,6 +238,24 @@ static const DWORD kPaletteGetEntriesVtableIndex = 4;
  */
 static const DWORD kGamePaletteRva = 0x00075424;
 
+/**
+ * The game's palette fade (0x415F70, ECX = the step callback): it starts a
+ * 14 ms multimedia timer whose callback changes the palette in 64 steps and
+ * waits until the last step releases a semaphore. No frame is flipped
+ * meanwhile.
+ */
+static const DWORD kRaceFadeFunctionRva = 0x00015F70;
+/** The fade-in before a race: MOV ECX,0x415D90 and CALL 0x415F70. */
+static const DWORD kRaceFadeInCallRva = 0x0001642F;
+/** The fade-out after a race: MOV ECX,0x415E90 and CALL 0x415F70. */
+static const DWORD kRaceFadeOutCallRva = 0x00016669;
+/** The remaining fade steps; the fade sets it to kRaceFadeSteps first. */
+static const DWORD kRaceFadeStepCountRva = 0x00082350;
+/** The number of steps the game's fade starts with. */
+static const DWORD kRaceFadeSteps = 0x40;
+/** The interval of the game's fade timer in milliseconds. */
+static const DWORD kRaceFadeStepMilliseconds = 14;
+
 /** Nonzero when the game runs in HiRes (640x480). */
 static const DWORD kHighResolutionFlagRva = 0x00075380;
 /**
@@ -1156,6 +1174,54 @@ BOOL GetPatchSettingsPath(CHAR* path)
 }
 
 /**
+ * Logs the desktop mode (size, colour depth and, where Windows tells it,
+ * the refresh rate) and the display size the races ask for.
+ *
+ * @param [in] desktopWidth The width of the desktop.
+ * @param [in] desktopHeight The height of the desktop.
+ * @param [in] source Where the race size comes from.
+ */
+static void LogDesktopAndRaceSize(
+    DWORD desktopWidth,
+    DWORD desktopHeight,
+    const CHAR* source)
+{
+    CHAR message[256];
+    DWORD length;
+    int bitsPerPixel = 0;
+    int refresh = 0;
+    HDC screen = GetDC(NULL);
+
+    if (screen != NULL)
+    {
+        bitsPerPixel =
+            GetDeviceCaps(screen, BITSPIXEL) * GetDeviceCaps(screen, PLANES);
+        // Windows 95/98 give 0; 0 and 1 also stand for the hardware default.
+        refresh = GetDeviceCaps(screen, VREFRESH);
+        ReleaseDC(NULL, screen);
+    }
+
+    length = wsprintfA(
+        message,
+        "Desktop: %lux%lu, %d-bit",
+        desktopWidth,
+        desktopHeight,
+        bitsPerPixel);
+    if (refresh > 1)
+    {
+        length += wsprintfA(message + length, ", %d Hz", refresh);
+    }
+
+    length += wsprintfA(
+        message + length,
+        ". Races ask for %lux%lu (%s).\r\n",
+        kTargetDisplayWidth,
+        kTargetDisplayHeight,
+        source);
+    LogMessage(message, length);
+}
+
+/**
  * Reads the [Display] settings and the size of the race's display mode.
  *
  * Makes the process DPI aware first: without this, the desktop size is
@@ -1169,6 +1235,9 @@ static void ReadVirtualWidthSetting()
     DWORD width;
     DWORD displayWidth;
     DWORD displayHeight;
+    DWORD desktopWidth;
+    DWORD desktopHeight;
+    const CHAR* source = "the desktop resolution";
 
     // Without this, the desktop size is reported DPI-virtualized on newer Windows.
     setDpiAware = reinterpret_cast<SetProcessDPIAwareFn>(GetProcAddress(
@@ -1180,6 +1249,8 @@ static void ReadVirtualWidthSetting()
 
     displayWidth = GetSystemMetrics(SM_CXSCREEN);
     displayHeight = GetSystemMetrics(SM_CYSCREEN);
+    desktopWidth = displayWidth;
+    desktopHeight = displayHeight;
 
     if (GetSettingsPath(path))
     {
@@ -1204,12 +1275,14 @@ static void ReadVirtualWidthSetting()
         if (width != 0)
         {
             displayWidth = width;
+            source = "DisplayWidth and DisplayHeight";
         }
 
         width = GetPrivateProfileIntA("Display", "DisplayHeight", 0, path);
         if (width != 0)
         {
             displayHeight = width;
+            source = "DisplayWidth and DisplayHeight";
         }
 
         width = GetPrivateProfileIntA("Display", "VirtualWidth", 0, path);
@@ -1233,10 +1306,12 @@ static void ReadVirtualWidthSetting()
     {
         displayWidth = kSafeDisplayWidth;
         displayHeight = kSafeDisplayHeight;
+        source = "the size used when the others are not usable";
     }
 
     kTargetDisplayWidth = displayWidth;
     kTargetDisplayHeight = displayHeight;
+    LogDesktopAndRaceSize(desktopWidth, desktopHeight, source);
 }
 
 /**
@@ -3569,6 +3644,172 @@ static HRESULT WINAPI HookedSurfaceFlip(
     return result;
 }
 
+/** A step of the game's palette fade: a multimedia timer callback. */
+typedef void (CALLBACK *RaceFadeStepFn)(UINT, UINT, DWORD, DWORD, DWORD);
+/** The game's palette fade, __fastcall with the step callback in ECX. */
+typedef void (__fastcall *RaceFadeFn)(RaceFadeStepFn);
+/** timeGetTime, looked up at run time. */
+typedef DWORD (WINAPI *TimeGetTimeFn)(void);
+
+/**
+ * Gives a millisecond clock for the fade.
+ *
+ * timeGetTime of winmm.dll, which the game has loaded and whose timers set a
+ * resolution of 1 ms; GetTickCount when it is missing.
+ *
+ * @return The function.
+ */
+static TimeGetTimeFn GetFadeClock()
+{
+    static TimeGetTimeFn clock = NULL;
+
+    if (clock == NULL)
+    {
+        HMODULE winmm = GetModuleHandleA("winmm.dll");
+
+        if (winmm != NULL)
+        {
+            clock = reinterpret_cast<TimeGetTimeFn>(
+                GetProcAddress(winmm, "timeGetTime"));
+        }
+
+        if (clock == NULL)
+        {
+            clock = GetTickCount;
+        }
+    }
+
+    return clock;
+}
+
+/**
+ * Replaces the game's palette fade before and after a race while the 32-bit
+ * presenter is active.
+ *
+ * The game changes the palette from a timer and flips no frame, which an
+ * 8-bit display shows at once. The 32-bit presenter converts a frame only
+ * when it is flipped, so the screen would keep the last frame and jump to
+ * the new brightness. Here the main thread runs the game's own fade steps
+ * on the timer's 14 ms schedule (several at once when presenting takes
+ * longer) and presents the last frame with the changed palette after them.
+ * In every other case the game's fade runs unchanged.
+ *
+ * @param [in] step The game's fade step (0x415D90 in, 0x415E90 out).
+ */
+static void __fastcall HookedRaceFade(RaceFadeStepFn step)
+{
+    TimeGetTimeFn clock;
+    HANDLE semaphore;
+    DWORD start;
+    DWORD stepsDone = 0;
+    DWORD presents = 0;
+    BOOL finished = FALSE;
+
+    if (g_staging == NULL || g_virtualPrimary == NULL || g_virtualBack == NULL)
+    {
+        reinterpret_cast<RaceFadeFn>(g_gameBase + kRaceFadeFunctionRva)(step);
+        return;
+    }
+
+    semaphore = CreateSemaphoreA(NULL, 0, 1, NULL);
+    if (semaphore == NULL)
+    {
+        reinterpret_cast<RaceFadeFn>(g_gameBase + kRaceFadeFunctionRva)(step);
+        return;
+    }
+
+    clock = GetFadeClock();
+    WriteGameDword(kRaceFadeStepCountRva, kRaceFadeSteps);
+    start = clock();
+    while (!finished)
+    {
+        DWORD due = (clock() - start) / kRaceFadeStepMilliseconds;
+        BOOL changed = FALSE;
+
+        // The last step only releases the semaphore; the bound keeps a
+        // changed step count from fading forever.
+        while (stepsDone < due && !finished)
+        {
+            step(0, 0, reinterpret_cast<DWORD>(semaphore), 0, 0);
+            ++stepsDone;
+            finished =
+                WaitForSingleObject(semaphore, 0) == WAIT_OBJECT_0 ||
+                stepsDone >= 2 * kRaceFadeSteps;
+            changed = TRUE;
+        }
+
+        if (changed)
+        {
+            FrameTiming timing;
+
+            QueryPerformanceCounter(&timing.start);
+            PresentFilteredFrame(g_virtualPrimary, &timing);
+            ++presents;
+        }
+        else
+        {
+            Sleep(1);
+        }
+    }
+
+    CloseHandle(semaphore);
+    {
+        CHAR message[128];
+
+        wsprintfA(
+            message,
+            "Race fade: %lu palette steps shown in %lu frames.\r\n",
+            stepsDone,
+            presents);
+        LogMessage(message, lstrlenA(message));
+    }
+}
+
+/**
+ * Points the game's fade calls before and after a race to HookedRaceFade.
+ *
+ * @return TRUE when both calls had the expected code.
+ */
+static BOOL InstallRaceFadeHook()
+{
+    static const BYTE fadeIn[] =
+    {
+        0xB9, 0x90, 0x5D, 0x41, 0x00, 0xE8, 0x37, 0xFB, 0xFF, 0xFF
+    };
+    static const BYTE fadeOut[] =
+    {
+        0xB9, 0x90, 0x5E, 0x41, 0x00, 0xE8, 0xFD, 0xF8, 0xFF, 0xFF
+    };
+    const DWORD callOffset = 5;
+    BYTE call[5];
+
+    if (!MatchesBytes(
+            reinterpret_cast<const BYTE*>(g_gameBase + kRaceFadeInCallRva),
+            fadeIn,
+            sizeof(fadeIn)) ||
+        !MatchesBytes(
+            reinterpret_cast<const BYTE*>(g_gameBase + kRaceFadeOutCallRva),
+            fadeOut,
+            sizeof(fadeOut)))
+    {
+        LogMessage(
+            "Race fade: unexpected code; the fades stay the game's own.\r\n",
+            sizeof("Race fade: unexpected code; the fades stay the game's own.\r\n") - 1);
+        return FALSE;
+    }
+
+    call[0] = 0xE8;
+    *reinterpret_cast<DWORD*>(call + 1) =
+        reinterpret_cast<DWORD>(HookedRaceFade) -
+        (g_gameBase + kRaceFadeInCallRva + callOffset + sizeof(call));
+    WriteGameCode(kRaceFadeInCallRva + callOffset, call, sizeof(call));
+    *reinterpret_cast<DWORD*>(call + 1) =
+        reinterpret_cast<DWORD>(HookedRaceFade) -
+        (g_gameBase + kRaceFadeOutCallRva + callOffset + sizeof(call));
+    WriteGameCode(kRaceFadeOutCallRva + callOffset, call, sizeof(call));
+    return TRUE;
+}
+
 /**
  * Replaces the surface's GetFlipStatus and logs the first calls for the
  * virtual primary.
@@ -4152,18 +4393,18 @@ static HRESULT WINAPI HookedSetDisplayMode(
                 g_virtualDisplayActive = TRUE;
                 SetHudCentering(TRUE);
                 g_widescreenActive = TRUE;
-                LogHRESULTResult(
-                    "Enabled the virtual viewport; real width=0x",
-                    sizeof("Enabled the virtual viewport; real width=0x") - 1,
-                    targetWidth);
-                LogHRESULTResult(
-                    "  real height=0x",
-                    sizeof("  real height=0x") - 1,
-                    targetHeight);
-                LogHRESULTResult(
-                    "  virtual width=0x",
-                    sizeof("  virtual width=0x") - 1,
-                    kVirtualDisplayWidth);
+                {
+                    CHAR message[128];
+
+                    wsprintfA(
+                        message,
+                        "Enabled the virtual viewport: display mode %lux%lu, the game renders %lux%lu.\r\n",
+                        targetWidth,
+                        targetHeight,
+                        kVirtualDisplayWidth * g_renderScale,
+                        kOriginalDisplayHeight * g_renderScale);
+                    LogMessage(message, lstrlenA(message));
+                }
                 return result;
             }
 
@@ -4309,6 +4550,8 @@ BOOL InstallRoadRashWidescreenHook(LPVOID directDraw)
                     GetPrivateProfileIntA(
                         "Display", "MenuBackground", 1, settingsPath) != 0);
         }
+
+        InstallRaceFadeHook();
 
         if (g_renderScaleSetting != 1 &&
             !RenderScaleInstall(
